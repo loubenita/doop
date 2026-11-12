@@ -40,6 +40,7 @@ const MISSING = [
   'set_page_background',
   'export_frame',
   'upload_asset',
+  'add_font', // a workspace library change; a resident run is scoped to one canvas
   'list_linear_issues', // integration tools, registered by their connections
   'get_linear_issue',
 ]
