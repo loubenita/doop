@@ -3,7 +3,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import type { drizzle as pgliteDrizzle } from 'drizzle-orm/pglite'
 import { db } from '../server/db/index.ts'
-import { hydrateFonts, listFonts } from '../server/fonts.ts'
+import { addFont, hydrateFonts, listFonts } from '../server/fonts.ts'
 import { buildMcpServer } from '../server/mcp.ts'
 import { createWorkspace } from '../server/workspaces.ts'
 import { ttf } from './fontFiles.ts'
@@ -55,10 +55,19 @@ const FONT_FILES: Record<string, Buffer> = {
 let requested: string[]
 let cssOverride: Record<string, string>
 
+/** A gstatic file URL that answers with a redirect to another host. */
+const MOVED = `${GSTATIC}/moved.ttf`
+
 /** Google as the tool sees it: CSS for known families, a 400 for the rest. */
-function google(input: string | URL | Request): Promise<Response> {
+function google(input: string | URL | Request, init?: RequestInit): Promise<Response> {
   const url = String(input)
   requested.push(url)
+  if (url === MOVED) {
+    /* what fetch does with a 302: refuse under redirect 'error', else follow it */
+    if (init?.redirect === 'error') return Promise.reject(new TypeError('fetch failed: unexpected redirect'))
+    requested.push('https://evil.example/font.ttf')
+    return Promise.resolve(new Response(new Uint8Array(ttf({ family: 'Inter', weight: 400 }))))
+  }
   if (url.startsWith('https://fonts.googleapis.com/css2?family=')) {
     const query = decodeURIComponent(url.slice('https://fonts.googleapis.com/css2?family='.length)).replace(/\+/g, ' ')
     const css = { ...REAL_CSS, ...cssOverride }[query]
@@ -188,6 +197,56 @@ describe('add_font', () => {
     expect(isError).toBe(true)
     expect(text).toContain('fonts.gstatic.com')
     expect(library()).toEqual([])
+  })
+
+  it('refuses a font file that redirects, following it nowhere', async () => {
+    cssOverride['Inter:wght@400'] = face('normal', 400, 'moved')
+
+    const { isError } = await addFontAs('member-id', { workspace_id: workspaceId, family: 'Inter' })
+
+    expect(isError).toBe(true)
+    expect(requested.some((url) => url.includes('evil.example'))).toBe(false)
+    expect(library()).toEqual([])
+  })
+
+  it('stores nothing when any one font file fails to download', async () => {
+    /* the first file downloads; the second is missing on Google */
+    cssOverride['Inter:wght@400;700'] = NORMAL_400 + face('normal', 700, 'missing')
+
+    const { isError } = await addFontAs('member-id', {
+      workspace_id: workspaceId,
+      family: 'Inter',
+      weights: [400, 700],
+    })
+
+    expect(isError).toBe(true)
+    expect(stored.size).toBe(0)
+    expect(library()).toEqual([])
+  })
+
+  it("returns only the added family's rows, not the rest of the library", async () => {
+    await addFont({ workspaceId }, { id: 'member-id', name: 'Member' }, ttf({ family: 'Roboto', weight: 400 }), 'r.ttf')
+
+    const { text } = await addFontAs('member-id', { workspace_id: workspaceId, family: 'Inter' })
+
+    expect(JSON.parse(text).fonts).toEqual([{ family: 'Inter', weight: '400', style: 'normal' }])
+    expect(library()).toHaveLength(2)
+  })
+
+  it('refuses a family name that could change the request, asking Google nothing', async () => {
+    const { isError } = await addFontAs('member-id', { workspace_id: workspaceId, family: 'Inter:wght@900&x=1' })
+
+    expect(isError).toBe(true)
+    expect(requested).toEqual([])
+  })
+
+  it('downloads a font file the stylesheet names twice only once', async () => {
+    cssOverride['Inter:wght@400'] = NORMAL_400 + NORMAL_400
+
+    await addFontAs('member-id', { workspace_id: workspaceId, family: 'Inter' })
+
+    expect(requested.filter((url) => url.startsWith(GSTATIC))).toHaveLength(1)
+    expect(library()).toHaveLength(1)
   })
 
   it('replaces a face that is added again instead of duplicating it', async () => {
