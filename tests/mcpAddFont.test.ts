@@ -6,6 +6,7 @@ import { db } from '../server/db/index.ts'
 import { addFont, hydrateFonts, listFonts } from '../server/fonts.ts'
 import { buildMcpServer } from '../server/mcp.ts'
 import { createWorkspace } from '../server/workspaces.ts'
+import { MAX_FONT_BYTES } from '../shared/fonts.ts'
 import { ttf } from './fontFiles.ts'
 
 /**
@@ -16,6 +17,11 @@ import { ttf } from './fontFiles.ts'
  * ital,wght twin), requested without a browser User-Agent, which is what
  * makes Google answer with one whole TTF per face.
  */
+
+/* the suite calls the tool far more often than a minute's cap; the cap itself is tested in rate-limit-wiring */
+vi.hoisted(() => {
+  process.env.MCP_ADD_FONTS_PER_MIN = '1000'
+})
 
 vi.mock('../server/db/index.ts', async () => {
   const { PGlite } = await import('@electric-sql/pglite')
@@ -58,10 +64,22 @@ let cssOverride: Record<string, string>
 /** A gstatic file URL that answers with a redirect to another host. */
 const MOVED = `${GSTATIC}/moved.ttf`
 
+/** A gstatic file that is no font, and one that announces more bytes than a font may hold. */
+const NOT_A_FONT = `${GSTATIC}/notafont.ttf`
+const HUGE = `${GSTATIC}/huge.ttf`
+
+/** Without a browser-like User-Agent Google answers whole TTFs; the tool must say so itself. */
+const USER_AGENT = 'doop-font-fetch'
+
 /** Google as the tool sees it: CSS for known families, a 400 for the rest. */
 function google(input: string | URL | Request, init?: RequestInit): Promise<Response> {
   const url = String(input)
   requested.push(url)
+  if (new Headers(init?.headers).get('user-agent') !== USER_AGENT)
+    return Promise.resolve(new Response('browser-like request', { status: 403 }))
+  if (url === NOT_A_FONT) return Promise.resolve(new Response('this is not a font file at all'))
+  if (url === HUGE)
+    return Promise.resolve(new Response('tiny', { headers: { 'content-length': String(MAX_FONT_BYTES + 1) } }))
   if (url === MOVED) {
     /* what fetch does with a 302: refuse under redirect 'error', else follow it */
     if (init?.redirect === 'error') return Promise.reject(new TypeError('fetch failed: unexpected redirect'))
@@ -262,5 +280,66 @@ describe('add_font', () => {
     expect(rows.find((f) => f.weight === '400')!.id).not.toBe(first[0])
     expect(rows.find((f) => f.weight === '700')!.id).toBe(first[1])
     expect(JSON.parse(text).fonts).toHaveLength(2)
+  })
+
+  it('stores nothing, and names the face, when a later file downloads but is not a font', async () => {
+    cssOverride['Inter:wght@400;700'] = NORMAL_400 + face('normal', 700, 'notafont')
+
+    const { isError, text } = await addFontAs('member-id', {
+      workspace_id: workspaceId,
+      family: 'Inter',
+      weights: [400, 700],
+    })
+
+    expect(isError).toBe(true)
+    expect(text).toContain('notafont.ttf')
+    expect(text).toContain('not a font file')
+    expect(stored.size).toBe(0)
+    expect(library()).toEqual([])
+  })
+
+  it('refuses a weight Google would round to another, fetching nothing', async () => {
+    const { isError } = await addFontAs('member-id', { workspace_id: workspaceId, family: 'Inter', weights: [450] })
+
+    expect(isError).toBe(true)
+    expect(requested).toEqual([])
+  })
+
+  it('refuses a stylesheet naming more than 18 font files, fetching none of them', async () => {
+    cssOverride['Inter:wght@400'] = Array.from({ length: 19 }, (_, i) => face('normal', 400, `f${i}`)).join('')
+
+    const { isError, text } = await addFontAs('member-id', { workspace_id: workspaceId, family: 'Inter' })
+
+    expect(isError).toBe(true)
+    expect(text).toContain('19')
+    expect(requested.filter((url) => url.startsWith(GSTATIC))).toEqual([])
+    expect(library()).toEqual([])
+  })
+
+  it('refuses a font file whose content-length is over the limit, without reading it', async () => {
+    cssOverride['Inter:wght@400'] = face('normal', 400, 'huge')
+
+    const { isError, text } = await addFontAs('member-id', { workspace_id: workspaceId, family: 'Inter' })
+
+    expect(isError).toBe(true)
+    expect(text).toContain('10 MB')
+    expect(stored.size).toBe(0)
+  })
+
+  it('tells a 400 from Google may be a wrong-case family name', async () => {
+    const { isError, text } = await addFontAs('member-id', { workspace_id: workspaceId, family: 'inter' })
+
+    expect(isError).toBe(true)
+    expect(text).toContain('case-sensitive')
+    expect(text).toContain('"Inter"')
+  })
+
+  it('does not repeat unparsable stylesheet text back to the agent', async () => {
+    cssOverride['Inter:wght@400'] = "@font-face { src: url(secret-from-the-stylesheet) format('truetype'); }"
+
+    const { isError, text } = await addFontAs('member-id', { workspace_id: workspaceId, family: 'Inter' })
+
+    expect(isError).toBe(true)
+    expect(text).not.toContain('secret-from-the-stylesheet')
   })
 })

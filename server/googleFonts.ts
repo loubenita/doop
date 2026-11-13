@@ -1,5 +1,6 @@
-import { familyKey, type CustomFont, type FontScope } from '../shared/fonts.ts'
+import { MAX_FONT_BYTES, familyKey, type CustomFont, type FontScope } from '../shared/fonts.ts'
 import { WEB_FONTS_ORIGIN } from '../shared/webFonts.ts'
+import { readFontFile } from './fontFile.ts'
 import { FontInputError, addFont, listFonts } from './fonts.ts'
 
 /**
@@ -15,10 +16,19 @@ import { FontInputError, addFont, listFonts } from './fonts.ts'
  *  to a server-side fetch, so it must not be able to aim it elsewhere. */
 const FILE_HOST = 'fonts.gstatic.com'
 const FETCH_TIMEOUT_MS = 20_000
+/** One call, every fetch in it: 9 weights with italics are 18 files plus the stylesheet. */
+const CALL_TIMEOUT_MS = 60_000
+const MAX_FILES = 18
+/** Fixed, and not browser-like: that is what makes css2 answer with whole TTFs, so it is not left to the runtime's default. */
+const USER_AGENT = 'doop-font-fetch'
 
-async function get(url: string): Promise<Response> {
+async function get(url: string, deadline: AbortSignal): Promise<Response> {
   try {
-    return await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) })
+    return await fetch(url, {
+      redirect: 'error',
+      headers: { 'User-Agent': USER_AGENT },
+      signal: AbortSignal.any([deadline, AbortSignal.timeout(FETCH_TIMEOUT_MS)]),
+    })
   } catch {
     throw new FontInputError('Google Fonts could not be reached — try again')
   }
@@ -38,7 +48,9 @@ function fontFileUrls(css: string): URL[] {
   return [...new Set(urls)].map((raw) => {
     const url = URL.canParse(raw) ? new URL(raw) : null
     if (url?.protocol !== 'https:' || url.host !== FILE_HOST)
-      throw new FontInputError(`refusing the font file at ${url?.host ?? raw}: only https://${FILE_HOST} is allowed`)
+      throw new FontInputError(
+        `refusing the font file at ${url?.host ?? 'an unreadable address'}: only https://${FILE_HOST} is allowed`,
+      )
     return url
   })
 }
@@ -54,20 +66,37 @@ export async function addGoogleFont(
 ): Promise<CustomFont[]> {
   const name = family.trim().replace(/\s+/g, ' ')
   if (!/^[A-Za-z0-9 ]{1,80}$/.test(name)) throw new FontInputError(`"${family}" is not a Google Fonts family name`)
-  const res = await get(stylesheetUrl(name, weights, italic))
+  const deadline = AbortSignal.timeout(CALL_TIMEOUT_MS)
+  const res = await get(stylesheetUrl(name, weights, italic), deadline)
   if (res.status === 400)
     throw new FontInputError(
-      `Google Fonts has no family "${name}" with weights ${weights.join(', ')}${italic ? ' and italics' : ''}`,
+      `Google Fonts has no family "${name}" with weights ${weights.join(', ')}${italic ? ' and italics' : ''}: ` +
+        'family names are case-sensitive (write "Inter", not "inter"), and the family may not have that weight',
     )
   if (!res.ok) throw new FontInputError(`Google Fonts answered HTTP ${res.status}`)
   const urls = fontFileUrls(await res.text())
   if (!urls.length) throw new FontInputError(`Google Fonts returned no font files for "${name}"`)
-  /* every file is fetched before the first is stored, so a failure leaves the library as it was */
+  if (urls.length > MAX_FILES)
+    throw new FontInputError(`the stylesheet names ${urls.length} font files, more than the ${MAX_FILES} allowed`)
+  const tooBig = (fileName: string) =>
+    new FontInputError(`${fileName}: over the ${MAX_FONT_BYTES / 1024 / 1024} MB limit`)
   const files: { buf: Buffer; fileName: string }[] = []
   for (const url of urls) {
-    const file = await get(url.href)
+    const fileName = url.pathname.split('/').pop() ?? ''
+    const file = await get(url.href, deadline)
     if (!file.ok) throw new FontInputError(`Google Fonts answered HTTP ${file.status} for a font file`)
-    files.push({ buf: Buffer.from(await file.arrayBuffer()), fileName: url.pathname.split('/').pop() ?? '' })
+    if (Number(file.headers.get('content-length')) > MAX_FONT_BYTES) throw tooBig(fileName)
+    files.push({ buf: Buffer.from(await file.arrayBuffer()), fileName })
+  }
+  /* every file is downloaded and checked before the first is stored, so a bad file leaves the library as it was.
+     addFont checks again as it stores; these are the same size and readFontFile checks, run up front. */
+  for (const { buf, fileName } of files) {
+    if (buf.length > MAX_FONT_BYTES) throw tooBig(fileName)
+    try {
+      readFontFile(buf)
+    } catch (e) {
+      throw new FontInputError(`${fileName}: ${e instanceof Error ? e.message : 'the font file could not be read'}`)
+    }
   }
   const added = new Set<string>()
   for (const { buf, fileName } of files) added.add(familyKey((await addFont(scope, user, buf, fileName)).family))

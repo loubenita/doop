@@ -88,7 +88,15 @@ describe('MCP add_font tool contract', () => {
       const schema = addFont!.inputSchema as ToolInputSchema
       expect(Object.keys(schema.properties ?? {}).sort()).toEqual(['family', 'italic', 'weights', 'workspace_id'])
       expect(new Set(schema.required)).toEqual(new Set(['workspace_id', 'family']))
-      expect(addFont!.annotations).toMatchObject({ readOnlyHint: false, openWorldHint: true })
+      expect(addFont!.description).toContain("that workspace's canvases")
+      expect(schema.properties?.family).toMatchObject({ description: expect.stringContaining('case') })
+      /* adding a face again replaces the old one, and every call stores new assets */
+      expect(addFont!.annotations).toMatchObject({
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: true,
+      })
 
       /* a workspace the connection is not in is refused before Google is asked */
       const refused = await client.callTool({ name: 'add_font', arguments: { workspace_id: 'nope', family: 'Inter' } })

@@ -294,7 +294,8 @@ ${FRAME_STYLES}
   family in CSS (font-family: "Family", sans-serif) and nothing more: Doop adds the @font-face
   rules in a <style data-doop-fonts> block, which you keep. Never fetch them from Google Fonts.
   To put a Google Fonts family in a workspace's library yourself, call add_font (workspace_id,
-  family, weights, italic); the canvas then lists it under \`fonts\`.
+  family, weights, italic; workspace_id is on the list_canvases rows). The font lands in that
+  workspace's library, and the canvases in that workspace then list it under \`fonts\`.
 - Pictures on the canvas: a frame listed with \`images\` references raster images people
   uploaded or pasted, each with a \`description\` of what it shows, written by a vision model
   (null while pending). Read them before designing, and call get_frame_screenshot on the

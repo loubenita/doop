@@ -278,6 +278,10 @@ const GENERATIONS_PER_MIN = env.MCP_GENERATIONS_PER_MIN
 const importHits = new Map<string, number[]>()
 const IMPORTS_PER_MIN = env.MCP_IMPORTS_PER_MIN
 
+/* one add_font call fetches up to 19 files from Google and stores them all */
+const addFontHits = new Map<string, number[]>()
+const ADD_FONTS_PER_MIN = env.MCP_ADD_FONTS_PER_MIN
+
 const agentName = z
   .string()
   .describe(
@@ -1635,22 +1639,29 @@ export function buildMcpServer(
     {
       title: 'Add a Google font to a workspace library',
       description:
-        "Add a Google Fonts family to a workspace's font library (workspace_id from list_canvases), so its canvases get the font without loading it from Google. Stores one file per weight, plus the italic faces when italic is true; adding a face again replaces it. Returns the library's rows for that family. Only Google Fonts families work; a family Google does not serve (SF Pro, a commercial font) is refused: upload its file in Workspace settings instead.",
-      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+        "Add a Google Fonts family to a workspace's font library (workspace_id from list_canvases), so that workspace's canvases get the font without loading it from Google. Stores one file per weight, plus the italic faces when italic is true; adding a face again replaces it. Returns the library's rows for that family. Only Google Fonts families work; a family Google does not serve (SF Pro, a commercial font) is refused: upload its file in Workspace settings instead.",
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
       inputSchema: {
         workspace_id: z.string().describe('The workspace whose library gets the font; you must be a member'),
-        family: z.string().describe('The Google Fonts family name, e.g. "Inter" or "Open Sans"'),
+        family: z.string().describe('The Google Fonts family name in its exact case: "Open Sans", not "open sans"'),
         weights: z
-          .array(z.number().int().min(100).max(900))
+          .array(z.number().int().min(100).max(900).multipleOf(100))
           .max(9)
           .optional()
-          .describe('CSS weights to add (100-900); default [400]. A family without a weight is refused.'),
+          .describe(
+            'CSS weights to add: 100, 200 … 900; default [400], also when empty. A family without a weight is refused.',
+          ),
         italic: z.boolean().optional().describe('Also add the italic face of each weight (default false)'),
       },
     },
     async ({ workspace_id, family, weights, italic }) => {
       const scope = { workspaceId: workspace_id }
       if (!ownerId || !canUseScope(scope, ownerId)) return err(`no workspace with id ${workspace_id}`)
+      const now = Date.now()
+      const hits = (addFontHits.get(ownerId) ?? []).filter((t) => now - t < 60_000)
+      if (hits.length >= ADD_FONTS_PER_MIN) return err('add_font rate limit — wait a minute')
+      hits.push(now)
+      addFontHits.set(ownerId, hits)
       try {
         const library = await addGoogleFont(
           scope,

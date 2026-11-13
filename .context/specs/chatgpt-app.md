@@ -71,10 +71,11 @@ parts that apply to Doop are in `handleMcpRequest`:
 - `destructiveHint: true` for anything that can remove or overwrite content: `delete_frame`,
   `set_canvas_pages` (can delete pages), `set_frame_html`, `set_guidelines` and
   `restore_frame_version` (replace), `append_frame_html` (`start: true` clears the frame) and
-  `edit_frame_html` (find-and-replace can delete content).
+  `edit_frame_html` (find-and-replace can delete content), `add_font` (a face added again
+  replaces the old one).
 - `openWorldHint: true` for anything reaching a third party: website viewing/importing, stock
   photos, icons, logos, inspiration, `upload_asset` (fetches a URL),
-  `generate_image` (OpenAI). `list_backgrounds` serves Doop's own library, so `false`.
+  `add_font` (Google Fonts), `generate_image` (OpenAI). `list_backgrounds` serves Doop's own library, so `false`.
 
 ## The preview card (`server/chatgptApp.ts`)
 
