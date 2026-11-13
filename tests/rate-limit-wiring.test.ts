@@ -20,6 +20,16 @@ vi.mock('../server/db/persist.ts', () => ({
   saveProposal: () => {},
 }))
 
+/* add_font checks membership before the limiter: let the owner in, and keep the
+   calls that pass the limiter off Google */
+vi.mock('../server/fonts.ts', () => ({
+  FontInputError: class FontInputError extends Error {},
+  canUseScope: () => true,
+  fontsForCanvas: () => [],
+}))
+const addGoogleFont = vi.fn(async () => [])
+vi.mock('../server/googleFonts.ts', () => ({ addGoogleFont }))
+
 const OWNER_ID = 'rate-limit-owner'
 
 interface CallResult {
@@ -73,6 +83,28 @@ describe('configurable tool rate limits', () => {
       const limited = await upload(client, canvasId)
       expect(limited.isError).toBe(true)
       expect(limited.raw).toContain('rate limit')
+    } finally {
+      await close()
+    }
+  })
+
+  it('applies a lowered MCP_ADD_FONTS_PER_MIN to add_font, before any font is fetched', async () => {
+    vi.stubEnv('MCP_ADD_FONTS_PER_MIN', '2')
+    addGoogleFont.mockClear()
+    const { client, close } = await connect()
+    try {
+      const addFont = async () => {
+        const result = (await client.callTool({
+          name: 'add_font',
+          arguments: { workspace_id: 'ws', family: 'Inter' },
+        })) as unknown as CallResult
+        return { raw: result.content.map((b) => b.text ?? '').join('\n'), isError: result.isError }
+      }
+      for (let i = 0; i < 2; i++) expect((await addFont()).isError).toBeFalsy()
+      const limited = await addFont()
+      expect(limited.isError).toBe(true)
+      expect(limited.raw).toContain('add_font rate limit')
+      expect(addGoogleFont).toHaveBeenCalledTimes(2)
     } finally {
       await close()
     }
