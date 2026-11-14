@@ -13,7 +13,8 @@ import {
 import { ELEMENT_ID_ATTR, elementIdSelector } from '../../shared/elementId'
 import type { Frame } from '../../shared/types'
 import { api, type InstanceChangeInput } from './api'
-import { recordCreate, recordUpdate, recordUpdates } from './history'
+import { endFrameEdit } from './frameBridge'
+import { recordCreate, recordUpdate, recordUpdates, savesLanded } from './history'
 import { t } from './i18n'
 import { elementPath } from './layers'
 import { isLayerLocked, replaceLayerHtml } from './layerEdits'
@@ -128,8 +129,18 @@ function refuseLocked(frame: Frame, selector: string): boolean {
   return true
 }
 
+/* The server is about to rewrite this frame. A text edit open in it ends and its
+   save lands first: made later, from the document as it was, that save would undo the write.
+   Returns the frame as that save left it, so undoing the write keeps the typed text. */
+async function settleFrame(frame: Frame): Promise<Frame> {
+  await endFrameEdit(frame.id)
+  await savesLanded()
+  return useStore.getState().canvas?.frames.find((candidate) => candidate.id === frame.id) ?? frame
+}
+
 export async function makeComponent(frame: Frame, selector: string, name: string, replaceMatching = false) {
   if (refuseLocked(frame, selector)) return null
+  await settleFrame(frame)
   const framesBefore = useStore.getState().canvas?.frames ?? []
   try {
     const { component, converted, frames } = await api.createComponent(frame.canvasId, {
@@ -187,10 +198,11 @@ export function promptMakeComponent(frame: Frame, selector: string) {
 
 export async function changeInstance(frame: Frame, change: InstanceChangeInput) {
   if (refuseLocked(frame, elementIdSelector(change.instanceId))) return
+  const settled = await settleFrame(frame)
   try {
     const { frame: next, missing } = await api.changeInstances(frame.id, [change])
     if (missing.length) useStore.getState().pushNotice(t('components.changeFailed'))
-    adopt(frame, next)
+    adopt(settled, next)
   } catch (error) {
     notifyFailure(error, t('components.changeFailed'))
   }
@@ -208,11 +220,12 @@ export async function placeComponent(def: ComponentDef) {
         s.pushNotice(t('components.locked'))
         return
       }
+      const settled = await settleFrame(frame)
       const { frame: next } = await api.insertInstance(frame.id, {
         component: def.id,
         ...(target ? { target, position: 'after' } : {}),
       })
-      adopt(frame, next)
+      adopt(settled, next)
       return
     }
     if (!s.canvas) return
@@ -246,8 +259,9 @@ export async function dropComponent(componentId: string, client: { x: number; y:
         s.pushNotice(t('components.locked'))
         return
       }
+      const settled = await settleFrame(frame)
       const { frame: next } = await api.insertInstance(frame.id, { component: def.id })
-      adopt(frame, next)
+      adopt(settled, next)
       s.select(frame.id)
       return
     }
