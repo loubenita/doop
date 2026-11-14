@@ -12,6 +12,7 @@ import { api, ApiError } from '../src/lib/api'
 import { setFramesApproval } from '../src/lib/frameApproval'
 import { useStore } from '../src/lib/store'
 import { useFrameSaves } from '../src/lib/frameSaves'
+import { getLocale } from '../src/lib/i18n'
 
 vi.mock('../src/lib/posthog', () => ({ posthog: { capture: vi.fn() } }))
 ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
@@ -88,11 +89,11 @@ it('waits for confirmation, shows attribution on hover or focus, and lets a pers
   expect(save).toHaveBeenCalledWith('f', 'ready_for_dev', 10)
   await act(async () => finish(approved))
   expect(container.textContent).not.toContain('Reviewer')
-  expect(container.textContent).not.toContain(new Date(11).toLocaleString())
+  expect(container.textContent).not.toContain(new Date(11).toLocaleString(getLocale()))
   expect(toggle().getAttribute('aria-checked')).toBe('true')
   await act(async () => toggle().focus())
   expect(document.querySelector('[role="tooltip"]')?.textContent).toContain('Approved by Reviewer')
-  expect(document.querySelector('[role="tooltip"]')?.textContent).toContain(new Date(11).toLocaleString())
+  expect(document.querySelector('[role="tooltip"]')?.textContent).toContain(new Date(11).toLocaleString(getLocale()))
   save.mockResolvedValueOnce({ ...approved, updatedAt: 12, approval: null })
   await act(async () => toggle().click())
   expect(save).toHaveBeenLastCalledWith('f', 'draft', 11)
