@@ -98,7 +98,7 @@ export async function addGoogleFont(
       throw new FontInputError(`${fileName}: ${e instanceof Error ? e.message : 'the font file could not be read'}`)
     }
   }
-  const added = new Set<string>()
-  for (const { buf, fileName } of files) added.add(familyKey((await addFont(scope, user, buf, fileName)).family))
-  return listFonts(scope, user.id).filter((font) => added.has(familyKey(font.family)))
+  /* stored under the family asked for: Google's static file for one weight may name that weight in its family */
+  for (const { buf, fileName } of files) await addFont(scope, user, buf, fileName, name)
+  return listFonts(scope, user.id).filter((font) => familyKey(font.family) === familyKey(name))
 }

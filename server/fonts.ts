@@ -64,12 +64,15 @@ export function fontsForCanvas(canvas: { workspaceId?: string | null; ownerId?: 
 
 /** Add a font file to a library. A file for a face the library already has
  *  (same family, weight and style) replaces it, so re-uploading a fixed
- *  version needs no delete first. */
+ *  version needs no delete first. `family`, when given, is stored instead of
+ *  the family the file names: a static file without a typographic family
+ *  (name ID 16) puts its weight in the family ("IBM Plex Mono SemiBold"). */
 export async function addFont(
   scope: FontScope,
   user: { id: string; name: string },
   buf: Buffer,
   fileName: string,
+  family?: string,
 ): Promise<CustomFont> {
   if (buf.length === 0) throw new FontInputError('empty file')
   if (buf.length > MAX_FONT_BYTES)
@@ -85,7 +88,7 @@ export async function addFont(
     id: nanoid(10),
     workspaceId: 'workspaceId' in scope ? scope.workspaceId : null,
     ownerId: user.id,
-    family: info.family,
+    family: family ?? info.family,
     weight: info.weight,
     style: info.style,
     format: info.format,
