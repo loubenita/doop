@@ -334,6 +334,32 @@ describe('add_font', () => {
     expect(text).toContain('"Inter"')
   })
 
+  it('stores every weight under the family asked for, even a file that names its weight in its family', async () => {
+    /* Google's real static TTFs for IBM Plex Mono: the 600 file has no
+       typographic family (name ID 16), only the legacy "IBM Plex Mono SemiBold" */
+    const plex = 'https://fonts.gstatic.com/s/ibmplexmono/v23'
+    const plexFace = (weight: number, file: string) =>
+      `@font-face {\n  font-family: 'IBM Plex Mono';\n  font-style: normal;\n  font-weight: ${weight};\n  src: url(${plex}/${file}.ttf) format('truetype');\n}\n`
+    cssOverride['IBM Plex Mono:wght@400;600'] =
+      plexFace(400, '-F63fjptAgt5VM-kVkqdyU8n5ig') + plexFace(600, '-F6qfjptAgt5VM-kVkqdyU8n3vAO8lc')
+    FONT_FILES[`${plex}/-F63fjptAgt5VM-kVkqdyU8n5ig.ttf`] = ttf({ family: 'IBM Plex Mono', weight: 400 })
+    FONT_FILES[`${plex}/-F6qfjptAgt5VM-kVkqdyU8n3vAO8lc.ttf`] = ttf({ family: 'IBM Plex Mono SemiBold', weight: 600 })
+
+    const { isError, text } = await addFontAs('member-id', {
+      workspace_id: workspaceId,
+      family: 'IBM Plex Mono',
+      weights: [400, 600],
+    })
+
+    expect(isError).toBe(false)
+    const expected = [
+      { family: 'IBM Plex Mono', weight: '400', style: 'normal' },
+      { family: 'IBM Plex Mono', weight: '600', style: 'normal' },
+    ]
+    expect(faces(library())).toEqual(expected)
+    expect(JSON.parse(text).fonts).toEqual(expected)
+  })
+
   it('does not repeat unparsable stylesheet text back to the agent', async () => {
     cssOverride['Inter:wght@400'] = "@font-face { src: url(secret-from-the-stylesheet) format('truetype'); }"
 
