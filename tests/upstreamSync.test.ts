@@ -88,7 +88,8 @@ describe('weekly merge of upstream into the fork', () => {
     land('fork.git', 'fork.txt', 'ours\n')
 
     const result = syncUpstream(
-      options({ testCommand: 'test -f upstream.txt && test -f fork.txt && echo 2914 passed' }),
+      // printf, so the expected output is not also the command text the issue quotes
+      options({ testCommand: "test -f upstream.txt && test -f fork.txt && printf '%s passed\\n' 2914" }),
     )
 
     expect(result.outcome).toBe('ready')
@@ -135,7 +136,7 @@ describe('weekly merge of upstream into the fork', () => {
   it('stops on failing tests, pushes the branch for inspection and puts the failure in the issue', () => {
     land('upstream.git', 'upstream.txt', 'from upstream\n')
 
-    const result = syncUpstream(options({ testCommand: 'echo FAIL tests/fonts.test.ts; exit 1' }))
+    const result = syncUpstream(options({ testCommand: "printf 'FAIL %s\\n' tests/fonts.test.ts; exit 1" }))
 
     expect(result.outcome).toBe('tests-failed')
     expect(forkHas('upstream-sync/2026-11-16')).toBe(true)
