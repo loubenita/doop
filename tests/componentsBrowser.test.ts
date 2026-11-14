@@ -457,6 +457,15 @@ describe.skipIf(!findBrowserPath())('components in the editor', { timeout: 60_00
     await doc.waitForSelector('p.headline[contenteditable]')
     await page.keyboard.type('Edited headline')
 
+    /* the card's saves arrive late, as on a slow network: the server must still see the typed
+       text before it stamps the main, or the late save wipes the stamp */
+    await page.setRequestInterception(true)
+    page.on('request', (request) => {
+      const save = request.method() === 'PATCH' && new URL(request.url()).pathname === `/api/frames/${cardId}`
+      if (!save) return void request.continue()
+      setTimeout(() => void request.continue(), 800)
+    })
+
     /* make the edited text a component without leaving the edit, then leave it. Keys typed in the
        frame stay there while it edits, so focus goes back to the page first, as a click on a panel
        (the Design panel's parent arrow) takes it while the edit stays open */
