@@ -1,0 +1,61 @@
+name: Upstream sync
+
+# Every Monday: merge kgoedecke/doop's main into an upstream-sync/<date> branch cut from this
+# fork's main, run the tests on the merged tree, push the branch and open an issue with the
+# compare link and the result (scripts/upstreamSync.ts). A person opens the pull request from
+# the issue; nothing here merges into main or deploys. A conflict or a test failure goes in the
+# same issue. The token below can push branches and open issues, and nothing more.
+on:
+  schedule:
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Branch of this fork to merge upstream into (main unless rehearsing)
+        default: main
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    # Only the fork syncs itself; upstream and other forks never run this.
+    if: github.repository == 'loubenita/doop'
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      # The browser tests need the Chrome pinned in .chrome-version, installed as ci.yml does.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/doop-chrome
+          key: chrome-${{ runner.os }}-${{ hashFiles('.chrome-version') }}
+      - name: Install the pinned Chrome
+        run: |
+          ./node_modules/.bin/browsers install "chrome@$(cat .chrome-version)" --path ~/.cache/doop-chrome > "$RUNNER_TEMP/chrome-install"
+          path=$(awk '{ print $2 }' "$RUNNER_TEMP/chrome-install")
+          "$path" --version
+          echo "CHROME_PATH=$path" >> "$GITHUB_ENV"
+          echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns >/dev/null
+      - name: Merge upstream, test, push the branch and open the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Via env, never inlined into the script: a dispatch input is free text.
+          BASE: ${{ inputs.base || 'main' }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          bun x tsx scripts/upstreamSync.ts \
+            --upstream https://github.com/kgoedecke/doop.git \
+            --repo "$GITHUB_REPOSITORY" \
+            --base "$BASE" \
+            --test 'bun install --frozen-lockfile && bun run test'
