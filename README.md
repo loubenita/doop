@@ -684,9 +684,13 @@ Any container host works; Railway/Fly are the least friction:
 2. Add a managed Postgres and set `DATABASE_URL`. **Don't skip this in real deployments** —
    the PGlite fallback is embedded/single-process and only suits a single instance with a
    persistent volume mounted at `/app/data`.
-3. Set `BETTER_AUTH_SECRET` (long random string) and `BETTER_AUTH_URL` (the public origin,
+3. Give uploads a lasting home. Either set the object storage variables (`BUCKET` and the rest,
+   listed below) or mount a persistent volume at `/app/data`. Without either, Doop keeps uploaded
+   pictures and fonts inside the container. A redeploy then deletes them while their database rows
+   stay, so their `/a/` addresses answer 404. `docker-compose.yml` mounts one, named `doop-data`.
+4. Set `BETTER_AUTH_SECRET` (long random string) and `BETTER_AUTH_URL` (the public origin,
    e.g. `https://doop.example.com`). Extra allowed origins: `TRUSTED_ORIGINS` (comma-separated).
-4. Health check: `GET /healthz`. The server trusts one proxy hop (`trust proxy`), so
+5. Health check: `GET /healthz`. The server trusts one proxy hop (`trust proxy`), so
    TLS termination at the platform edge works out of the box.
 
 Local sanity check of the exact production image:
