@@ -1,16 +1,19 @@
 /**
- * Weekly merge of upstream Doop (kgoedecke/doop) into this fork.
+ * Daily merge of upstream Doop (kgoedecke/doop) into this fork.
  *
  * Merges upstream main into a dated `upstream-sync/<date>` branch cut from the fork's main, runs the
- * tests on the merged tree, pushes the branch and opens an issue on the fork with the compare link
- * and the test result, so a person opens the pull request. A merge conflict stops before anything
- * is pushed, and the issue names the conflicted files; failing tests still push the branch, so the
- * compare link shows what broke. Nothing is merged into main and nothing is deployed.
+ * tests on the merged tree, pushes the branch and opens a pull request into main whose description
+ * is the report (compare link, upstream commits, test result); a draft when the tests failed. The
+ * same report goes to the run summary every time, so it survives a repository that does not let
+ * GitHub Actions open pull requests (the summary then carries a link to open one by hand) and a
+ * merge conflict, which stops before anything is pushed. Nothing is merged into main and nothing
+ * is deployed: a person reviews and merges the pull request.
  *
- * Run by .github/workflows/upstream-sync.yml every Monday, inside a checkout of the fork:
+ * Run by .github/workflows/upstream-sync.yml every day, inside a checkout of the fork:
  *   bun x tsx scripts/upstreamSync.ts --upstream <url> --repo <owner/name> [--base main] [--test "<cmd>"]
  */
 
+import { appendFileSync } from 'node:fs'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { pathToFileURL } from 'node:url'
 
@@ -24,6 +27,8 @@ export interface SyncOptions {
   testCommand: string
   /** the gh binary; tests pass a stand-in */
   gh?: string
+  /** where the report is appended for the run page ($GITHUB_STEP_SUMMARY) */
+  summaryFile?: string
   /** extra environment for git and the test command */
   env?: Record<string, string>
 }
@@ -34,7 +39,7 @@ export interface SyncResult {
   outcome: SyncOutcome
   report: string
   branch?: string
-  issueUrl?: string
+  pullRequestUrl?: string
 }
 
 const TEST_OUTPUT_TAIL = 60
@@ -50,7 +55,8 @@ export function syncUpstream(opts: SyncOptions): SyncResult {
   const upstreamHead = git('rev-parse', 'FETCH_HEAD')
   const upstreamCommits = git('log', '--oneline', '--no-decorate', `${base}..${upstreamHead}`)
   if (!upstreamCommits) {
-    return { outcome: 'up-to-date', report: `Upstream main ${upstreamHead.slice(0, 7)} is already in ${base}.` }
+    const report = `Upstream main ${upstreamHead.slice(0, 7)} is already in ${base}.`
+    return summarise(opts, { outcome: 'up-to-date', report })
   }
 
   const branch = `upstream-sync/${opts.date}`
@@ -70,7 +76,7 @@ export function syncUpstream(opts: SyncOptions): SyncResult {
       `Conflicted files:\n\n${fenced(conflicted)}`,
       commits,
     ].join('\n\n')
-    return openIssue(opts, env, { outcome: 'conflict', report }, `Upstream merge ${opts.date}: conflict`)
+    return summarise(opts, { outcome: 'conflict', report })
   }
 
   const tests = spawnSync('sh', ['-c', opts.testCommand], { cwd: opts.repoDir, env, encoding: 'utf8' })
@@ -90,17 +96,43 @@ export function syncUpstream(opts: SyncOptions): SyncResult {
     commits,
     `Test command \`${opts.testCommand}\`, last ${TEST_OUTPUT_TAIL} lines:\n\n${fenced(testOutput)}`,
   ].join('\n\n')
-  const title = `Upstream merge ${opts.date}: ${passed ? 'ready for a pull request' : 'tests failed'}`
-  return openIssue(opts, env, { outcome: passed ? 'ready' : 'tests-failed', report, branch }, title)
+  const title = `Upstream merge ${opts.date}: ${passed ? 'ready to review' : 'tests failed'}`
+  const result: SyncResult = { outcome: passed ? 'ready' : 'tests-failed', report, branch }
+  return summarise(opts, openPullRequest(opts, env, result, branch, title, compare))
 }
 
-function openIssue(opts: SyncOptions, env: NodeJS.ProcessEnv, result: SyncResult, title: string): SyncResult {
-  const issueUrl = execFileSync(
-    opts.gh ?? 'gh',
-    ['issue', 'create', '--repo', opts.forkRepo, '--title', title, '--body', result.report],
-    { cwd: opts.repoDir, env, encoding: 'utf8' },
-  ).trim()
-  return { ...result, issueUrl }
+/** Opens the pull request from the pushed branch; a refusal goes into the report, never stops it. */
+function openPullRequest(
+  opts: SyncOptions,
+  env: NodeJS.ProcessEnv,
+  result: SyncResult,
+  branch: string,
+  title: string,
+  compare: string,
+): SyncResult {
+  const args = ['pr', 'create', '--repo', opts.forkRepo, '--base', opts.baseBranch, '--head', branch]
+  if (result.outcome !== 'ready') args.push('--draft')
+  const created = spawnSync(opts.gh ?? 'gh', [...args, '--title', title, '--body', result.report], {
+    cwd: opts.repoDir,
+    env,
+    encoding: 'utf8',
+  })
+  if (created.status === 0) {
+    const pullRequestUrl = created.stdout.trim()
+    return { ...result, pullRequestUrl, report: `Pull request: ${pullRequestUrl}\n\n${result.report}` }
+  }
+  const refusal = `${created.stderr ?? ''}${created.error?.message ?? ''}`.trim()
+  const report = [
+    `The pull request could not be opened: ${refusal}`,
+    `Open it by hand: ${compare}?expand=1`,
+    result.report,
+  ].join('\n\n')
+  return { ...result, report }
+}
+
+function summarise(opts: SyncOptions, result: SyncResult): SyncResult {
+  if (opts.summaryFile) appendFileSync(opts.summaryFile, `## Upstream merge ${opts.date}\n\n${result.report}\n`)
+  return result
 }
 
 function fenced(text: string): string {
@@ -127,7 +159,8 @@ if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
     baseBranch: argument(argv, '--base') ?? 'main',
     date: new Date().toISOString().slice(0, 10),
     testCommand: argument(argv, '--test') ?? 'bun run test',
+    summaryFile: process.env.GITHUB_STEP_SUMMARY,
   })
-  console.log(`${result.outcome}${result.issueUrl ? ` ${result.issueUrl}` : ''}\n\n${result.report}`)
+  console.log(`${result.outcome}${result.pullRequestUrl ? ` ${result.pullRequestUrl}` : ''}\n\n${result.report}`)
   process.exit(result.outcome === 'up-to-date' || result.outcome === 'ready' ? 0 : 1)
 }
