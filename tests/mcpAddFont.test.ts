@@ -21,6 +21,8 @@ import { ttf } from './fontFiles.ts'
 /* the suite calls the tool far more often than a minute's cap; the cap itself is tested in rate-limit-wiring */
 vi.hoisted(() => {
   process.env.MCP_ADD_FONTS_PER_MIN = '1000'
+  /* billing on, so every library here is a Free one holding two families (FREE_FONT_FAMILIES) */
+  process.env.STRIPE_SECRET_KEY = 'sk_test_doop_fake'
 })
 
 vi.mock('../server/db/index.ts', async () => {
@@ -344,6 +346,9 @@ describe('add_font', () => {
       plexFace(400, '-F63fjptAgt5VM-kVkqdyU8n5ig') + plexFace(600, '-F6qfjptAgt5VM-kVkqdyU8n3vAO8lc')
     FONT_FILES[`${plex}/-F63fjptAgt5VM-kVkqdyU8n5ig.ttf`] = ttf({ family: 'IBM Plex Mono', weight: 400 })
     FONT_FILES[`${plex}/-F6qfjptAgt5VM-kVkqdyU8n3vAO8lc.ttf`] = ttf({ family: 'IBM Plex Mono SemiBold', weight: 600 })
+    /* a Free library with one family already: the 600 file counted under its own
+       family name would be a third family and be refused */
+    expect((await addFontAs('member-id', { workspace_id: workspaceId, family: 'Inter' })).isError).toBe(false)
 
     const { isError, text } = await addFontAs('member-id', {
       workspace_id: workspaceId,
@@ -356,7 +361,7 @@ describe('add_font', () => {
       { family: 'IBM Plex Mono', weight: '400', style: 'normal' },
       { family: 'IBM Plex Mono', weight: '600', style: 'normal' },
     ]
-    expect(faces(library())).toEqual(expected)
+    expect(faces(library().filter((r) => r.family !== 'Inter'))).toEqual(expected)
     expect(JSON.parse(text).fonts).toEqual(expected)
   })
 
