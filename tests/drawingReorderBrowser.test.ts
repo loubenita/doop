@@ -288,7 +288,7 @@ describe.skipIf(!findBrowserPath())('drawing on the canvas', { timeout: 30_000 }
         const before = await visibleDrawing('Layers', '#rect')
         const iframe = (await (await page.$('iframe[title="Layers"]'))!.contentFrame())!
         await iframe.evaluate((message) => {
-          delete document.body.dataset.replied
+          window.heldReplyPassed = false
           window.addEventListener(
             'message',
             function delay(event) {
@@ -298,7 +298,7 @@ describe.skipIf(!findBrowserPath())('drawing on the canvas', { timeout: 30_000 }
               window.removeEventListener('message', delay, true)
               setTimeout(() => {
                 window.dispatchEvent(new MessageEvent('message', { data: event.data, source: event.source }))
-                document.body.dataset.replied = 'true'
+                window.heldReplyPassed = true
               }, 250)
             },
             true,
@@ -310,7 +310,7 @@ describe.skipIf(!findBrowserPath())('drawing on the canvas', { timeout: 30_000 }
         await page.mouse.move(before.x + 100, before.y + 70, { steps: 3 })
         if (cancel) await page.keyboard.press('Escape')
         await page.mouse.up()
-        await iframe.waitForFunction(() => document.body.dataset.replied === 'true')
+        await iframe.waitForFunction(() => window.heldReplyPassed === true)
         await expect
           .poll(async () => (await visibleDrawing('Layers', '#rect')).x)
           .toBeCloseTo(before.x + (cancel ? 0 : 60), 0)

@@ -197,20 +197,32 @@ describe.skipIf(!findBrowserPath())('sandboxed frame replay', () => {
       await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 1100)))
       expect(attempts).toBe(3)
 
+      /* The next failure schedules a 250ms retry, and this test has to stop
+         recording while that retry is still pending. On a loaded machine the
+         steps below took longer than 250ms and the retry ran first, so the
+         frame's timers run 8x slower from here (the retry waits 2s), and the
+         check after the stop waits past that. */
+      const child = page.frames().find((f) => f !== page.mainFrame())!
+      await child.evaluate(() => {
+        const original = window.setTimeout
+        window.setTimeout = ((handler: TimerHandler, ms?: number, ...rest: unknown[]) =>
+          original(handler, (ms ?? 0) * 8, ...rest)) as typeof window.setTimeout
+      })
       await page.evaluate(() => {
         window.stopReplay()
         window.startReplay()
       })
       await vi.waitFor(() => expect(attempts).toBe(4))
-      const child = page.frames().find((f) => f !== page.mainFrame())!
       await child.waitForFunction(() => !document.querySelector('script[data-doop-replay]'))
       await page.evaluate(() => window.stopReplay())
-      await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 600)))
+      await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 2500)))
       expect(attempts).toBe(4)
       expect(await page.evaluate(() => window.messages.filter((m) => m.type === 'rrweb'))).toEqual([])
     } finally {
       page.off('request', onRequest)
       await page.setRequestInterception(false)
     }
-  })
+    /* about 5s of the time is fixed waits: the backoff, the 1.1s hold and the
+       2.5s after the stop, past vitest's 5s default on a loaded machine */
+  }, 20_000)
 })
