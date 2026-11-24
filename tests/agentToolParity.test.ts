@@ -29,6 +29,11 @@ const BY_CONTEXT = [
   'list_canvases', // a resident run is scoped to its canvas
   'create_canvas',
   'get_profile',
+  'list_workspaces', // workspaces are the account's, above any one canvas
+  'create_workspace',
+  'rename_workspace',
+  'delete_workspace',
+  'move_canvas_to_workspace',
 ]
 
 /** Real gaps: MCP agents can do these and resident agents cannot yet. */
