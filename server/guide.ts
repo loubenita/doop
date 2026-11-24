@@ -296,6 +296,12 @@ ${FRAME_STYLES}
   To put a Google Fonts family in a workspace's library yourself, call add_font (workspace_id,
   family, weights, italic; workspace_id is on the list_canvases rows). The font lands in that
   workspace's library, and the canvases in that workspace then list it under \`fonts\`.
+- Workspaces: list_workspaces shows the ones this account is in and its role there.
+  create_workspace makes one this account owns; rename_workspace needs owner or admin.
+  move_canvas_to_workspace moves a whole canvas, frames untouched, into a workspace (canvas
+  owner only) or out with workspace_id null (owner or a workspace admin). delete_workspace is
+  owner-only, needs confirm: true and refuses a workspace that still holds canvases; never
+  delete one unless the human asked for exactly that.
 - Pictures on the canvas: a frame listed with \`images\` references raster images people
   uploaded or pasted, each with a \`description\` of what it shows, written by a vision model
   (null while pending). Read them before designing, and call get_frame_screenshot on the
