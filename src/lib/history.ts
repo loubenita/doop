@@ -78,6 +78,11 @@ export function trackSave(p: Promise<unknown>) {
   inflight = inflight.then(() => p.catch(() => undefined))
 }
 
+/** Resolves once every tracked save has landed. */
+export function savesLanded() {
+  return inflight
+}
+
 /* bumped by every clearHistory, so a save that finishes later can tell the
    history it was made under is gone (another canvas, or a fresh visit) */
 let epoch = 0
