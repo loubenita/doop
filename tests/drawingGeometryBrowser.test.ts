@@ -323,7 +323,7 @@ describe.skipIf(!findBrowserPath())('drawing on the canvas', { timeout: 30_000 }
             window.dispatchEvent(
               new MessageEvent('message', { data: { ...event.data, delayed: true }, source: event.source }),
             )
-            document.body.dataset.replied = 'true'
+            window.heldReplyPassed = true
           }, 250)
         },
         true,
@@ -334,7 +334,7 @@ describe.skipIf(!findBrowserPath())('drawing on the canvas', { timeout: 30_000 }
     await page.mouse.move(900, 600)
     if (cancel) await page.keyboard.press('Escape')
     await page.mouse.up()
-    await iframe.waitForFunction(() => document.body.dataset.replied === 'true')
+    await iframe.waitForFunction(() => window.heldReplyPassed === true)
     if (cancel) {
       await page.evaluate(
         () => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))),

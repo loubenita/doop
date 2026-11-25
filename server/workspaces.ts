@@ -192,6 +192,12 @@ export function listFor(userId: string): WorkspaceSummary[] {
 
 /* ---- writes ---- */
 
+/** A workspace name as REST and MCP accept it: trimmed, at most 80
+ *  characters; '' when there is none. */
+export function workspaceName(input: unknown): string {
+  return typeof input === 'string' ? input.trim().slice(0, 80) : ''
+}
+
 export function createWorkspace(name: string, ownerId: string): WorkspaceRecord {
   const now = Date.now()
   const ws: WorkspaceRecord = {
@@ -554,18 +560,29 @@ export function planRequired(res: express.Response, ws: WorkspaceRecord) {
   })
 }
 
-function requireWorkspace(req: express.Request, res: express.Response, id: string, atLeast: WorkspaceRole = 'member') {
+export type WorkspaceAccess =
+  { ok: true; ws: WorkspaceRecord } | { ok: false; reason: 'not_found' | 'role'; error: string }
+
+/** May this user act on this workspace at this role? The one rule REST and
+ *  MCP share. A non-member is told it is not there: a workspace's existence
+ *  is its members' business. */
+export function workspaceAccess(id: string, userId: string | undefined, atLeast: WorkspaceRole): WorkspaceAccess {
   const ws = records.get(id)
-  if (!ws || !isWorkspaceMember(id, req.user!.id)) {
-    /* 404 for non-members: a workspace's existence is its members' business */
-    res.status(404).json({ error: 'workspace not found' })
-    return null
-  }
-  if (!hasRole(id, req.user!.id, atLeast)) {
-    res.status(403).json({ error: `only workspace ${atLeast === 'owner' ? 'owners' : 'admins'} can do that` })
-    return null
-  }
-  return ws
+  if (!ws || !isWorkspaceMember(id, userId)) return { ok: false, reason: 'not_found', error: 'workspace not found' }
+  if (!hasRole(id, userId, atLeast))
+    return {
+      ok: false,
+      reason: 'role',
+      error: `only workspace ${atLeast === 'owner' ? 'owners' : 'admins'} can do that`,
+    }
+  return { ok: true, ws }
+}
+
+function requireWorkspace(req: express.Request, res: express.Response, id: string, atLeast: WorkspaceRole = 'member') {
+  const access = workspaceAccess(id, req.user!.id, atLeast)
+  if (access.ok) return access.ws
+  res.status(access.reason === 'not_found' ? 404 : 403).json({ error: access.error })
+  return null
 }
 
 workspacesRouter.get('/', (req, res) => {
@@ -573,7 +590,7 @@ workspacesRouter.get('/', (req, res) => {
 })
 
 workspacesRouter.post('/', (req, res) => {
-  const name = typeof req.body?.name === 'string' ? req.body.name.trim().slice(0, 80) : ''
+  const name = workspaceName(req.body?.name)
   if (!name) return res.status(400).json({ error: 'name required' })
   const ws = createWorkspace(name, req.user!.id)
   res.json(summaryFor(ws, req.user!.id))
@@ -588,7 +605,7 @@ workspacesRouter.get('/:id', async (req, res) => {
 workspacesRouter.patch('/:id', (req, res) => {
   const ws = requireWorkspace(req, res, req.params.id, 'admin')
   if (!ws) return
-  const name = typeof req.body?.name === 'string' ? req.body.name.trim().slice(0, 80) : ''
+  const name = workspaceName(req.body?.name)
   if (!name) return res.status(400).json({ error: 'name required' })
   renameWorkspace(ws.id, name)
   res.json(summaryFor(ws, req.user!.id))

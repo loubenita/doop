@@ -38,9 +38,16 @@ function setUp(): void {
   const gh = path.join(dir, 'gh')
   writeFileSync(
     gh,
-    `#!/bin/sh\nprintf '%s\\n' "$@" >> "${path.join(dir, 'gh.log')}"\necho https://github.com/loubenita/doop/issues/7\n`,
+    `#!/bin/sh\nprintf '%s\\n' "$@" >> "${path.join(dir, 'gh.log')}"\necho https://github.com/loubenita/doop/pull/7\n`,
   )
   chmodSync(gh, 0o755)
+  /* What gh says when the repository does not let GitHub Actions open pull requests. */
+  const refusingGh = path.join(dir, 'gh-refuses')
+  writeFileSync(
+    refusingGh,
+    `#!/bin/sh\necho 'pull request create failed: GraphQL: GitHub Actions is not permitted to create or approve pull requests (createPullRequest)' >&2\nexit 1\n`,
+  )
+  chmodSync(refusingGh, 0o755)
 }
 
 /** Lands a commit on a bare repo's main through a throwaway clone. */
@@ -60,6 +67,7 @@ function options(overrides: Partial<SyncOptions> = {}): SyncOptions {
     date: '2026-11-16',
     testCommand: 'echo all tests passed',
     gh: path.join(dir, 'gh'),
+    summaryFile: path.join(dir, 'summary.md'),
     env: identity,
     ...overrides,
   }
@@ -68,6 +76,11 @@ function options(overrides: Partial<SyncOptions> = {}): SyncOptions {
 function ghLog(): string {
   const log = path.join(dir, 'gh.log')
   return existsSync(log) ? readFileSync(log, 'utf8') : ''
+}
+
+function summary(): string {
+  const file = path.join(dir, 'summary.md')
+  return existsSync(file) ? readFileSync(file, 'utf8') : ''
 }
 
 function forkHas(ref: string): boolean {
@@ -79,21 +92,21 @@ function forkHas(ref: string): boolean {
   }
 }
 
-describe('weekly merge of upstream into the fork', () => {
+describe('daily merge of upstream into the fork', () => {
   beforeEach(setUp)
   afterEach(() => rmSync(dir, { recursive: true, force: true }))
 
-  it('pushes a dated branch holding upstream and the fork, and opens an issue with the compare link', () => {
+  it('pushes a dated branch holding upstream and the fork, and reports it in a pull request and the run summary', () => {
     land('upstream.git', 'upstream.txt', 'from upstream\n')
     land('fork.git', 'fork.txt', 'ours\n')
 
     const result = syncUpstream(
-      // printf, so the expected output is not also the command text the issue quotes
+      // printf, so the expected output is not also the command text the report quotes
       options({ testCommand: "test -f upstream.txt && test -f fork.txt && printf '%s passed\\n' 2914" }),
     )
 
     expect(result.outcome).toBe('ready')
-    expect(result.issueUrl).toBe('https://github.com/loubenita/doop/issues/7')
+    expect(result.pullRequestUrl).toBe('https://github.com/loubenita/doop/pull/7')
     const branch = 'upstream-sync/2026-11-16'
     expect(forkHas(branch)).toBe(true)
     const upstreamHead = git(path.join(dir, 'upstream.git'), 'rev-parse', 'main')
@@ -102,10 +115,28 @@ describe('weekly merge of upstream into the fork', () => {
     git(path.join(dir, 'fork.git'), 'merge-base', '--is-ancestor', forkHead, branch)
     expect(forkHead).toBe(git(path.join(dir, 'fork.git'), 'rev-parse', 'main'))
     const log = ghLog()
-    expect(log).toContain('issue\ncreate\n--repo\nloubenita/doop')
-    expect(log).toContain('https://github.com/loubenita/doop/compare/main...upstream-sync/2026-11-16')
-    expect(log).toContain('edit upstream.txt')
-    expect(log).toContain('2914 passed')
+    expect(log).toContain('pr\ncreate\n--repo\nloubenita/doop\n--base\nmain\n--head\nupstream-sync/2026-11-16')
+    expect(log).not.toContain('--draft')
+    expect(log).not.toContain('issue')
+    for (const report of [log, summary()]) {
+      expect(report).toContain('https://github.com/loubenita/doop/compare/main...upstream-sync/2026-11-16')
+      expect(report).toContain('edit upstream.txt')
+      expect(report).toContain('2914 passed')
+    }
+    expect(summary()).toContain('https://github.com/loubenita/doop/pull/7')
+  })
+
+  it('still reports in the run summary, with a link to open the pull request, when GitHub refuses to open it', () => {
+    land('upstream.git', 'upstream.txt', 'from upstream\n')
+
+    const result = syncUpstream(options({ gh: path.join(dir, 'gh-refuses') }))
+
+    expect(result.outcome).toBe('ready')
+    expect(result.pullRequestUrl).toBeUndefined()
+    expect(forkHas('upstream-sync/2026-11-16')).toBe(true)
+    expect(summary()).toContain('GitHub Actions is not permitted to create or approve pull requests')
+    expect(summary()).toContain('https://github.com/loubenita/doop/compare/main...upstream-sync/2026-11-16?expand=1')
+    expect(summary()).toContain('edit upstream.txt')
   })
 
   it('reports nothing new and touches nothing when upstream has no commits the fork lacks', () => {
@@ -116,9 +147,10 @@ describe('weekly merge of upstream into the fork', () => {
     expect(result.outcome).toBe('up-to-date')
     expect(forkHas('upstream-sync/2026-11-16')).toBe(false)
     expect(ghLog()).toBe('')
+    expect(summary()).toContain('already in origin/main')
   })
 
-  it('stops on a merge conflict, names the conflicted files in the issue and pushes nothing', () => {
+  it('stops on a merge conflict, names the conflicted files in the run summary and pushes nothing', () => {
     land('upstream.git', 'shared.txt', 'upstream wording\n')
     land('fork.git', 'shared.txt', 'our wording\n')
 
@@ -127,13 +159,14 @@ describe('weekly merge of upstream into the fork', () => {
     expect(result.outcome).toBe('conflict')
     expect(forkHas('upstream-sync/2026-11-16')).toBe(false)
     expect(git(work, 'status', '--porcelain')).toBe('')
-    const log = ghLog()
-    expect(log).toContain('conflict')
-    expect(log).toContain('shared.txt')
-    expect(log).not.toContain('tests ran')
+    expect(ghLog()).toBe('')
+    const report = summary()
+    expect(report).toContain('conflict')
+    expect(report).toContain('shared.txt')
+    expect(report).not.toContain('tests ran')
   })
 
-  it('stops on failing tests, pushes the branch for inspection and puts the failure in the issue', () => {
+  it('stops on failing tests, pushes the branch for inspection and puts the failure in a draft pull request', () => {
     land('upstream.git', 'upstream.txt', 'from upstream\n')
 
     const result = syncUpstream(options({ testCommand: "printf 'FAIL %s\\n' tests/fonts.test.ts; exit 1" }))
@@ -141,7 +174,10 @@ describe('weekly merge of upstream into the fork', () => {
     expect(result.outcome).toBe('tests-failed')
     expect(forkHas('upstream-sync/2026-11-16')).toBe(true)
     const log = ghLog()
-    expect(log).toContain('tests failed')
-    expect(log).toContain('FAIL tests/fonts.test.ts')
+    expect(log).toContain('--draft')
+    for (const report of [log, summary()]) {
+      expect(report).toContain('tests failed')
+      expect(report).toContain('FAIL tests/fonts.test.ts')
+    }
   })
 })

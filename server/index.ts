@@ -56,6 +56,7 @@ import { tokensCss, tokensMarkdown, tokensTailwind } from '../shared/designToken
 import {
   canEditCanvas,
   canManageCanvas,
+  canvasMoveRefusal,
   canvasRole,
   guestCanvasRole,
   hasDurableCanvasAccess,
@@ -1467,28 +1468,20 @@ app.delete('/api/canvases/:id/publish', (req, res) => {
   res.json({ ok: true })
 })
 
-/* Move a canvas into a workspace (its owner, who must be a member, while it
-   may grow) or back out to its owner's personal space (the owner, or a
-   workspace admin). Moving is an access change, not an edit: every member
-   of the target workspace can open it from now on. */
+/* Move a canvas into a workspace or back out to its owner's personal space,
+   by canvasMoveRefusal's rules (shared with MCP's move_canvas_to_workspace).
+   Moving is an access change, not an edit: every member of the target
+   workspace can open it from now on. */
 app.put('/api/canvases/:id/workspace', (req, res) => {
   const c = requireCanvas(req, res, req.params.id, 'edit')
   if (!c) return
   const target = req.body?.workspaceId
   if (target !== null && typeof target !== 'string')
     return res.status(400).json({ error: 'workspaceId must be a workspace id or null' })
-  if (!canManageCanvas(req.user!.id, c))
-    return res.status(403).json({ error: 'only the canvas owner or a workspace admin can move it' })
-  if (target !== null) {
-    if (target === c.workspaceId) return res.json({ ok: true })
-    /* an admin's say over a workspace canvas ends at moving it out: re-homing
-       it into another workspace — one the owner may not even belong to — is
-       the owner's call alone */
-    if (c.ownerId !== req.user!.id)
-      return res.status(403).json({ error: 'only the canvas owner can move it into a workspace' })
-    if (!requireGrowableWorkspace(req, res, target)) return
-  }
-  store.setWorkspace(c.id, target ?? undefined)
+  const refusal = canvasMoveRefusal(req.user!.id, c, target)
+  if (refusal?.reason === 'plan_required') return workspaces.planRequired(res, refusal.ws)
+  if (refusal) return res.status(refusal.reason === 'not_found' ? 404 : 403).json({ error: refusal.error })
+  if (target !== c.workspaceId) store.setWorkspace(c.id, target ?? undefined)
   res.json({ ok: true })
 })
 
