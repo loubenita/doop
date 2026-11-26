@@ -1,21 +1,25 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEvent } from 'react'
-import { useStore, type ComposerSend } from '../lib/store'
+import { pickedSelectors, useStore, type ComposerSend } from '../lib/store'
 import { api, type Allowance } from '../lib/api'
 import { posthog } from '../lib/posthog'
 import { uploadImageFrames } from '../lib/frameClipboard'
+import { arrivedDeliverable } from '../lib/composerFlight'
 import { isResidentLimit, meterText, useAllowance } from './TeamAllowance'
 import { Button } from './ui/button'
 import { Textarea } from './ui/textarea'
 import { Note } from './ui/note'
 import { Tooltip } from './ui/tooltip'
 import { DoopMark } from './Logo'
-import { ArrowUpIcon, AttachmentIcon, FrameIcon, XIcon } from './ui/icons'
+import { ArrowUpIcon, AttachmentIcon, BookOpenIcon, FrameIcon, XIcon } from './ui/icons'
 import { ModelPicker } from './ModelPicker'
+import { useSkillMenu } from './SkillMenu'
 import { currentRunnerPick, useRunnerPick } from '../lib/runnerPick'
 import { resolveRunnerPick } from '../../shared/agentRunner'
+import { AGENT_ROLES, DEFAULT_ROLE_ID, mentionedRoles } from '../../shared/agents'
 import { LayerKindIcon } from './LayerKindIcon'
 import { buildLayerTree, findLayer, layerName } from '../lib/layers'
-import type { CardScope } from '../../shared/types'
+import type { CardScope, CardTarget } from '../../shared/types'
+import { exceedsCardTargetLimit, MAX_CARD_TARGETS, scopeFromTargets } from '../../shared/cardScope'
 import type { LayerKind } from '../lib/layers'
 import { t as translate, useT } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
@@ -34,6 +38,10 @@ import { cn } from '@/lib/utils'
 const MAX_ATTACHMENTS = 4
 /** the scope chip's label is cut here so a long text node never eats the row */
 const MAX_SCOPE_LABEL = 24
+/** Bottom padding for the scrolling list right above the composer: the scope
+ *  chip's row (34px: its 10px top padding and the 24px chip) floats over the
+ *  end of that list, and 12px more keeps the last line off the chip's edge. */
+export const SCOPE_ROW_CLEARANCE = 'pb-[46px]'
 /** the field grows with the draft up to this many lines, then scrolls */
 const MAX_COMPOSER_LINES = 6
 /** a ⌘/ older than this is ignored by a composer that mounts later */
@@ -48,11 +56,6 @@ interface ScopeChip {
 
 function clip(text: string): string {
   return text.length > MAX_SCOPE_LABEL ? `${text.slice(0, MAX_SCOPE_LABEL - 1).trimEnd()}…` : text
-}
-
-/** "frame:element" for an element scope, the frame id alone for a frame one */
-function scopeKey(scope: CardScope): string {
-  return scope.selector ? `${scope.frameId}:${scope.selector}` : scope.frameId
 }
 
 const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024 // mirrors the server's asset cap
@@ -70,7 +73,9 @@ let cancelPendingFlight: (() => void) | null = null
  * the panel) while the agent works must not cancel the flight. Leaving the
  * canvas does: another canvas's frames are all "new" to this watch, and a
  * flight there would land on something unrelated. A newer submit replaces
- * an older watch.
+ * an older watch. A component's main is not the deliverable: the watch
+ * keeps waiting past it rather than pulling the person onto the Components
+ * page.
  */
 function flyToNextFrame(canvasId: string, extraKnown: string[]) {
   cancelPendingFlight?.()
@@ -79,7 +84,7 @@ function flyToNextFrame(canvasId: string, extraKnown: string[]) {
     /* null while a canvas loads — only a different canvas ends the watch */
     if (!s.canvas) return
     if (s.canvas.id !== canvasId) return stop()
-    const arrived = s.canvas.frames.find((f) => !known.has(f.id))
+    const arrived = arrivedDeliverable(s.canvas, known)
     if (!arrived) return
     stop()
     s.requestFlyTo(arrived.id)
@@ -141,17 +146,22 @@ async function sendPrompt(args: {
     /* the composer's pick rides on the card, so the task runs on what the
        picker beside the send button shows */
     const runner = currentRunnerPick()
+    /* "@copy tighten the hero" goes to the Copywriter, "@copy @a11y …" to
+       both in that order; no mention is Doop's */
+    const mentioned = mentionedRoles(text, store.canvas?.team ?? AGENT_ROLES).map((role) => role.id)
     await api.addCard(
       canvasId,
       text,
-      ['doop'],
+      mentioned.length > 0 ? mentioned : [DEFAULT_ROLE_ID],
       refFrames.map((f) => f.id),
       scope,
       runner,
     )
     posthog.capture('prompt_bar_submitted', {
       attachments: refFrames.length,
+      agents: mentioned.length,
       scope: scope ? (scope.selector ? 'element' : 'frame') : 'none',
+      targets: scope ? 1 + (scope.additionalTargets?.length ?? 0) : 0,
       runner: runner?.provider ?? 'default',
     })
     flyToNextFrame(
@@ -198,7 +208,10 @@ interface Attachment {
 }
 
 export function PromptBar({ canvasId }: { canvasId: string }) {
+  const t = useT()
   const frames = useStore((s) => s.canvas?.frames)
+  const selectedIds = useStore((s) => s.selectedIds)
+  const selectedElements = useStore((s) => s.selectedElements)
   const selectedId = useStore((s) => s.selectedId)
   const selectedElement = useStore((s) => s.selectedElement)
   const focusAt = useStore((s) => s.composerFocusAt)
@@ -221,10 +234,20 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
   const chip = useMemo<ScopeChip | null>(() => {
     const frame = frames?.find((f) => f.id === (selectedElement?.frameId ?? selectedId))
     if (!frame) return null
-    const scope: CardScope = selectedElement
-      ? { frameId: frame.id, selector: selectedElement.selector }
-      : { frameId: frame.id }
-    if (dismissed === scopeKey(scope)) return null
+    const targets: CardTarget[] = selectedIds.filter((id) => id !== frame.id).map((frameId) => ({ frameId }))
+    if (selectedElement) {
+      for (const selector of pickedSelectors({ selectedElement, selectedElements })) {
+        targets.push({ frameId: frame.id, selector })
+      }
+    } else targets.push({ frameId: frame.id })
+    const scope = scopeFromTargets(targets)!
+    if (dismissed === JSON.stringify(scope)) return null
+    if (scope.additionalTargets) {
+      const label = selectedElement
+        ? t('panels.promptSelectionCount', { count: targets.length })
+        : t('rail.frameCount', { count: targets.length })
+      return { scope, label, kind: selectedElement ? 'box' : 'frame' }
+    }
     if (!selectedElement) return { scope, label: frame.name, kind: 'frame' }
     const node = findLayer(buildLayerTree(frame.html), selectedElement.selector)
     return {
@@ -232,7 +255,7 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
       label: node ? layerName(node) : (selectedElement.selector.split(' > ').at(-1) ?? ''),
       kind: node?.kind ?? 'box',
     }
-  }, [frames, selectedId, selectedElement, dismissed])
+  }, [frames, selectedId, selectedIds, selectedElement, selectedElements, dismissed, t])
   const [attachments, setAttachments] = useState<Attachment[]>([])
   /* attachment slips (too big, too many) — local and brief, unlike a failed
      send, which the store keeps until the draft changes */
@@ -242,7 +265,14 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
   const error = attachError ?? sendError
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
-  const t = useT()
+  const skillMenu = useSkillMenu({
+    from: { canvasId },
+    text,
+    setText: (value) => setDraft(canvasId, value),
+    inputRef,
+    /* the store keeps the draft per canvas, so leaving to add a skill loses nothing */
+    offerNew: true,
+  })
   const meter = meterText(allowance, t, pickedProvider, picked?.runner.name)
 
   useLayoutEffect(() => {
@@ -290,6 +320,10 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
   async function submit(prompt: string) {
     const clean = prompt.trim()
     if (!clean || busy) return
+    if (exceedsCardTargetLimit(chip?.scope)) {
+      showError(t('panels.promptTooManyTargets', { count: MAX_CARD_TARGETS }))
+      return
+    }
     const files = attachments.map((a) => a.file)
     await sendPrompt({ canvasId, text: clean, files, scope: chip?.scope, allowance })
     /* the thumbnails go once the card is queued: the files were handed to
@@ -301,9 +335,10 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
   }
 
   function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
+    if (skillMenu.onKeyDown(e)) return
     if (e.key === 'Escape' && chip) {
       e.preventDefault()
-      setDismissed(scopeKey(chip.scope))
+      setDismissed(JSON.stringify(chip.scope))
       return
     }
     /* Enter sends, ⇧Enter breaks the line; an Enter that commits an IME
@@ -337,13 +372,58 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
   return (
     <div
       className={cn(
-        'flex shrink-0 flex-col gap-1.5 border-t border-line-soft bg-surface px-3 pt-2.5 pb-2',
+        'relative flex shrink-0 flex-col gap-1.5 border-t border-line-soft bg-surface px-3 pt-2.5 pb-2',
+        /* the chip's row above carries the composer's top edge */
+        chip && 'border-t-transparent',
         dropping && 'bg-paper-deep',
       )}
       onDragOver={onDragOver}
       onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
+      {/* the scope chip floats above the composer over the strip the
+          conversation keeps clear at its end (SCOPE_ROW_CLEARANCE), so picking
+          an element or a frame moves nothing in the panel: the composer
+          grows upward over empty space instead of pushing the chat */}
+      {chip && (
+        <div
+          className={cn(
+            'absolute inset-x-0 bottom-full flex border-t border-line-soft bg-surface px-3 pt-2.5',
+            dropping && 'bg-paper-deep',
+          )}
+        >
+          <span
+            className="flex h-6 min-w-0 max-w-full items-center gap-1.5 rounded-[6px] pr-1 pl-2 text-[12px] text-ink-soft shadow-ring"
+            title={
+              chip.scope.additionalTargets
+                ? chip.label
+                : chip.kind === 'frame'
+                  ? t('panels.promptScopedFrame', { name: chip.label })
+                  : t('panels.promptScopedElement', { name: chip.label || t('panels.promptElement') })
+            }
+          >
+            <span className="flex-none text-ink-faint">
+              {chip.kind === 'frame' ? <FrameIcon className="size-3.5" /> : <LayerKindIcon kind={chip.kind} />}
+            </span>
+            <span className="min-w-0 truncate">{clip(chip.label || t('panels.promptElement'))}</span>
+            <Button
+              variant="bare"
+              className="size-4 flex-none justify-center rounded-full p-0 text-ink-faint hover:bg-paper-deep hover:text-ink"
+              aria-label={
+                chip.scope.additionalTargets
+                  ? t('panels.promptRemoveSelectionScope')
+                  : chip.kind === 'frame'
+                    ? t('panels.promptRemoveFrameScope')
+                    : t('panels.promptRemoveElementScope')
+              }
+              disabled={busy}
+              onClick={() => setDismissed(JSON.stringify(chip.scope))}
+            >
+              <XIcon className="size-3" aria-hidden />
+            </Button>
+          </span>
+        </div>
+      )}
       {attachments.length > 0 && (
         <div className="flex flex-wrap gap-1.5">
           {attachments.map((a) => (
@@ -363,7 +443,7 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
         </div>
       )}
       <form
-        className="rounded-[10px]"
+        className="relative rounded-[10px]"
         onSubmit={(e) => {
           e.preventDefault()
           void submit(text)
@@ -380,34 +460,7 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
             e.target.value = '' // same file can be re-picked after removal
           }}
         />
-        {chip && (
-          <div className="mb-2 flex">
-            <span
-              className="flex h-6 min-w-0 max-w-full items-center gap-1.5 rounded-[6px] pr-1 pl-2 text-[12px] text-ink-soft shadow-ring"
-              title={
-                chip.kind === 'frame'
-                  ? t('panels.promptScopedFrame', { name: chip.label })
-                  : t('panels.promptScopedElement', { name: chip.label || t('panels.promptElement') })
-              }
-            >
-              <span className="flex-none text-ink-faint">
-                {chip.kind === 'frame' ? <FrameIcon className="size-3.5" /> : <LayerKindIcon kind={chip.kind} />}
-              </span>
-              <span className="min-w-0 truncate">{clip(chip.label || t('panels.promptElement'))}</span>
-              <Button
-                variant="bare"
-                className="size-4 flex-none justify-center rounded-full p-0 text-ink-faint hover:bg-paper-deep hover:text-ink"
-                aria-label={
-                  chip.kind === 'frame' ? t('panels.promptRemoveFrameScope') : t('panels.promptRemoveElementScope')
-                }
-                disabled={busy}
-                onClick={() => setDismissed(scopeKey(chip.scope))}
-              >
-                <XIcon className="size-3" aria-hidden />
-              </Button>
-            </span>
-          </div>
-        )}
+        {skillMenu.menu}
         <Textarea
           ref={inputRef}
           variant="bare"
@@ -423,8 +476,8 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
                 : t('panels.promptPlaceholderElement')
               : t('panels.promptPlaceholder')
           }
+          {...skillMenu.inputProps}
           onKeyDown={onKeyDown}
-          onChange={(e) => setDraft(canvasId, e.target.value)}
           onPaste={(e) => {
             const images = [...(e.clipboardData?.files ?? [])].filter((f) => f.type.startsWith('image/'))
             if (images.length) {
@@ -444,6 +497,19 @@ export function PromptBar({ canvasId }: { canvasId: string }) {
             onClick={() => fileRef.current?.click()}
           >
             <AttachmentIcon className="size-3.5" />
+          </Button>
+          <Button
+            variant="bare"
+            size="icon-sm"
+            className="size-7 rounded-[7px] text-ink-faint hover:bg-paper-deep hover:text-ink"
+            aria-label={t('skills.menuLabel')}
+            title={t('skills.menuButton')}
+            disabled={busy}
+            /* keep the field's caret: the / goes where the person was typing */
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={skillMenu.openMenu}
+          >
+            <BookOpenIcon className="size-3.5" />
           </Button>
           <span className="flex-1" />
           <ModelPicker disabled={busy} />

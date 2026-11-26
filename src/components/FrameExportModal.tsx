@@ -3,6 +3,7 @@ import type { Frame } from '../../shared/types'
 import {
   downloadElementExport,
   downloadFrameExport,
+  downloadFrameHtml,
   downloadFramesPdf,
   type ElementTarget,
   type FrameExportFormat,
@@ -15,6 +16,7 @@ import { ChoiceList, ChoiceRow } from './ui/choice-list'
 import { ImportIcon } from './ui/icons'
 import { Modal, ModalActions, ModalLede, ModalTitle } from './ui/modal'
 import { useT } from '@/lib/i18n'
+import { trackExport } from '../lib/exportEvents'
 
 /** A frame's own export, or one element's: the scale to render at, then
  *  its formats as a list, each row downloads. */
@@ -39,13 +41,24 @@ export function FrameExportModal({
      starts from it too */
   function download(format: FrameExportFormat) {
     setExportSettings({ format })
+    trackExport(format, 1, element ? 'element_menu' : 'frame_menu', element ? 'element' : 'frame')
     if (element) void downloadElementExport(frame, element, format, settings.scale)
     else void downloadFrameExport(frame, format, settings.scale)
     onClose()
   }
 
   function downloadPdf() {
+    setExportSettings({ format: 'pdf' })
+    trackExport('pdf', groupFrames.length, 'frame_menu')
     void downloadFramesPdf(frame.canvasId, readingOrder(groupFrames))
+    onClose()
+  }
+
+  /* a frame's source with no render behind it: no scale, and not a pick the
+     Inspector's image export could start from */
+  function downloadHtml() {
+    trackExport('html', 1, 'frame_menu')
+    downloadFrameHtml(frame)
     onClose()
   }
 
@@ -92,6 +105,15 @@ export function FrameExportModal({
             description={groupFrames.length > 1 ? t('panels.frameExportPdfGroupHint') : t('panels.frameExportPdfHint')}
             trailing={downloadMark}
             onClick={downloadPdf}
+          />
+        )}
+        {!element && (
+          <ChoiceRow
+            icon={<AppIcon brand="html" />}
+            title={t('panels.frameExportHtml')}
+            description={t('panels.frameExportHtmlHint')}
+            trailing={downloadMark}
+            onClick={downloadHtml}
           />
         )}
       </ChoiceList>

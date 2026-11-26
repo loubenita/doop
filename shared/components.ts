@@ -4,7 +4,8 @@
  * written out in full in the frame that uses it, marked `data-doop-instance`, so
  * everything that reads frame HTML (the iframe, exports, screenshots, comments,
  * the Layers panel) needs no idea components exist. Agents read and write the
- * short form, `<doop-use component="Button" label="Buy"></doop-use>`.
+ * short form, `<doop-use component="Button" label="Buy"></doop-use>`, and it is
+ * also how a frame's row keeps an instance at rest (server/frameRest.ts).
  * Spec: .context/specs/components.md.
  */
 
@@ -74,6 +75,9 @@ export interface ComponentCode {
 
 export interface ComponentSnapshot {
   rev: number
+  /** the revision this state last changed what an instance is rendered from (see
+   *  `ComponentDef.renderRev`); absent means `rev` */
+  renderRev?: number
   template: string
   rawCss: string
   head: string[]
@@ -97,17 +101,124 @@ export interface ComponentDef {
   props: ComponentProp[]
   slots: ComponentSlot[]
   rev: number
+  /** the newest revision at which what an instance is rendered from (the template and the
+   *  props) last changed. A revision of the rules alone (stylesheet, head tags) raises
+   *  `rev` and leaves this: every revision from `renderRev` to `rev` renders the same
+   *  markup, an instance is marked with `renderRev`, and it is behind only when its mark
+   *  is older. Absent means `rev`. Set by the store on every save (`store.saveComponent`). */
+  renderRev?: number
   /** the frame whose element is the main; null once that element is gone */
   mainFrameId: string | null
   code?: ComponentCode
-  /** imported from a library canvas: pulled on request, never pushed */
-  source?: { canvasId: string; componentId: string; rev: number }
+  /** imported from a library canvas: pulled on request, never pushed. `library`
+   *  marks a link to a workspace library's published snapshot: such a component
+   *  has no main here, and is changed on its library canvas. */
+  source?: { canvasId: string; componentId: string; rev: number; library?: true }
   /** recent earlier states, newest last: rollback and three-way merge of stale saves */
   history: ComponentSnapshot[]
+  /** `deleted` is a soft delete: the definition is kept and frozen, its instances keep
+   *  their markup and stop following it, new uses are refused, and it can be restored.
+   *  Absent means active. */
+  status?: 'active' | 'deleted'
+  deletedAt?: number
+  deletedBy?: string
   createdAt: number
   updatedAt: number
   updatedBy: string
 }
+
+/** A definition as browsers and the native apps get it (room `init`, `component` messages,
+ *  REST): without its earlier revisions, which only the server merges against. The editor
+ *  reads them on request: `GET /api/canvases/:id/components/:componentId/revisions`. */
+export type WireComponentDef = Omit<ComponentDef, 'history'>
+
+export function wireComponent(def: ComponentDef): WireComponentDef {
+  const { history: _history, ...wire } = def
+  return wire
+}
+
+/** A canvas as a browser gets it: its components without their earlier revisions. */
+export function withWireComponents<C extends { components?: ComponentDef[] }>(
+  canvas: C,
+): Omit<C, 'components'> & { components?: WireComponentDef[] } {
+  const { components, ...rest } = canvas
+  return components ? { ...rest, components: components.map(wireComponent) } : rest
+}
+
+/** The revision an instance of this state is marked with: where its markup last changed. */
+export function renderRevOf(state: { rev: number; renderRev?: number }): number {
+  return state.renderRev ?? state.rev
+}
+
+/** Do two states of a component render the same instance markup? */
+export function rendersSame(
+  a: Pick<ComponentDef, 'template' | 'props'>,
+  b: Pick<ComponentDef, 'template' | 'props'>,
+): boolean {
+  return a.template === b.template && (a.props === b.props || JSON.stringify(a.props) === JSON.stringify(b.props))
+}
+
+/** What a component rendered from at the revision an instance is marked with: the
+ *  definition itself when that revision renders as it does now, else the kept state
+ *  whose span of revisions (`renderRev`..`rev`) holds the mark. Rules-only revisions use
+ *  up kept history without moving a mark out of reach: a span is found by any of its
+ *  revisions. Undefined when no kept state covers it. */
+export function stateAtRev<D extends Pick<ComponentDef, 'rev' | 'renderRev' | 'template' | 'props' | 'history'>>(
+  def: D,
+  rev: number,
+): D | (Pick<ComponentSnapshot, 'template' | 'props'> & { rev: number }) | undefined {
+  if (rev > def.rev) return undefined
+  if (rev >= renderRevOf(def)) return rev === renderRevOf(def) ? def : { rev, template: def.template, props: def.props }
+  const kept = def.history.find((entry) => renderRevOf(entry) <= rev && rev <= entry.rev)
+  return kept ? { rev, template: kept.template, props: kept.props } : undefined
+}
+
+export function isDeleted(def: Pick<ComponentDef, 'status'> | undefined): boolean {
+  return def?.status === 'deleted'
+}
+
+/** A definition with no markup: a row that lost its content (an older write landing last,
+ *  2026-11-11). Nothing can be rendered from it, so its instances are left exactly as they
+ *  are, stylesheet included, until its main is written again and gives it back its markup. */
+export function isHollow(def: Pick<ComponentDef, 'template'> | undefined): boolean {
+  return def !== undefined && !def.template.trim()
+}
+
+/** The components of a canvas that are in use: everything but the soft-deleted. */
+export function activeComponents<T extends Pick<ComponentDef, 'status'>>(defs: readonly T[] | undefined): T[] {
+  return (defs ?? []).filter((def) => !isDeleted(def))
+}
+
+/** A component as its workspace library last published it. Canvases in the
+ *  workspace use this snapshot, never the library canvas's live definition, so
+ *  work in progress there reaches nobody until it is published. */
+export interface LibraryComponent {
+  /** the library canvas */
+  canvasId: string
+  id: string
+  name: string
+  description: string
+  template: string
+  css: string
+  rawCss: string
+  head: string[]
+  props: ComponentProp[]
+  slots: ComponentSlot[]
+  code?: ComponentCode
+  /** nested components this one is built from that come from ANOTHER library,
+   *  by component id → that library's canvas: recorded at publish time, so a
+   *  canvas taking this up follows the same library the publisher did. Ones
+   *  from this same library are not listed. */
+  nested?: Record<string, string>
+  /** this publication's version: the library canvas's revision when taken, raised
+   *  past the last publication's when a change left that revision alone */
+  rev: number
+  publishedAt: number
+  publishedBy: string
+}
+
+/** What publishing would do to one component of a library canvas. */
+export type LibraryChange = 'new' | 'changed' | 'unchanged' | 'removed'
 
 /** One template element's overrides on one instance. A value of null removes what the template set. */
 export interface PartOverride {
@@ -132,17 +243,29 @@ export interface InstanceOverrides {
 
 export type ComponentIssueCode =
   | 'unknown_component'
+  | 'deleted_component'
   | 'unknown_prop'
   | 'invalid_prop_value'
   | 'nesting_cycle'
   | 'unknown_main'
   | 'instance_removed'
   | 'too_deep'
+  | 'library_ambiguous'
+  | 'ignored_attribute'
+  | 'css_not_kept'
+  | 'css_unmatched'
+  | 'css_not_read'
+  | 'empty_template'
+  | 'unclosed_use'
 
 /** Something an agent should hear about instead of finding out from a screenshot. */
 export interface ComponentIssue {
   code: ComponentIssueCode
   message: string
+  /** `unclosed_use`: the component the open tag names, as written */
+  component?: string
+  /** `unclosed_use` in slot or override content, which is whole: no later stream chunk closes it */
+  inOverride?: boolean
 }
 
 /** One instance's identity as the editor needs it, read from the frame's markup. */
@@ -200,7 +323,22 @@ export interface Binding {
   prop: string
 }
 
-export function parseBindings(value: string): Binding[] {
+/** What a bare binding (`data-doop-prop="photo"`) fills on an element that holds no text:
+ *  an image's source, a field's value. Elsewhere a bare binding is the text. */
+const BARE_TARGET = new Map([
+  ['img', 'src'],
+  ['source', 'src'],
+  ['video', 'src'],
+  ['audio', 'src'],
+  ['iframe', 'src'],
+  ['embed', 'src'],
+  ['input', 'value'],
+])
+
+/** The bindings in a data-doop-prop value. Pass the element's tag so a bare name on an <img>
+ *  binds its src: as text it would fill nothing, and the prop would silently do nothing. */
+export function parseBindings(value: string, tagName?: string): Binding[] {
+  const bare = (tagName && BARE_TARGET.get(tagName.toLowerCase())) ?? null
   const bindings: Binding[] = []
   for (const piece of value.split(',')) {
     const text = piece.trim()
@@ -208,7 +346,7 @@ export function parseBindings(value: string): Binding[] {
     const at = text.lastIndexOf(':')
     const prop = (at === -1 ? text : text.slice(at + 1)).trim()
     if (!isPropName(prop)) continue
-    bindings.push({ target: at === -1 ? null : text.slice(0, at).trim().toLowerCase(), prop })
+    bindings.push({ target: at === -1 ? bare : text.slice(0, at).trim().toLowerCase(), prop })
   }
   return bindings
 }

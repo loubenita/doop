@@ -34,6 +34,11 @@ const BY_CONTEXT = [
   'rename_workspace',
   'delete_workspace',
   'move_canvas_to_workspace',
+  /* repo import cards queued for a person's own MCP agent; the resident runs
+     its repo cards itself (runRepoCards), reading the repo the same way */
+  'take_repo_cards',
+  'read_repo_files',
+  'finish_repo_card',
 ]
 
 /** Real gaps: MCP agents can do these and resident agents cannot yet. */
@@ -48,6 +53,11 @@ const MISSING = [
   'add_font', // a workspace library change; a resident run is scoped to one canvas
   'list_linear_issues', // integration tools, registered by their connections
   'get_linear_issue',
+  /* a Storybook import is a job a person or a connected agent starts (and the CLI, with an agent
+     key); the resident composes from the components it brought */
+  'list_storybook_components',
+  'import_storybook',
+  'sync_storybook',
 ]
 
 async function mcpToolNames(): Promise<string[]> {

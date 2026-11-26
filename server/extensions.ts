@@ -6,6 +6,7 @@ import type { CanvasRole } from '../shared/canvasRole.ts'
 import type { PullStep, SlackStep, LinearStep } from '../shared/automations.ts'
 import { linearExtension } from './linear/extension.ts'
 import { slackExtension } from './slack/extension.ts'
+import { storybookExtension } from './storybook/extension.ts'
 
 /**
  * Server extensions: integrations that are removable as a unit. The core
@@ -75,6 +76,8 @@ export interface CanvasRouteHelpers {
   requireCanvas(req: express.Request, res: express.Response, canvasId: string, need: CanvasRole): Canvas | null
   /** the shared import rate slot (websites, repos, design files alike) */
   takeImportSlot(userId: string): boolean
+  /** undo what the request has written so far, before answering a failure itself */
+  undoRequest(res: express.Response): void
 }
 
 /** The MCP server's per-session helpers, so an extension's tools answer,
@@ -127,4 +130,4 @@ export interface ServerExtension {
   ): Promise<{ summary: string; url?: string }>
 }
 
-export const extensions: ServerExtension[] = [linearExtension, slackExtension]
+export const extensions: ServerExtension[] = [linearExtension, slackExtension, storybookExtension]

@@ -1,9 +1,10 @@
 import { CAPTURE_PREFIX, pasteWebCapture } from '../lib/webCapture'
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react'
 import { canEditOpenCanvas, pickedSelectors, roleOf, useStore } from '../lib/store'
-import { MOD_KEY, PRESENT_SHORTCUT_HINT, isControlTarget, isTypingTarget } from '../lib/keys'
+import { followPageInUrl } from '../lib/pageUrl'
+import { MOD_KEY, PRESENT_SHORTCUT_HINT, isControlTarget, isMenuTarget, isTypingTarget, pressedKey } from '../lib/keys'
 import { enterSelection, exitSelection, selectSibling } from '../lib/selectionKeys'
-import { dispatchActionKey, setActionHost, type ActionHost } from '../lib/actions/registry'
+import { dispatchActionKey, isCanvasChord, setActionHost, type ActionHost } from '../lib/actions/registry'
 import { presentStartFrame } from '../lib/present'
 import { canHideUi, hideUiHinted } from '../lib/hideUi'
 import { connect, disconnect, sendWs } from '../lib/ws'
@@ -33,7 +34,13 @@ import {
 import { LivePresence } from '../components/LivePresence'
 import { ensureTab, openExternal } from '../lib/desktop'
 import { Stage } from '../components/Stage'
-import { COMPONENT_DRAG_TYPE, dropComponent } from '../lib/components'
+import {
+  COMPONENT_DRAG_TYPE,
+  LIBRARY_COMPONENT_DRAG_TYPE,
+  dropComponent,
+  dropLibraryComponent,
+  parseLibraryDrag,
+} from '../lib/components'
 import { Inspector } from '../components/Inspector'
 import { PagePanel } from '../components/PagePanel'
 import { ElementPanel } from '../components/ElementPanel'
@@ -43,15 +50,21 @@ import { LimitWall, isResidentLimit } from '../components/TeamAllowance'
 import { WorkingNow } from '../components/WorkingNow'
 import { MobilePanelTabs, SideRail } from '../components/SideRail'
 import { LayersPanel, LayersRailToggle } from '../components/LayersPanel'
+import { MobileGuestSheet } from '../components/MobileGuestSheet'
+import { useCanvasAppBanner } from '../lib/nativeApp'
+import { noteActiveDay } from '../lib/githubStar'
 import { Onboarding } from '../components/Onboarding'
 import { AccessBanner } from '../components/AccessBanner'
 import { ShareModal } from '../components/ShareModal'
 import { ExportModal } from '../components/ExportModal'
 import { AppIcon } from '../components/ui/brand-mark'
+import { CardFailureNotices } from '../components/CardFailureNotices'
+import { RepoAgentGuide, type RepoGuideState } from '../components/RepoAgentGuide'
 import { pageFrames } from '../../shared/pages'
-import type { Frame } from '../../shared/types'
+import type { Frame, GithubImportRunner } from '../../shared/types'
 import { ImportStepFooter, ImportStepHeader, SourcePicker } from '../components/ImportSources'
 import { importSources } from '../components/importSourceList'
+import { clientIntegrations } from '../integrations'
 import { PresentMode } from '../components/PresentMode'
 import { CommandPalette } from '../components/CommandPalette'
 import { MainMenu } from '../components/MainMenu'
@@ -72,6 +85,7 @@ import {
 } from '../lib/frameClipboard'
 import { clearHistory } from '../lib/history'
 import { deleteSelection, nudgeSelection } from '../lib/layerEdits'
+import { libraryResumeWaits } from '../lib/libraryResume'
 import { copyPicked, hasElementClip, pasteLayer } from '../lib/elementClipboard'
 import { isCanvasClipboard, writeCanvasClipboard } from '../lib/canvasClipboard'
 import { authClient } from '../lib/auth'
@@ -102,6 +116,8 @@ import {
 } from '../components/ui/icons'
 import { Badge, badgeVariants } from '../components/ui/badge'
 import { Pressable } from '../components/ui/pressable'
+import { MetaLine } from '../components/ui/tile'
+import { ChoiceList, ChoiceRow } from '../components/ui/choice-list'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -111,13 +127,12 @@ import {
 import { SelectionBar, SelectionBarAction } from '../components/ui/selection-bar'
 import { Input } from '../components/ui/input'
 import { Field } from '../components/ui/field'
-import { PeerAvatars, PresenceFace } from '../components/PeerAvatars'
 import { Checkbox, CheckboxCard } from '../components/ui/checkbox'
 import { Toast, ToastAction, ToastSpinner } from '../components/ui/toast'
 import { Tooltip } from '../components/ui/tooltip'
 import { Note } from '../components/ui/note'
 import { Textarea } from '../components/ui/textarea'
-import { Modal, ModalActions, ModalEyebrow, ModalLede, ModalTitle } from '../components/ui/modal'
+import { Modal, ModalActions, ModalLede, ModalSource, ModalTitle } from '../components/ui/modal'
 import { createCenteredFrame } from '../lib/framePlacement'
 import { RULER_PX } from '../components/Rulers'
 import { NO_CANVAS, onViewCommand, syncViewMenu } from '../lib/viewMenu'
@@ -253,9 +268,16 @@ export function CanvasPage({
   const readOnly = useStore((s) => guest || !canEditOpenCanvas(s))
   const editorReady = useStore((s) => !guest && s.canvas?.id === canvasId && canEditOpenCanvas(s))
   const isMobile = useIsMobile()
+  const mobileGuest = guest && isMobile
+  const [guestSheetExpanded, setGuestSheetExpanded] = useState(true)
+  useCanvasAppBanner(canvasId)
   const prototypeMode = useStore((s) => s.prototypeMode)
   const [panelWidths, setPanelWidths] = useState(readPanelWidths)
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth)
+  /* a day spent editing a canvas counts toward Home's GitHub star ask (StarCard) */
+  useEffect(() => {
+    if (editorReady) noteActiveDay()
+  }, [editorReady])
   useEffect(() => {
     const updateWidth = () => setViewportWidth(window.innerWidth)
     window.addEventListener('resize', updateWidth)
@@ -293,6 +315,15 @@ export function CanvasPage({
     () => presentStartFrame(canvas, selectedId, activePageId),
     [selectedId, canvas, activePageId],
   )
+  /* one label for the bar's Play button and the phone sheet's Present row */
+  const presentLabel = selectedId
+    ? t('canvas.presentFromFrame')
+    : playFrom
+      ? t('canvas.presentPrototype')
+      : t('canvas.addFrameToPresent')
+  const present = () => {
+    if (playFrom) setPresenting(playFrom)
+  }
   /* returning from a GitHub App install: the setup redirect appends a signed
      pass — pull it off the URL and open the import modal on the repo picker */
   const [ghInstallPass, setGhInstallPass] = useState<string | null>(() => {
@@ -346,6 +377,17 @@ export function CanvasPage({
     if (canvas?.id === canvasId) ensureTab(canvas.id, canvas.name)
   }, [canvas, canvasId])
 
+  /* back from checkout on the way to a component library: open the Components
+     tab, whose panel holds the note and takes it from here */
+  useEffect(() => {
+    if (guest || !libraryResumeWaits(canvasId)) return
+    useStore.getState().setLayersOpen(true)
+    useStore.getState().setLayersTab('components')
+  }, [canvasId, guest])
+
+  /* the open page rides in the URL (?page=), so a reload or a shared link lands on it */
+  useEffect(() => followPageInUrl(canvasId), [canvasId])
+
   useEffect(() => {
     connect(canvasId, guest)
     return () => {
@@ -386,8 +428,21 @@ export function CanvasPage({
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       const typing = isTypingTarget(e.target)
+      /* an open menu has the keyboard, as in Figma: a letter is its
+         typeahead and no shortcut runs. The canvas's own chords are still
+         kept from the browser, and Backspace, "back" to some engines (below) */
+      if (isMenuTarget(e.target)) {
+        if (e.key === 'Backspace' || isCanvasChord(e)) e.preventDefault()
+        return
+      }
       if (dispatchActionKey(e, typing)) return
       if (typing) return
+      /* a held ⌘X cuts once: the auto-repeat would cut the frame left
+         selected around a cut element next, as a held ⌫ would */
+      if ((e.metaKey || e.ctrlKey) && e.repeat && pressedKey(e) === 'x') {
+        e.preventDefault()
+        return
+      }
       /* a picked element (from the canvas or the layers tree) is what ⌫
          removes — the frame it lives in only goes when nothing inside it is
          selected. Auto-repeat is ignored: a held key must not take the
@@ -429,28 +484,41 @@ export function CanvasPage({
     return () => window.removeEventListener('keydown', onKey)
   }, [canvasId, presenting]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  /* Native copy/paste events let us write the selection's token and read
+  /* Native copy/cut/paste events let us write the selection's token and read
      clipboard images without asking for clipboard-read permission. */
   useEffect(() => {
-    function onCopy(e: ClipboardEvent) {
-      if (isTypingTarget(e.target) || window.getSelection()?.toString() || !e.clipboardData) return
+    /* the picked elements, else the selected frames, onto the clipboard;
+       false when there is nothing of the canvas's to take (text selected on
+       the page, a field focused, nothing selected) */
+    function writeSelection(e: ClipboardEvent, onWritten?: () => void): boolean {
+      if (isTypingTarget(e.target) || isMenuTarget(e.target) || window.getSelection()?.toString() || !e.clipboardData)
+        return false
       const state = useStore.getState()
       const picked = state.selectedElement
       const frame = state.canvas?.frames.find((f) => f.id === picked?.frameId)
       let copy: () => boolean | void
       if (picked) {
-        if (!frame) return
+        if (!frame) return false
         const selectors = pickedSelectors(state)
         copy = () => copyPicked(frame, selectors)
       } else {
         const frames = state.canvas?.frames.filter((f) => state.selectedIds.includes(f.id)) ?? []
-        if (!frames.length) return
+        if (!frames.length) return false
         copy = () => copyFrames(frames)
       }
-      if (writeCanvasClipboard(copy, e.clipboardData)) e.preventDefault()
+      return writeCanvasClipboard(copy, e.clipboardData, onWritten)
+    }
+    function onCopy(e: ClipboardEvent) {
+      if (writeSelection(e)) e.preventDefault()
+    }
+    /* ⌘X: copy, then remove what ⌫ would. Locked frames and layers stay put,
+       as they do on ⌫, so cutting one only copies it; a reader's cut copies. */
+    function onCut(e: ClipboardEvent) {
+      const remove = canEditOpenCanvas(useStore.getState()) ? () => void deleteSelection() : undefined
+      if (writeSelection(e, remove)) e.preventDefault()
     }
     function onPaste(e: ClipboardEvent) {
-      if (isTypingTarget(e.target)) return
+      if (isTypingTarget(e.target) || isMenuTarget(e.target)) return
       /* every paste lands a frame or a layer */
       if (!canEditOpenCanvas(useStore.getState())) return
       const captureText = e.clipboardData?.getData('text/plain') ?? ''
@@ -482,9 +550,11 @@ export function CanvasPage({
       }
     }
     window.addEventListener('copy', onCopy)
+    window.addEventListener('cut', onCut)
     window.addEventListener('paste', onPaste)
     return () => {
       window.removeEventListener('copy', onCopy)
+      window.removeEventListener('cut', onCut)
       window.removeEventListener('paste', onPaste)
     }
   }, [canvasId])
@@ -499,7 +569,8 @@ export function CanvasPage({
   useEffect(() => {
     /* files from outside, or a component card from the Components panel; both
        need the frames' shields up so the drop reaches the window */
-    const carriesComponent = (e: DragEvent) => e.dataTransfer?.types.includes(COMPONENT_DRAG_TYPE) ?? false
+    const carriesComponent = (e: DragEvent) =>
+      [COMPONENT_DRAG_TYPE, LIBRARY_COMPONENT_DRAG_TYPE].some((type) => e.dataTransfer?.types.includes(type))
     const carriesFiles = (e: DragEvent) => (e.dataTransfer?.types.includes('Files') ?? false) || carriesComponent(e)
     let depth = 0
     const setDragging = useStore.getState().setFileDragging
@@ -530,6 +601,13 @@ export function CanvasPage({
       const componentId = e.dataTransfer?.getData(COMPONENT_DRAG_TYPE)
       if (componentId) {
         void dropComponent(componentId, { x: e.clientX, y: e.clientY })
+        return
+      }
+      /* a library's card: this canvas takes the component up on the drop, then places it */
+      const libraryData = e.dataTransfer?.getData(LIBRARY_COMPONENT_DRAG_TYPE)
+      if (libraryData) {
+        const drag = parseLibraryDrag(libraryData)
+        if (drag) void dropLibraryComponent(drag, { x: e.clientX, y: e.clientY })
         return
       }
       const incoming = splitIncoming([...(e.dataTransfer?.files ?? [])])
@@ -691,11 +769,13 @@ export function CanvasPage({
   const layersOpen = useStore((s) => s.layersOpen)
   /* ⌘. — the canvas view with nothing over it; the board and PresentMode keep their chrome */
   const uiHidden = useStore((s) => s.uiHidden) && hideUiActive
-  /* the element panel takes the frame inspector's spot while a Layers row
-     has it open; it follows the element selection until it is closed */
+  /* the element panel takes the frame inspector's spot once a pick opens
+     it; it follows the element selection until it is closed, and a person
+     who closed it keeps it closed across picks (`elementPanelClosed`) */
   const selectedElement = useStore((s) => s.selectedElement)
   const elementPanelOpen = useStore((s) => s.elementPanelOpen)
-  const panelElement = elementPanelOpen && selectedElement?.frameId === selectedFrame?.id ? selectedElement : null
+  const elementPicked = !!selectedFrame && selectedElement?.frameId === selectedFrame.id
+  const panelElement = elementPanelOpen && elementPicked ? selectedElement : null
   /* with nothing selected the slot is the page's own settings, once opened
      from the rail, until closed */
   const pagePanelOpen = useStore((s) => s.pagePanelOpen)
@@ -816,11 +896,12 @@ export function CanvasPage({
   return (
     /* --app-inset is 0 normally; the impersonation shell raises it so this
        fixed layer starts below the banner instead of under it */
-    <div className="fixed inset-x-0 bottom-0 top-[var(--app-inset,0px)] bg-canvas">
+    <div
+      className={cn('fixed inset-x-0 bottom-0 top-[var(--app-inset,0px)] bg-canvas', mobileGuest && 'flex flex-col')}
+    >
       {/* Floating pills over the canvas, which shows through the transparent
           bar: the title pill on the left, live presence centred, sharing on
-          the right. Tablet (xs..md) folds the text actions into the •••
-          sheet; phone (< xs) wraps to two rows. ⌘. hides the chrome (this
+          the right. Phones and tablets fold actions into the ••• sheet. ⌘. hides the chrome (this
           bar, the panels, the toolbars) with display:none rather than
           unmounting it, so what it holds — a composer draft, the expanded
           layers, a scroll position — is exactly as it was when ⌘. brings it
@@ -832,7 +913,7 @@ export function CanvasPage({
         className={cn(uiHidden && 'hidden')}
         style={rulerInset ? { top: rulerInset, left: rulerInset } : undefined}
       >
-        <div className="flex min-w-0 items-center gap-2 max-xs:basis-full">
+        <div className="flex min-w-0 items-center gap-2">
           <BarPill className="min-w-0 gap-1 pr-3 pl-1">
             <MainMenu
               trigger={
@@ -864,21 +945,18 @@ export function CanvasPage({
             )}
           </BarPill>
         </div>
-        <div className={cn('absolute left-1/2 -translate-x-1/2 max-[1180px]:hidden', docked ? 'top-1' : 'top-3.5')}>
+        {/* the presence pill takes the bar's true centre from 1180px; below
+            that the actions need it, so the pill sits in the room between the
+            title and them, its status line truncating. A phone has no room. */}
+        <div
+          className={cn(
+            'flex min-w-0 flex-1 justify-center max-sm:hidden min-[1180px]:absolute min-[1180px]:left-1/2 min-[1180px]:flex-none min-[1180px]:-translate-x-1/2',
+            docked ? 'min-[1180px]:top-1' : 'min-[1180px]:top-3.5',
+          )}
+        >
           <LivePresence me={meFace} others={others} onRenameSelf={() => setRenaming(true)} />
         </div>
         <div className="ml-auto flex flex-none items-center gap-2 max-md:hidden">
-          {/* the presence pill needs the bar's centre; narrower desktops keep
-              the plain avatar stack (and its follow buttons) over here */}
-          <div
-            className="mr-1 flex items-center min-[1181px]:hidden"
-            title={others.map((p) => p.name).join(', ') || t('canvas.justYou')}
-          >
-            <PresenceFace name={meFace.name} image={meFace.image} color={meFace.color} kind="user" />
-            <span className="-ml-[7px] flex items-center">
-              <PeerAvatars others={others} />
-            </span>
-          </div>
           {!guest && (
             <BarPill>
               {!readOnly && (
@@ -908,16 +986,7 @@ export function CanvasPage({
                 {t('canvas.share')}
               </Button>
             )}
-            <Tooltip
-              label={
-                selectedId
-                  ? `${t('canvas.presentFromFrame')} · ${PRESENT_SHORTCUT_HINT}`
-                  : playFrom
-                    ? `${t('canvas.presentPrototype')} · ${PRESENT_SHORTCUT_HINT}`
-                    : t('canvas.addFrameToPresent')
-              }
-              side="bottom"
-            >
+            <Tooltip label={playFrom ? `${presentLabel} · ${PRESENT_SHORTCUT_HINT}` : presentLabel} side="bottom">
               <span className="inline-flex">
                 <Button
                   variant="bare"
@@ -925,7 +994,7 @@ export function CanvasPage({
                   className={barPillIconBtn}
                   aria-label={t('canvas.presentPrototypeLabel')}
                   disabled={!playFrom}
-                  onClick={() => setPresenting(playFrom)}
+                  onClick={present}
                 >
                   <PlayIcon className="size-3.5" />
                 </Button>
@@ -946,16 +1015,7 @@ export function CanvasPage({
             </Button>
           )}
         </div>
-        <div className="ml-auto hidden items-center gap-1.5 max-md:flex max-xs:order-3">
-          <div
-            className="mr-1 flex items-center max-sm:hidden"
-            title={others.map((p) => p.name).join(', ') || t('canvas.justYou')}
-          >
-            <PresenceFace name={meFace.name} image={meFace.image} color={meFace.color} kind="user" />
-            <span className="-ml-[7px] flex items-center">
-              <PeerAvatars others={others} />
-            </span>
-          </div>
+        <div className="ml-auto hidden shrink-0 items-center gap-1.5 max-md:flex">
           {!readOnly && (
             <Button
               variant="primary"
@@ -984,12 +1044,21 @@ export function CanvasPage({
       {/* the canvas runs under the transparent top bar to the window's top
           edge; the floating chrome gets its own layer that starts below the
           bar, so every panel offset stays measured from there */}
-      <div className="absolute inset-0 overflow-hidden" style={chromeVars}>
+      <div
+        className={cn('overflow-hidden', mobileGuest ? 'relative min-h-0 flex-1' : 'absolute inset-0')}
+        style={chromeVars}
+      >
         {find && !presenting && !uiHidden && <FindBar mode={find} step={findStep} onClose={() => setFind(null)} />}
-        <Stage onAddFrame={addFrame} insets={stageInsets} bounds={stageBounds} docked={docked} />
+        <Stage
+          onAddFrame={addFrame}
+          insets={stageInsets}
+          bounds={stageBounds}
+          docked={docked}
+          hideTools={mobileGuest && !!loadedCanvasId && guestSheetExpanded}
+        />
         <div
           className={cn(
-            'pointer-events-none absolute inset-x-0 bottom-0 top-[50px] max-md:top-14 max-xs:top-[100px]',
+            'pointer-events-none absolute inset-x-0 bottom-0 top-[50px] max-md:top-14',
             uiHidden && 'hidden',
           )}
           /* panel offsets are measured from this layer, so moving it past
@@ -1044,7 +1113,7 @@ export function CanvasPage({
               line; this per-agent stack is only for windows too narrow for it */}
           <WorkingNow style={{ left: chrome.left }} className="min-[1180px]:hidden" />
           {!readOnly && <Onboarding canvasId={canvasId} />}
-          <AccessBanner guest={guest} onSignUp={onSignUp} onSignIn={onSignIn} />
+          {!mobileGuest && <AccessBanner guest={guest} onSignUp={onSignUp} onSignIn={onSignIn} />}
           {!isMobile &&
             (layersOpen ? (
               <LayersPanel
@@ -1075,9 +1144,8 @@ export function CanvasPage({
           )}
           {!isMobile && !readOnly && selectedFrame && panelElement && !deferPanel && (
             <ElementPanel
-              /* keyed by frame, not element: picking the next element swaps
-                 the values in place instead of remounting the panel blank */
-              key={selectedFrame.id}
+              /* never keyed: picking the next element, in this frame or
+                 another, swaps the values in place instead of remounting */
               frame={selectedFrame}
               selector={panelElement.selector}
               surface={panelSurface}
@@ -1113,7 +1181,7 @@ export function CanvasPage({
               onToggleAgents={() => setShowActivity((open) => !open)}
               inspectorOpen={propertiesShown}
               inspectorAvailable={!readOnly}
-              inspectTarget={selectedFrame ? 'frame' : 'page'}
+              inspectTarget={selectedFrame ? (elementPicked ? 'element' : 'frame') : 'page'}
               onToggleInspector={() => {
                 const s = useStore.getState()
                 if (!selectedFrame) {
@@ -1123,28 +1191,34 @@ export function CanvasPage({
                 if (propertiesShown) {
                   /* the element panel and the inspector share the slot —
                      hiding it closes whichever is showing */
-                  s.setElementPanelOpen(false)
+                  if (panelElement) s.closeElementPanel()
                   s.setInspectorOpen(false)
-                } else s.setInspectorOpen(true)
+                } else if (elementPicked) s.openElementPanel()
+                else s.setInspectorOpen(true)
               }}
-              me={meFace}
-              onRenameSelf={() => setRenaming(true)}
               guest={guest}
             />
           )}
         </div>
       </div>
 
+      {guest && loadedCanvasId && (
+        <MobileGuestSheet
+          launcherVisible={mobileGuest && !uiHidden}
+          expanded={guestSheetExpanded}
+          onExpandedChange={setGuestSheetExpanded}
+        />
+      )}
       {isMobile && (
         <>
           <Sheet open={showMobileActions} onOpenChange={setShowMobileActions}>
             <SheetContent
               side="bottom"
-              className="gap-0 rounded-t-2xl border-line bg-surface p-0 pb-[env(safe-area-inset-bottom)] shadow-pop"
+              className="gap-0 overflow-hidden rounded-t-panel border-line bg-surface p-0 pb-[env(safe-area-inset-bottom)] shadow-pop"
             >
               <div className="border-b border-line-soft px-5 py-4 pr-14">
-                <SheetTitle className="font-display text-lg font-extrabold">{t('canvas.canvasActions')}</SheetTitle>
-                <SheetDescription className="mt-1 text-xs text-ink-soft">
+                <SheetTitle className="text-heading font-semibold">{t('canvas.canvasActions')}</SheetTitle>
+                <SheetDescription className="mt-1 text-copy text-ink-soft">
                   {t('canvas.canvasActionsDescription')}
                 </SheetDescription>
               </div>
@@ -1198,6 +1272,18 @@ export function CanvasPage({
                 >
                   <PrototypeModeIcon /> {prototypeMode ? t('canvas.leavePrototypeMode') : t('canvas.prototypeMode')}
                 </Button>
+                {/* the bar's Play button, from the selected frame or the start */}
+                <Button
+                  variant="ghost"
+                  className="h-11 justify-start gap-2.5 border-line bg-surface px-4"
+                  disabled={!playFrom}
+                  onClick={() => {
+                    setShowMobileActions(false)
+                    present()
+                  }}
+                >
+                  <PlayIcon /> {presentLabel}
+                </Button>
                 {!guest && (
                   <Button
                     variant="ghost"
@@ -1218,7 +1304,7 @@ export function CanvasPage({
                  tooltip would pop on the sheet's auto-focus; the finger is
                  the focus on a phone anyway */
               onOpenAutoFocus={(e) => e.preventDefault()}
-              className="max-h-[calc(100svh-56px)] gap-0 rounded-t-2xl border-line bg-surface p-0 shadow-pop data-[side=bottom]:h-[min(78svh,680px)]"
+              className="max-h-[calc(100svh-56px)] gap-0 overflow-hidden rounded-t-panel border-line bg-surface p-0 shadow-pop data-[side=bottom]:h-[min(78svh,680px)]"
             >
               <SheetTitle className="sr-only">{t('canvas.layers')}</SheetTitle>
               <LayersPanel onAddFrame={addFrame} surface="inline" onClose={() => setShowMobileLayers(false)} />
@@ -1229,14 +1315,19 @@ export function CanvasPage({
               as they were when ⌘. restores the chrome */}
           <Sheet
             open={!readOnly && !!selectedFrame && inspectorOpen && !deferPanel && !uiHidden}
+            /* closing the sheet keeps the frame selected: tapping its name
+               brings the properties back, as it first opened them */
             onOpenChange={(open) => {
-              if (!open) select(null)
+              if (!open) useStore.getState().setInspectorOpen(false)
             }}
           >
             <SheetContent
               side="bottom"
               showCloseButton={false}
-              className="max-h-[calc(100svh-56px)] gap-0 rounded-t-2xl border-line bg-surface p-0 shadow-pop data-[side=bottom]:h-[min(78svh,680px)]"
+              /* no focus ring on the first tab or field as the sheet rises,
+                 as in the Layers sheet: the finger is the focus on a phone */
+              onOpenAutoFocus={(e) => e.preventDefault()}
+              className="max-h-[calc(100svh-56px)] gap-0 overflow-hidden rounded-t-panel border-line bg-surface p-0 shadow-pop data-[side=bottom]:h-[min(78svh,680px)]"
             >
               <SheetTitle className="sr-only">{t('canvas.frameInspector')}</SheetTitle>
               {selectedFrame && <Inspector frame={selectedFrame} surface="inline" />}
@@ -1246,7 +1337,10 @@ export function CanvasPage({
             <SheetContent
               side="bottom"
               showCloseButton={false}
-              className="max-h-[calc(100svh-56px)] gap-0 rounded-t-2xl border-line bg-surface p-0 shadow-pop data-[side=bottom]:h-[min(78svh,680px)]"
+              /* no focus ring on the first tab or field as the sheet rises,
+                 as in the Layers sheet: the finger is the focus on a phone */
+              onOpenAutoFocus={(e) => e.preventDefault()}
+              className="max-h-[calc(100svh-56px)] gap-0 overflow-hidden rounded-t-panel border-line bg-surface p-0 shadow-pop data-[side=bottom]:h-[min(78svh,680px)]"
             >
               <SheetTitle className="sr-only">{t('canvas.canvasActivity')}</SheetTitle>
               <ActivityPanel canvasId={canvasId} onClose={() => setShowActivity(false)} surface="inline" />
@@ -1342,10 +1436,22 @@ export function CanvasPage({
             const imported = t('canvas.itemsImported', { count: frameIds.length })
             showToast(failedCount ? t('canvas.importedWithFailures', { imported, failed: failedCount }) : imported)
           }}
-          onQueued={(cardCount) => {
+          onImporting={(frameCount) => {
+            setShowImport(false)
+            showToast(t('canvas.framesImporting', { count: frameCount }))
+          }}
+          onQueued={(cardCount, runner) => {
             setShowImport(false)
             setGhInstallPass(null)
-            showToast(t('canvas.cardsQueued', { count: cardCount }))
+            showToast(
+              runner.kind === 'plan'
+                ? t(runner.online ? 'canvas.cardsQueuedPlan' : 'canvas.cardsQueuedPlanOffline', { count: cardCount })
+                : t('canvas.cardsQueued', { count: cardCount }),
+            )
+          }}
+          onConnectAgent={() => {
+            posthog.capture('agent_connection_opened')
+            setShowConnect(true)
           }}
         />
       )}
@@ -1364,6 +1470,7 @@ export function CanvasPage({
           </Toast>
         )
       )}
+      <CardFailureNotices />
     </div>
   )
 }
@@ -1375,7 +1482,9 @@ function ImportModal({
   initialSource = null,
   onClose,
   onDone,
+  onImporting,
   onQueued,
+  onConnectAgent,
 }: {
   canvasId: string
   installPass: string | null
@@ -1384,8 +1493,12 @@ function ImportModal({
   initialSource?: string | null
   onClose: () => void
   onDone: (frameIds: string[], failedCount: number) => void
+  /** an integration's import runs on as a task: frames land while the canvas is open */
+  onImporting: (frameCount: number) => void
   /** a repo import queues cards on the board instead of landing frames */
-  onQueued: (cardCount: number) => void
+  onQueued: (cardCount: number, runner: GithubImportRunner) => void
+  /** open Connect AI over the import, for a repo import's own agent */
+  onConnectAgent: () => void
 }) {
   /* which source's screen is open — null is the picker; landing back from
      GitHub's install flow jumps straight to that screen */
@@ -1397,6 +1510,8 @@ function ImportModal({
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [busy, setBusy] = useState<'discovering' | 'importing' | null>(null)
   const [error, setError] = useState<string | null>(null)
+  /* an integration's import under review (the modal's whole view swaps) */
+  const [integrationReview, setIntegrationReview] = useState<ReactNode | null>(null)
   /* a connected repo's screen manifest under review — the modal's third view */
   const [repoReview, setRepoReview] = useState<{ connection: GithubConnectionInfo; manifest: RepoManifest } | null>(
     null,
@@ -1404,6 +1519,9 @@ function ImportModal({
   const [repoSelected, setRepoSelected] = useState<Set<string>>(new Set())
   const [extractSystem, setExtractSystem] = useState(true)
   const [showPages, setShowPages] = useState(false)
+  /* a repo import with no Doop Agent: who should build it, then how to hand
+     the cards to the person's own agent, since nothing starts on its own */
+  const [repoGuide, setRepoGuide] = useState<RepoGuideState | null>(null)
 
   function errorMessage(caught: unknown, fallback: string) {
     if (caught instanceof ApiError) return String(caught.body.error ?? fallback)
@@ -1504,6 +1622,12 @@ function ImportModal({
     })
   }
 
+  /* an agent of their own connected from the guide: import again, for it */
+  function retryRepoImport() {
+    setRepoGuide(null)
+    void importRepoScreens()
+  }
+
   async function importRepoScreens() {
     if (!repoReview || busy || (!repoSelected.size && !extractSystem)) return
     setBusy('importing')
@@ -1511,6 +1635,35 @@ function ImportModal({
     const screens = repoReview.manifest.screens.filter((s) => repoSelected.has(screenKey(s)))
     try {
       const result = await api.importGithubScreens(canvasId, repoReview.connection.id, screens, extractSystem)
+      const runner = result.runner ?? { kind: 'doop' as const }
+      if (runner.kind === 'agent') {
+        posthog.capture('github_screens_imported', {
+          requested_count: screens.length,
+          queued_count: result.cards.length,
+          rejected_count: result.rejected.length,
+          runner: 'agent',
+        })
+        /* cards already waiting for it keep their place: show those */
+        const waiting = result.cards.length
+          ? result.cards
+          : useStore
+              .getState()
+              .tasks.filter(
+                (task) =>
+                  task.payload?.outside &&
+                  task.payload.connectionId === repoReview.connection.id &&
+                  !task.endedAt &&
+                  !task.failedAt,
+              )
+              .map((task) => task.id)
+        setRepoGuide({ stage: 'agent', cardIds: waiting, client: runner.client })
+        setBusy(null)
+        return
+      }
+      if (!result.cards.length && result.handedOver) {
+        onQueued(result.handedOver, runner)
+        return
+      }
       if (!result.cards.length) {
         setError(result.rejected.length ? t('canvas.errScreensGone') : t('canvas.errAlreadyOnBoard'))
         setBusy(null)
@@ -1520,12 +1673,14 @@ function ImportModal({
         requested_count: screens.length,
         queued_count: result.cards.length,
         rejected_count: result.rejected.length,
+        runner: runner.kind,
       })
-      onQueued(result.cards.length)
+      onQueued(result.cards.length, runner)
     } catch (e) {
       if (isResidentLimit(e)) {
-        useStore.getState().setLimitWall(true)
-        onClose()
+        /* nobody can build it yet: ask who should, without losing the pick */
+        setRepoGuide({ stage: 'connect' })
+        setBusy(null)
         return
       }
       setError(errorMessage(e, t('canvas.errRepoImportFailed')))
@@ -1577,16 +1732,27 @@ function ImportModal({
       onClose={() => !busy && onClose()}
     >
       <>
-        {repoReview ? (
+        {integrationReview ? (
+          integrationReview
+        ) : repoGuide && repoReview ? (
+          <RepoAgentGuide
+            canvasId={canvasId}
+            repo={repoReview.connection.repo}
+            state={repoGuide}
+            onConnectAgent={onConnectAgent}
+            onAgentConnected={retryRepoImport}
+            onClose={onClose}
+          />
+        ) : repoReview ? (
           <>
-            <div className="flex flex-col items-start justify-between gap-2.5 sm:flex-row sm:gap-6">
-              <div className="flex flex-col gap-[5px]">
-                <ModalEyebrow>{t('canvas.reviewBeforeImport')}</ModalEyebrow>
-                <ModalTitle>{t('canvas.repoTitle')}</ModalTitle>
-              </div>
-              <Badge shape="pill">
-                {repoReview.connection.repo}@{repoReview.connection.branch}
-              </Badge>
+            <div className="flex flex-col gap-[5px]">
+              <ModalTitle>{t('canvas.repoTitle')}</ModalTitle>
+              <ModalSource
+                href={`https://github.com/${repoReview.connection.repo}/tree/${repoReview.connection.branch.split('/').map(encodeURIComponent).join('/')}`}
+              >
+                {repoReview.connection.repo}
+                <span className="text-ink-ghost">@{repoReview.connection.branch}</span>
+              </ModalSource>
             </div>
             <ModalLede>
               {repoReview.manifest.framework
@@ -1775,16 +1941,28 @@ function ImportModal({
                 onReview={openRepoReview}
                 onBack={() => setSource(null)}
               />
-            ) : null}
+            ) : (
+              clientIntegrations.map(
+                (integration) =>
+                  integration.id === source &&
+                  integration.ImportSection && (
+                    <integration.ImportSection
+                      key={integration.id}
+                      canvasId={canvasId}
+                      setReview={setIntegrationReview}
+                      onImporting={onImporting}
+                      onClose={onClose}
+                      onBack={() => setSource(null)}
+                    />
+                  ),
+              )
+            )}
           </>
         ) : (
           <>
-            <div className="flex flex-col items-start justify-between gap-2.5 sm:flex-row sm:gap-6">
-              <div className="flex flex-col gap-[5px]">
-                <ModalEyebrow>{t('canvas.reviewBeforeImport')}</ModalEyebrow>
-                <ModalTitle>{t('canvas.choosePages')}</ModalTitle>
-              </div>
-              <Badge shape="pill">{new URL(discovery.siteUrl).hostname}</Badge>
+            <div className="flex flex-col gap-[5px]">
+              <ModalTitle>{t('canvas.choosePages')}</ModalTitle>
+              <ModalSource href={discovery.siteUrl}>{new URL(discovery.siteUrl).hostname}</ModalSource>
             </div>
             <ModalLede>{t('canvas.pagesFound', { count: discovery.pages.length })}</ModalLede>
             <SelectionBar
@@ -2048,28 +2226,23 @@ function SyncKeysSection({ canvasId, onBack }: { canvasId: string; onBack: () =>
           </div>
         </div>
       ))}
-      <div className="mt-4 flex flex-col items-stretch gap-2 sm:flex-row">
-        <Field className="flex-1" label={t('canvas.appName')} labelVariant="form" htmlFor="sync-app-name">
+      <Field className="mt-4" label={t('canvas.appName')} labelVariant="form" htmlFor="sync-app-name">
+        <div className="flex gap-2">
           <Input
             id="sync-app-name"
             variant="well"
-            inputSize="lg"
+            className="min-w-0 flex-1"
             placeholder={t('canvas.appNamePlaceholder')}
             value={name}
             disabled={busy}
             onChange={(e) => setAppName(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && create()}
           />
-        </Field>
-        <Button
-          variant="primary"
-          className="justify-center self-end sm:h-12"
-          disabled={busy || !name.trim()}
-          onClick={create}
-        >
-          {t('canvas.createKey')}
-        </Button>
-      </div>
+          <Button variant="default" size="sm" disabled={busy || !name.trim()} onClick={create}>
+            {t('canvas.createKey')}
+          </Button>
+        </div>
+      </Field>
       <ol className="mt-3 flex flex-col divide-y divide-line-soft rounded-[10px] border border-line">
         {[
           [t('canvas.syncStep1Title'), t('canvas.syncStep1Detail')],
@@ -2161,41 +2334,49 @@ function GithubSection({
     }
   }
 
-  async function connectInstalledRepo(fullName: string) {
-    if (busy || !installPass) return
+  /* connect, then straight on to the screens; the server hands back the
+     existing connection (with the new credential) when this canvas already
+     has the repo on that branch, so it replaces its row instead of adding one */
+  async function connectAndAnalyze(
+    body: { repo: string; pass: string } | { repo: string; token: string },
+    via: 'app' | 'token',
+  ) {
     setBusy('connecting')
     setError(null)
+    let conn: GithubConnectionInfo
     try {
-      const conn = await api.connectGithub(canvasId, { repo: fullName, pass: installPass })
-      setConnections((c) => [conn, ...(c ?? [])])
-      setBusy(null)
-      posthog.capture('github_repo_connected', { via: 'app' })
+      conn = await api.connectGithub(canvasId, body)
+      setConnections((c) => [conn, ...(c ?? []).filter((x) => x.id !== conn.id)])
+      posthog.capture('github_repo_connected', { via })
     } catch (e) {
       failed(e, t('canvas.errConnectRepo'))
+      return false
     }
+    await runAnalysis(conn)
+    return true
+  }
+
+  async function connectInstalledRepo(fullName: string) {
+    if (busy || !installPass) return
+    await connectAndAnalyze({ repo: fullName, pass: installPass }, 'app')
   }
 
   async function connectRepo() {
     if (busy || !repo.trim() || !token.trim()) return
-    setBusy('connecting')
-    setError(null)
-    try {
-      const conn = await api.connectGithub(canvasId, {
-        repo: repo.trim(),
-        token: token.trim(),
-      })
-      setConnections((c) => [conn, ...(c ?? [])])
+    if (await connectAndAnalyze({ repo: repo.trim(), token: token.trim() }, 'token')) {
       setRepo('')
       setToken('')
-      setBusy(null)
-      posthog.capture('github_repo_connected', { via: 'token' })
-    } catch (e) {
-      failed(e, t('canvas.errConnectRepo'))
     }
   }
 
-  async function analyze(conn: GithubConnectionInfo) {
+  function analyze(conn: GithubConnectionInfo) {
     if (busy) return
+    void runAnalysis(conn)
+  }
+
+  /* a connected repo goes straight on to its screens: connecting is only
+     ever done to import, so there is no second click for it */
+  async function runAnalysis(conn: GithubConnectionInfo) {
     setBusy(conn.id)
     setError(null)
     try {
@@ -2241,32 +2422,50 @@ function GithubSection({
         lede={t('canvas.githubLede')}
       />
       <div className="mt-[22px] flex flex-col gap-2.5">
-        {(connections ?? []).map((conn) => (
-          <div key={conn.id} className="flex flex-col gap-1.5">
-            <div className="flex items-center gap-2 text-[13px]">
-              <b className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap font-semibold">
-                {conn.repo}
-                <span className="font-normal text-ink-faint">@{conn.branch}</span>
-              </b>
-              <Note className="mr-auto shrink-0">
-                {conn.frames ? t('canvas.screens', { count: conn.frames }) : t('canvas.nothingImported')}
-              </Note>
-              <Button size="sm" className="px-2.5 text-xs" disabled={!!busy} onClick={() => analyze(conn)}>
-                {busy === conn.id ? t('canvas.analyzing') : t('canvas.analyze')}
-              </Button>
-              <Button
-                variant="bare"
-                size="icon-sm"
-                className="-mr-1.5 hover:bg-accent-ink/10 hover:text-accent-ink"
-                title={t('canvas.disconnectRepo')}
-                aria-label={t('canvas.disconnectRepo')}
-                onClick={() => disconnect(conn.id)}
-              >
-                <XIcon size={14} />
-              </Button>
-            </div>
+        {!!connections?.length && (
+          <div className="flex flex-col gap-1.5">
+            <span className="text-caption text-ink-faint">{t('canvas.connectedRepos')}</span>
+            <ChoiceList>
+              {connections.map((conn) => (
+                <ChoiceRow
+                  key={conn.id}
+                  icon={<AppIcon brand="github" size={32} />}
+                  title={
+                    <>
+                      {conn.repo}
+                      <span className="font-normal text-ink-faint">@{conn.branch}</span>
+                    </>
+                  }
+                  description={
+                    busy === conn.id ? (
+                      t('canvas.analyzing')
+                    ) : (
+                      <MetaLine className="text-label">
+                        {!!conn.frames && <span>{t('canvas.screens', { count: conn.frames })}</span>}
+                        <span>{t('canvas.pickScreens')}</span>
+                      </MetaLine>
+                    )
+                  }
+                  disabled={!!busy}
+                  onClick={() => analyze(conn)}
+                  action={
+                    <Button
+                      variant="bare"
+                      size="icon-sm"
+                      className="hover:bg-accent-ink/10 hover:text-accent-ink"
+                      disabled={!!busy}
+                      title={t('canvas.disconnectRepo')}
+                      aria-label={t('canvas.disconnectRepo')}
+                      onClick={() => disconnect(conn.id)}
+                    >
+                      <XIcon size={14} />
+                    </Button>
+                  }
+                />
+              ))}
+            </ChoiceList>
           </div>
-        ))}
+        )}
         {unconnectedRepos && (
           <div className="flex flex-col gap-1.5 rounded-[11px] border border-line bg-paper p-2.5">
             <b className="text-[12px] text-ink-soft">{t('canvas.pickRepo')}</b>
@@ -2319,10 +2518,11 @@ function GithubSection({
         )}
         {(!appEnabled || showTokenForm) && (
           <div className="flex flex-col gap-2">
-            <div className="flex flex-col items-stretch gap-2 sm:flex-row">
+            <Field label={t('canvas.repoUrlLabel')} labelVariant="form" htmlFor="github-repo-url">
               <Input
+                id="github-repo-url"
                 variant="well"
-                className="flex-1 font-mono text-[12px]"
+                className="font-mono text-[12px]"
                 placeholder={t('canvas.repoPlaceholder')}
                 value={repo}
                 disabled={!!busy}
@@ -2331,9 +2531,12 @@ function GithubSection({
                   setError(null)
                 }}
               />
+            </Field>
+            <Field label={t('canvas.tokenLabel')} labelVariant="form" htmlFor="github-token">
               <Input
+                id="github-token"
                 variant="well"
-                className="flex-1 font-mono text-[12px]"
+                className="font-mono text-[12px]"
                 type="password"
                 placeholder={t('canvas.tokenPlaceholder')}
                 value={token}
@@ -2344,7 +2547,7 @@ function GithubSection({
                 }}
                 onKeyDown={(e) => e.key === 'Enter' && connectRepo()}
               />
-            </div>
+            </Field>
             <Button
               variant="primary"
               className="justify-center self-start"

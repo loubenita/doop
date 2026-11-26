@@ -12,19 +12,55 @@ export interface LayoutDrop {
   target: DropTarget
   styles: FlowPlacement
   container: ElementInfo['rect']
-  line: ElementInfo['rect']
+  /** the insertion mark; none for a box that places its layers by hand */
+  line: ElementInfo['rect'] | null
   /** the drop leaves the element's parent: only then is the container marked */
   reparent?: boolean
 }
 
-export async function elementMoveTarget(frameId: string, selector: string, x: number, y: number) {
-  const reply = await requestFrame(frameId, 'doop:move-target', { selector, x, y })
+/** Where a drop at (x, y) puts the layer. `at` is where the layer is drawn
+ *  when a drag shows a copy of it and leaves the layer itself in place. */
+export async function elementMoveTarget(
+  frameId: string,
+  selector: string,
+  x: number,
+  y: number,
+  at?: ElementInfo['rect'],
+) {
+  const reply = await requestFrame(frameId, 'doop:move-target', { selector, x, y, at })
   return reply?.result as { free: boolean; drop: LayoutDrop | null } | undefined
+}
+
+/** Where the frame's body places its absolute layers from, in design px
+ *  from the frame's corner (a positioned body with a margin moves it), and
+ *  the scale it draws them at; the corner itself when the frame is not
+ *  mounted. */
+export function bodyPlacementOrigin(frameId: string): PlacementOrigin | Promise<PlacementOrigin> {
+  /* nothing to ask, and no turn of the event loop spent, without a live frame */
+  if (!windows.has(frameId)) return FRAME_CORNER
+  return requestFrame(frameId, 'doop:placement-origin', {}).then(
+    (reply) => (reply?.origin as PlacementOrigin | undefined) ?? FRAME_CORNER,
+  )
+}
+
+export interface PlacementOrigin {
+  x: number
+  y: number
+  scale: { x: number; y: number }
+}
+const FRAME_CORNER: PlacementOrigin = { x: 0, y: 0, scale: { x: 1, y: 1 } }
+
+/** How the element sits once the Layers panel moves it to `target`: the
+ *  placement a canvas drag there would give it, or undefined to keep its
+ *  styles as authored (and when the frame is not mounted). */
+export async function layerPlacement(frameId: string, selector: string, target: DropTarget) {
+  const reply = await requestFrame(frameId, 'doop:layer-placement', { selector, target })
+  return (reply?.styles ?? undefined) as FlowPlacement | undefined
 }
 
 /** The runtime's summary of one element: computed styles resolved to what
  *  the Design panel shows, plus the inline styles the element already carries.
- *  Mirrors `inspect()` in frameRuntime.ts — keep the two in lockstep. */
+ *  What `inspect()` in src/frame-runtime/inspect.ts answers; the compiler holds the two together. */
 export interface ElementInfo {
   tag: string
   id: string
@@ -47,8 +83,8 @@ export interface ElementInfo {
   rect: { x: number; y: number; width: number; height: number }
   /** Rendered bounds relative to the parent's border box, in frame pixels. */
   geometry: {
-    x: number
-    y: number
+    x: number | null
+    y: number | null
     rotation: number | null
     scaleX: number
     scaleY: number
@@ -71,7 +107,7 @@ export interface ElementInfo {
   height: number | null
   widthValue: string
   heightValue: string
-  flexGrow: number
+  flexGrow: number | null
   boxSizing: string
   /** Unrounded computed padding and border sums, for content-box sizing. */
   boxExtras: { width: number; height: number }
@@ -92,6 +128,17 @@ export interface ElementInfo {
   borderStyle: string
   borderColor: string
   borderRadius: number | null
+  /** A vector layer's SVG paint (an `<svg>` of shapes, or a shape), read
+   *  from its first shape: Fill and Stroke edit these instead of the box's
+   *  background and border. `inline` is that shape's inline paint. */
+  vector?: {
+    fill: string
+    /** `fill-opacity`, which the panel folds into the fill's alpha */
+    fillOpacity: number | null
+    stroke: string
+    strokeWidth: number | null
+    inline: Record<string, string>
+  } | null
   color: string
   fontSize: number | null
   fontWeight: string
@@ -171,13 +218,20 @@ function listen() {
       return
     }
     if (typeof data?.type !== 'string' || typeof data.reqId !== 'number') return
-    const ask = pending.get(data.reqId)
-    /* the reply must come from the window that was asked — request ids are
-       predictable, so another frame's script could otherwise answer for it */
-    if (!ask || ask.replyType !== data.type || ev.source !== ask.win) return
-    pending.delete(data.reqId)
-    ask.resolve(data)
+    if (data.type !== 'doop:settle-result') finishRequest(ev.source, data.type, data.reqId, data)
   })
+}
+
+function finishRequest(source: MessageEventSource | null, type: string, reqId: number, data: Record<string, unknown>) {
+  const ask = pending.get(reqId)
+  if (!ask || ask.replyType !== type || source !== ask.win) return
+  pending.delete(reqId)
+  ask.resolve(data)
+}
+
+/** Arrives on the same private port as the edits undo is waiting for. */
+export function finishFrameSettle(win: Window, reqId: number) {
+  finishRequest(win, 'doop:settle-result', reqId, { type: 'doop:settle-result', reqId })
 }
 
 export function registerFrameWindow(frameId: string, win: Window) {
@@ -300,9 +354,47 @@ function infoOf(reply: Record<string, unknown> | null): ElementInfo | null {
   return reply && typeof reply.info === 'object' ? (reply.info as ElementInfo | null) : null
 }
 
+/** What ⌥ measures from the picked elements: their boxes (the primary's
+ *  first), the box around the primary, and what sits at the design point when
+ *  that is none of them. */
+export interface ElementMeasure {
+  rects: ElementInfo['rect'][]
+  parent: ElementInfo['rect']
+  over: ElementInfo['rect'] | null
+}
+
+/** Null when the selector no longer resolves or the frame is not mounted. */
+export async function measureElement(
+  frameId: string,
+  selector: string,
+  at: { x: number; y: number },
+  selected: string[],
+): Promise<ElementMeasure | null> {
+  const reply = await requestFrame(frameId, 'doop:measure', { selector, x: at.x, y: at.y, selected })
+  return (reply?.measure as ElementMeasure | null | undefined) ?? null
+}
+
 /** Computed properties of the element, or null when the selector no longer resolves. */
 export async function inspectElement(frameId: string, selector: string): Promise<ElementInfo | null> {
   return infoOf(await requestFrame(frameId, 'doop:inspect', { selector }))
+}
+
+export interface InspectedLayer {
+  selector: string
+  info: ElementInfo
+}
+
+export interface PickedLayerEdit {
+  selector: string
+  styles?: StylePatch
+  geometry?: GeometryEdit
+}
+
+export type PanelEditPhase = 'read' | 'apply' | 'begin' | 'preview' | 'commit' | 'cancel'
+
+export async function editPickedLayers(frameId: string, targets: PickedLayerEdit[], phase: PanelEditPhase) {
+  const reply = await requestFrame(frameId, 'doop:design-selection', { targets, phase })
+  return Array.isArray(reply?.layers) ? (reply.layers as InspectedLayer[]) : undefined
 }
 
 /** Write inline styles onto the element. The runtime saves the edited
@@ -319,14 +411,38 @@ export async function styleElement(
   return infoOf(await requestFrame(frameId, 'doop:style', { selector, styles, uniformText }))
 }
 
-/** Replace image content through the same live edit/undo path as styles. */
+/** The frame's own fill, as Figma's frame Fill: the root element that paints
+ *  the frame's background (`body`, or `html` when only the root is painted),
+ *  its computed colour and the inline value the Fill field binds tokens on. */
+export interface FrameFill {
+  selector: 'body' | 'html'
+  backgroundColor: string
+  /** a single image fill, edited as an element's is */
+  image: ElementInfo['image']
+  /** a gradient or layered image painted over the colour */
+  overlay: boolean
+  inline: Record<string, string>
+  /** the element's inline style uses the `background` shorthand */
+  shorthand: boolean
+  locked: boolean
+}
+
+/** Read the frame's fill, or null when the frame is not mounted. */
+export async function readFrameFill(frameId: string): Promise<FrameFill | null> {
+  const reply = await requestFrame(frameId, 'doop:root-fill', {})
+  return reply && typeof reply.fill === 'object' ? (reply.fill as FrameFill | null) : null
+}
+
+/** Replace image content through the same live edit/undo path as styles;
+ *  resolves with whether the frame took it. */
 export async function replaceElementImage(
   frameId: string,
   selector: string,
   image: NonNullable<ElementInfo['image']>,
   url: string,
-): Promise<ElementInfo | null> {
-  return infoOf(await requestFrame(frameId, 'doop:replace-image', { selector, image, url }))
+): Promise<boolean> {
+  const reply = await requestFrame(frameId, 'doop:replace-image', { selector, image, url })
+  return reply?.ok === true
 }
 
 /** One element with interactions, as the frame runtime reports it. */

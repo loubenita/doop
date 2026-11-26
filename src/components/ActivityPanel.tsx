@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState, type CSSProperties } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import type { AgentTask } from '../../shared/types'
 import { canEditOpenCanvas, useStore } from '../lib/store'
 import { api } from '../lib/api'
+import { authClient } from '../lib/auth'
 import { timeAgo } from '../lib/time'
 import { cn } from '@/lib/utils'
 import { AgentIcon } from './AgentIcon'
@@ -24,7 +25,10 @@ import { DotMatrix } from './ui/dot-matrix'
 import { Dot } from './ui/dot'
 import { isResidentLimit } from './TeamAllowance'
 import { CommentsPanel } from './CommentsPanel'
-import { PromptBar } from './PromptBar'
+import { PromptBar, SCOPE_ROW_CLEARANCE } from './PromptBar'
+import { AgentChat } from './AgentChat'
+import { isChatCard } from '../lib/agentChat'
+import { clampRecentHeight, MIN_CHAT_PX, MIN_RECENT_PX, readRecentHeight, writeRecentHeight } from '../lib/agentsSplit'
 import { taskFrameId } from '../lib/taskFrame'
 import { useOpenThreadCount } from '../lib/comments'
 import { useT } from '@/lib/i18n'
@@ -40,6 +44,11 @@ const tabEnter =
 function reportLimit(err: unknown) {
   if (isResidentLimit(err)) useStore.getState().setLimitWall(true)
   else console.error(err)
+}
+
+/** How far a job with countable steps has come, as a whole percent. */
+function jobPercent(task: AgentTask): number {
+  return task.progress ? Math.round((task.progress.done / task.progress.total) * 100) : 0
 }
 
 function duration(t: AgentTask): string {
@@ -75,6 +84,7 @@ export function ActivityPanel({
   const [, tick] = useState(0)
   const openThreads = useOpenThreadCount()
   const working = useStore((s) => s.tasks.filter((t) => t.agentName && !t.endedAt && !t.failedAt).length)
+  const hasChat = useStore((s) => s.tasks.some(isChatCard))
   const t = useT()
 
   /* refresh relative timestamps and running durations */
@@ -137,12 +147,19 @@ export function ActivityPanel({
           </PanelTabs>
           <PanelClose label={t('panels.activityClosePanel')} onClick={onClose} />
         </PanelHeader>
-        {/* the Agents tab is a column: what the agents are doing scrolls above,
-            the prompt composer is docked underneath */}
+        {/* the Agents tab is a column: what the agents are doing on top, the
+            conversation with them under it, the prompt composer docked below */}
         <PanelTabPanel value="tasks" className={tabEnter}>
-          <div className="flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-contain">
-            <RecentTasks />
-          </div>
+          {hasChat ? (
+            <AgentsSplit />
+          ) : (
+            /* the strip scrolls itself, so the clearance for the composer's
+               scope chip is kept here, under it, and its pinned toggle stays
+               clear of the chip */
+            <div className={cn('flex min-h-0 flex-1 flex-col', SCOPE_ROW_CLEARANCE)}>
+              <RecentTasks />
+            </div>
+          )}
           {/* the composer briefs agents to change frames: editors only */}
           {canEdit && <PromptBar canvasId={canvasId} />}
         </PanelTabPanel>
@@ -160,23 +177,143 @@ export function ActivityPanel({
   )
 }
 
+/** How far one arrow key moves the line between Recent tasks and the chat. */
+const SPLIT_STEP_PX = 16
+
+/* Recent tasks over the chat, with a line between them to drag: up gives the
+   chat more room, down gives it to the tasks. Until someone drags it, Recent
+   tasks takes what it needs up to 45%; a double-click goes back to that. */
+function AgentsSplit() {
+  const column = useRef<HTMLDivElement>(null)
+  const recent = useRef<HTMLDivElement>(null)
+  /* where the line started, and where the latest move put it: a release can
+     land before React renders that move, so it saves this, not the state */
+  const drag = useRef<{ y: number; height: number; placed?: number } | null>(null)
+  const [height, setHeight] = useState<number | null>(readRecentHeight)
+  /* the rendered sizes, for the separator's value and range: the line also
+     moves when the panel or Recent tasks changes height, not only on a drag */
+  const [sizes, setSizes] = useState({ recent: 0, column: 0 })
+  const t = useT()
+
+  useEffect(() => {
+    const col = column.current
+    const top = recent.current
+    if (!col || !top) return
+    const measure = () => setSizes({ recent: top.offsetHeight, column: col.clientHeight })
+    const observer = new ResizeObserver(measure)
+    observer.observe(col)
+    observer.observe(top)
+    return () => observer.disconnect()
+  }, [])
+
+  const place = (next: number) => {
+    const placed = clampRecentHeight(next, column.current?.clientHeight ?? 0)
+    setHeight(placed)
+    if (drag.current) drag.current.placed = placed
+    return placed
+  }
+  const endDrag = () => {
+    if (drag.current?.placed !== undefined) writeRecentHeight(drag.current.placed)
+    drag.current = null
+  }
+
+  return (
+    <div ref={column} className="flex min-h-0 flex-1 flex-col">
+      <div
+        ref={recent}
+        className={cn(
+          /* Recent tasks scrolls itself, its toggle pinned to its bottom edge */
+          'flex min-h-0 flex-none flex-col overflow-hidden',
+          height === null && 'max-h-[45%]',
+        )}
+        style={height === null ? undefined : { height, maxHeight: `calc(100% - ${MIN_CHAT_PX}px)` }}
+      >
+        <RecentTasks />
+      </div>
+      <div
+        role="separator"
+        tabIndex={0}
+        aria-label={t('panels.chatResize')}
+        title={t('panels.chatResize')}
+        aria-orientation="horizontal"
+        aria-valuemin={MIN_RECENT_PX}
+        aria-valuemax={Math.max(MIN_RECENT_PX, sizes.column - MIN_CHAT_PX)}
+        aria-valuenow={sizes.recent}
+        className="group relative z-[1] -my-[3px] flex h-[7px] flex-none touch-none cursor-row-resize items-center focus-visible:outline-none"
+        onPointerDown={(e) => {
+          if (e.button !== 0) return
+          e.preventDefault()
+          drag.current = { y: e.clientY, height: recent.current?.offsetHeight ?? 0 }
+          e.currentTarget.setPointerCapture(e.pointerId)
+        }}
+        onPointerMove={(e) => {
+          if (drag.current) place(drag.current.height + e.clientY - drag.current.y)
+        }}
+        onPointerUp={(e) => {
+          endDrag()
+          if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId)
+        }}
+        onLostPointerCapture={endDrag}
+        onPointerCancel={endDrag}
+        onDoubleClick={() => {
+          setHeight(null)
+          writeRecentHeight(null)
+        }}
+        onKeyDown={(e) => {
+          const current = height ?? recent.current?.offsetHeight ?? 0
+          let next: number
+          if (e.key === 'ArrowUp') next = current - SPLIT_STEP_PX
+          else if (e.key === 'ArrowDown') next = current + SPLIT_STEP_PX
+          else if (e.key === 'Home') next = MIN_RECENT_PX
+          else if (e.key === 'End') next = Number.MAX_SAFE_INTEGER
+          else return
+          e.preventDefault()
+          writeRecentHeight(place(next))
+        }}
+      >
+        {/* the hairline, which thickens while hovered, dragged or focused */}
+        <span className="h-px w-full bg-line-soft transition-[height,background-color] group-hover:h-[3px] group-hover:bg-line group-focus-visible:h-[3px] group-focus-visible:bg-brand group-active:h-[3px] group-active:bg-brand" />
+      </div>
+      {/* its end stays clear for the composer's scope chip, which floats there */}
+      <AgentChat className={cn('flex-1', SCOPE_ROW_CLEARANCE)} />
+    </div>
+  )
+}
+
 /** How many tasks the strip shows before "Show all". */
 const RECENT_SHOWN = 3
 
 /* The "Recent tasks" strip at the top of the Agents tab: what each agent is
    working on or just finished, and for whom. "Show all" opens the whole
-   history in the same rows, split into what is running and what is done. */
+   history in the same rows, split into what is running and what is done.
+   The strip scrolls itself, and its toggle after the rows is pinned to the
+   strip's bottom edge, so "Show less" stays in reach however long the list is
+   and wherever it is scrolled. */
 function RecentTasks() {
   const tasks = useStore((s) => s.tasks)
   const [all, setAll] = useState(false)
-  /* unclaimed board cards have no agent yet, so they are not activity */
-  const claimed = useMemo(() => tasks.filter((t) => t.agentName), [tasks])
+  const strip = useRef<HTMLElement>(null)
+  /* unclaimed board cards have no agent yet, so they are not activity, except
+     repo import cards, which can wait a long while (for the person's own
+     agent, or for their desktop to come online) and must show that they do */
+  const claimed = useMemo(() => tasks.filter((t) => t.agentName || isWaitingRepoCard(t)), [tasks])
   const working = useMemo(() => claimed.filter((t) => !t.endedAt && !t.failedAt), [claimed])
   const finished = useMemo(() => claimed.filter((t) => t.endedAt || t.failedAt), [claimed])
   const t = useT()
+  const hasMore = claimed.length > RECENT_SHOWN
+
+  const toggle = () => {
+    /* collapsing goes back to the top, where the three rows left are */
+    if (all && strip.current) strip.current.scrollTop = 0
+    setAll(!all)
+  }
 
   return (
-    <section aria-label={t('panels.activityRecentTasks')} className="flex flex-none flex-col pt-1.5 pb-1">
+    <section
+      ref={strip}
+      aria-label={t('panels.activityRecentTasks')}
+      className={cn('flex min-h-0 flex-initial flex-col overflow-y-auto overscroll-contain pt-1.5', !hasMore && 'pb-1')}
+    >
       <h3 className="flex h-7 flex-none items-center px-3 text-[11.5px] font-normal text-ink-faint">
         {t('panels.activityRecentTasks')}
       </h3>
@@ -190,16 +327,20 @@ function RecentTasks() {
       ) : (
         claimed.slice(0, RECENT_SHOWN).map((task) => <RecentTaskRow key={task.id} task={task} />)
       )}
-      {claimed.length > RECENT_SHOWN && (
-        <Button
-          variant="bare"
-          className="mx-1.5 mt-0.5 h-[26px] flex-none justify-start gap-1.5 self-start rounded-[7px] px-1.5 text-[11.5px] font-normal text-ink-soft"
-          aria-expanded={all}
-          onClick={() => setAll((v) => !v)}
-        >
-          {all ? t('panels.activityShowLess') : t('panels.activityShowAll')}
-          <ChevronDownIcon className={cn('size-3 text-ink-faint transition-transform', all && 'rotate-180')} />
-        </Button>
+      {hasMore && (
+        /* pinned to the strip's bottom edge, on the panel's own fill so the
+           rows scroll under it */
+        <div className="sticky bottom-0 z-[1] flex flex-none bg-surface px-1.5 pt-0.5 pb-1">
+          <Button
+            variant="bare"
+            className="h-[26px] justify-start gap-1.5 rounded-[7px] px-1.5 text-[11.5px] font-normal text-ink-soft"
+            aria-expanded={all}
+            onClick={toggle}
+          >
+            {all ? t('panels.activityShowLess') : t('panels.activityShowAll')}
+            <ChevronDownIcon className={cn('size-3 text-ink-faint transition-transform', all && 'rotate-180')} />
+          </Button>
+        </div>
       )}
     </section>
   )
@@ -217,8 +358,7 @@ function TaskGroup({ label, tasks }: { label: string; tasks: AgentTask[] }) {
   )
 }
 
-/** The one figure a row shows at its right end: how far a job has got, how
- *  long a running task has been at it, or how long ago a finished one ended. */
+/** Elapsed time while running, then how long ago the task ended. */
 function taskTime(task: AgentTask): string {
   if (task.failedAt) return timeAgo(task.failedAt)
   if (task.endedAt) return timeAgo(task.endedAt)
@@ -241,6 +381,16 @@ function RecentTaskRow({ task }: { task: AgentTask }) {
   }
   const t = useT()
   const running = !task.endedAt && !task.failedAt
+  const waiting = isWaitingRepoCard(task)
+  const userId = authClient.useSession().data?.user.id
+  /* a waiting card has no agent yet: name who it waits for, whose it is */
+  const agentLabel =
+    task.agentName ||
+    (!task.payload?.outside
+      ? t('panels.activityDoopAgent')
+      : task.queuedByUserId === userId
+        ? t('panels.activityYourAgent')
+        : t('panels.activityAgentOf', { name: task.queuedBy ?? '' }))
   const failed = !!task.failedAt
   const reason = task.failureReason ?? t('panels.activityTaskUnfinished')
   /* a job's status already is its reason; a card's status is its brief */
@@ -265,9 +415,10 @@ function RecentTaskRow({ task }: { task: AgentTask }) {
     >
       <span className="flex min-w-0 items-center gap-1.5 whitespace-nowrap">
         <span className="grid size-4 flex-none place-items-center">
-          <AgentIcon name={task.agentName} size={14} />
+          <AgentIcon name={agentLabel} size={14} />
         </span>
-        <b className="truncate font-medium text-ink">{task.agentName}</b>
+        <b className="truncate font-medium text-ink">{agentLabel}</b>
+        {waiting && <em className="flex-none not-italic text-ink-faint">{t('panels.activityWaiting')}</em>}
         {task.owner && (
           <em className="truncate not-italic text-ink-faint">{t('panels.activityFor', { name: task.owner })}</em>
         )}
@@ -320,13 +471,35 @@ function RecentTaskRow({ task }: { task: AgentTask }) {
           )}
         </span>
       )}
+      {running && task.progress && (
+        <span
+          className="col-span-2 ml-[22px] block h-[3px] overflow-hidden rounded-full bg-line-soft"
+          role="progressbar"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={jobPercent(task)}
+          aria-label={task.status}
+        >
+          <span
+            className="block h-full rounded-full transition-[width] duration-300 ease-out"
+            style={{ width: `${Math.max(3, jobPercent(task))}%`, background: task.color }}
+          />
+        </span>
+      )}
     </div>
   )
 }
 
+/** A repo import card nobody has taken yet. */
+function isWaitingRepoCard(task: AgentTask): boolean {
+  return !!task.queuedBy && !!task.kind && !task.agentName && !task.endedAt && !task.failedAt
+}
+
 /** Where a task stands, as one 12px glyph: the working matrix, a done check,
- *  or the failure mark. */
+ *  the failure mark, or an empty ring while nobody has taken it. */
+
 function TaskMark({ task }: { task: AgentTask }) {
+  if (isWaitingRepoCard(task)) return <span className="size-3 flex-none rounded-full border border-ink-faint" />
   if (task.failedAt)
     return (
       <span className="flex size-3 flex-none flex-col items-center justify-center gap-[1px] rounded-full bg-accent-ink">

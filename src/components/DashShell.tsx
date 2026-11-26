@@ -2,7 +2,7 @@ import * as React from 'react'
 import { authClient } from '../lib/auth'
 import { navigate } from '../App'
 import { posthog } from '../lib/posthog'
-import { useMe } from '../lib/me'
+import { offersUpgrade, useMe } from '../lib/me'
 import { isDesktopShell } from '../lib/shell'
 import { isTheme, useTheme } from '../lib/theme'
 import { useT } from '../lib/i18n'
@@ -25,7 +25,20 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from './ui/dropdown-menu'
-import { DesktopIcon, ExportIcon, GearIcon, HelpIcon, LogOutIcon, ShieldIcon } from './ui/icons'
+import {
+  DesktopIcon,
+  ExportIcon,
+  GearIcon,
+  HelpIcon,
+  LogOutIcon,
+  MailIcon,
+  MegaphoneIcon,
+  RocketIcon,
+  ShieldIcon,
+} from './ui/icons'
+import { openUpgrade } from '../lib/upgrade'
+import { offersFeedback, openFeedback } from '../lib/feedback'
+import { PRIORITY_SUPPORT } from '../../shared/billing'
 import { DOWNLOAD_URL, WEBSITE_URL } from '../lib/siteLinks'
 
 /** The account menu the signed-in shell repeats on every page: in the rail
@@ -95,18 +108,23 @@ export function AccountMenu({
           />
         </DropdownMenuLabel>
         {/* the plan is a workspace thing; this line says which side of it the
-            account is on — a member of a live paid workspace is on Team */}
+            account is on — a member of a live paid workspace is on Pro */}
         <div className="mx-2.5 mb-2 flex items-center gap-[7px] text-caption text-ink-soft">
           {me?.plan === 'team' ? (
             <>
-              <Badge tone="accent">team</Badge> {t('shell.teamPlan')}
+              <Badge tone="accent">pro</Badge> {t('plans.proPlan')}
             </>
           ) : (
             <>
-              <Badge>free</Badge> {t('shell.personalPlan')}
+              <Badge>free</Badge> {t('plans.freePlan')}
             </>
           )}
         </div>
+        {offersUpgrade(me) && (
+          <DropdownMenuItem onSelect={() => openUpgrade({ source: 'account-menu' })}>
+            <RocketIcon size="rail" /> {t('plans.upgradeToPro')}
+          </DropdownMenuItem>
+        )}
         <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={() => navigate('/settings')}>
           <GearIcon size="rail" /> {t('shell.settings')}
@@ -116,11 +134,23 @@ export function AccountMenu({
             <ShieldIcon size="rail" /> {t('shell.admin')}
           </DropdownMenuItem>
         )}
+        {me?.billing && me.plan === 'team' && (
+          <DropdownMenuItem asChild>
+            <a href={PRIORITY_SUPPORT}>
+              <MailIcon size="rail" /> {t('plans.prioritySupport')}
+            </a>
+          </DropdownMenuItem>
+        )}
         <DropdownMenuItem asChild>
           <a href="/docs" target="_blank" rel="noopener noreferrer">
             <HelpIcon size="rail" /> {t('shell.helpDocs')}
           </a>
         </DropdownMenuItem>
+        {offersFeedback(me) && (
+          <DropdownMenuItem onSelect={openFeedback}>
+            <MegaphoneIcon size="rail" /> {t('shell.sendFeedback')}
+          </DropdownMenuItem>
+        )}
         {/* new tabs, which the desktop shell hands to the system browser
             (initDesktopShell); the desktop app has nothing to download */}
         {!isDesktopShell() && (

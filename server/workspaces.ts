@@ -6,15 +6,20 @@ import { db } from './db/index.ts'
 import * as t from './db/schema.ts'
 import * as authSchema from './db/auth-schema.ts'
 import { store } from './store.ts'
+import { afterCommit, recordUndo } from './journal.ts'
 import * as billing from './billing.ts'
 import { mailerConfigured, sendMail } from './mailer.ts'
 import { dropWorkspaceFonts } from './fonts.ts'
+import { dropWorkspaceAgents } from './customAgents.ts'
+import { dropWorkspaceSkills } from './skills.ts'
 import { notifyUsers } from './userEvents.ts'
 import { avatarUrl } from '../shared/avatar.ts'
-import { isBillingInterval, isWorkspaceActive } from '../shared/billing.ts'
+import { billedSeats, isBillingInterval, isWorkspaceActive, parseSeats } from '../shared/billing.ts'
 import type { BillingInterval, WorkspaceStatus } from '../shared/billing.ts'
-import { isWorkspaceRole } from '../shared/types.ts'
+import { isLibraryPublishPolicy, isLinkSharingPolicy, isWorkspaceRole } from '../shared/types.ts'
 import type {
+  LibraryPublishPolicy,
+  LinkSharingPolicy,
   WorkspaceDetail,
   WorkspaceInvite,
   WorkspaceMember,
@@ -44,11 +49,18 @@ export interface WorkspaceRecord {
   plan: 'team' | null
   interval: BillingInterval | null
   seats: number
+  /** seats the owner chose; billing never drops below them */
+  seatsBought: number
   stripeCustomerId: string | null
   stripeSubscriptionId: string | null
   currentPeriodEnd: number | null
   cancelAtPeriodEnd: boolean
   billingEventAt: number | null
+  /** who may publish to the component library; stored null for 'everyone' */
+  libraryPublish: LibraryPublishPolicy
+  /** whether its canvases may be shared by link or listed in the gallery;
+   *  stored null for 'allowed' */
+  linkSharing: LinkSharingPolicy
   createdAt: number
   updatedAt: number
 }
@@ -81,11 +93,14 @@ export async function hydrateWorkspaces(): Promise<void> {
       plan: r.plan === 'team' ? 'team' : null,
       interval: isBillingInterval(r.interval) ? r.interval : null,
       seats: r.seats,
+      seatsBought: r.seatsBought,
       stripeCustomerId: r.stripeCustomerId,
       stripeSubscriptionId: r.stripeSubscriptionId,
       currentPeriodEnd: r.currentPeriodEnd,
       cancelAtPeriodEnd: r.cancelAtPeriodEnd,
       billingEventAt: r.billingEventAt,
+      libraryPublish: r.libraryPublish === 'admins' ? 'admins' : 'everyone',
+      linkSharing: r.linkSharing === 'off' ? 'off' : 'allowed',
       createdAt: r.createdAt,
       updatedAt: r.updatedAt,
     })
@@ -166,13 +181,33 @@ export function summaryFor(ws: WorkspaceRecord, viewerId: string): WorkspaceSumm
     plan: ws.plan,
     interval: ws.interval,
     seats: ws.seats,
+    seatsBought: ws.seatsBought,
     memberCount: members.get(ws.id)?.size ?? 0,
     canvasCount: store.countWorkspaceCanvases(ws.id),
     ...(ws.currentPeriodEnd ? { currentPeriodEnd: ws.currentPeriodEnd } : {}),
     cancelAtPeriodEnd: ws.cancelAtPeriodEnd,
+    libraryPublish: ws.libraryPublish,
+    linkSharing: ws.linkSharing,
     createdAt: ws.createdAt,
     updatedAt: ws.updatedAt,
   }
+}
+
+/** May this person publish to (or withdraw from) the workspace's component
+ *  library, as far as the workspace's setting goes? Editing the library canvas
+ *  is the caller's check. A workspace that is gone restricts nothing. */
+export function mayPublishLibrary(workspaceId: string, userId: string | undefined): boolean {
+  const ws = records.get(workspaceId)
+  if (!ws || ws.libraryPublish === 'everyone') return true
+  return hasRole(workspaceId, userId, 'admin')
+}
+
+/** May canvases in this workspace be shared beyond the team (a share link for
+ *  anyone, a Community listing)? A personal canvas (no workspace) and a
+ *  workspace that is gone restrict nothing. */
+export function linkSharingAllowed(workspaceId: string | undefined): boolean {
+  if (!workspaceId) return true
+  return records.get(workspaceId)?.linkSharing !== 'off'
 }
 
 /** Every workspace on the instance, for the admin's default-workspace pick. */
@@ -208,11 +243,14 @@ export function createWorkspace(name: string, ownerId: string): WorkspaceRecord 
     plan: null,
     interval: null,
     seats: 0,
+    seatsBought: 1,
     stripeCustomerId: null,
     stripeSubscriptionId: null,
     currentPeriodEnd: null,
     cancelAtPeriodEnd: false,
     billingEventAt: null,
+    libraryPublish: 'everyone',
+    linkSharing: 'allowed',
     createdAt: now,
     updatedAt: now,
   }
@@ -220,7 +258,7 @@ export function createWorkspace(name: string, ownerId: string): WorkspaceRecord 
   membersOf(ws.id).set(ownerId, { role: 'owner', addedAt: now })
   swallow(
     db.transaction(async (tx) => {
-      await tx.insert(t.workspaces).values(ws)
+      await tx.insert(t.workspaces).values({ ...ws, libraryPublish: null, linkSharing: null })
       await tx
         .insert(t.workspaceMembers)
         .values({ workspaceId: ws.id, userId: ownerId, role: 'owner', addedBy: ownerId, addedAt: now })
@@ -238,13 +276,64 @@ export function renameWorkspace(id: string, name: string): WorkspaceRecord | und
   return ws
 }
 
+export function setLibraryPublish(id: string, policy: LibraryPublishPolicy): WorkspaceRecord | undefined {
+  const ws = records.get(id)
+  if (!ws) return undefined
+  ws.libraryPublish = policy
+  ws.updatedAt = Date.now()
+  swallow(
+    db
+      .update(t.workspaces)
+      .set({ libraryPublish: policy === 'admins' ? 'admins' : null, updatedAt: ws.updatedAt })
+      .where(eq(t.workspaces.id, id)),
+  )
+  return ws
+}
+
+/* Who hears that a canvas went private without a request on that canvas: the
+   server's room, which tells open tabs and each connection its new role, and
+   closes the ones left without access. Registered at boot (server/index.ts),
+   since the room lives there. */
+let sharingClosed: (canvasId: string) => void = () => {}
+
+export function onCanvasSharingClosed(listener: (canvasId: string) => void) {
+  sharingClosed = listener
+}
+
+/** Allow or stop sharing the workspace's canvases beyond the team. Stopping
+ *  makes every canvas in it private at once: its share link goes back to no
+ *  access and it leaves the Community gallery, so allowing sharing again
+ *  re-opens nothing by itself. Returns the canvases it closed. */
+export function setLinkSharing(id: string, policy: LinkSharingPolicy): string[] {
+  const ws = records.get(id)
+  if (!ws) return []
+  const before = { linkSharing: ws.linkSharing, updatedAt: ws.updatedAt }
+  ws.linkSharing = policy
+  ws.updatedAt = Date.now()
+  /* one write with the canvases it closes: undone together, stored together */
+  recordUndo(() => Object.assign(ws, before))
+  const updatedAt = ws.updatedAt
+  afterCommit(() =>
+    swallow(
+      db
+        .update(t.workspaces)
+        .set({ linkSharing: policy === 'off' ? 'off' : null, updatedAt })
+        .where(eq(t.workspaces.id, id)),
+    ),
+  )
+  if (policy === 'allowed') return []
+  const closed = store.closePublicSharing(id)
+  afterCommit(() => closed.forEach((canvasId) => sharingClosed(canvasId)))
+  return closed
+}
+
 /** Tear a workspace down: its canvases return to their owners' personal
  *  spaces (nothing is deleted), its subscription is canceled on Stripe. */
 export async function deleteWorkspace(id: string): Promise<void> {
   const ws = records.get(id)
   if (!ws) return
   if (billing.billingEnabled()) await billing.cancelSubscription(ws)
-  store.detachWorkspace(id)
+  const detached = store.detachWorkspace(id)
   records.delete(id)
   const former = [...(members.get(id)?.keys() ?? [])]
   members.delete(id)
@@ -255,6 +344,12 @@ export async function deleteWorkspace(id: string): Promise<void> {
     await tx.delete(t.workspaces).where(eq(t.workspaces.id, id))
   })
   await dropWorkspaceFonts(id)
+  await dropWorkspaceAgents(id)
+  await dropWorkspaceSkills(id)
+  /* each canvas now has its owner's personal team; open rooms hear it. Lazy:
+     actions depends on this module through the font library */
+  const { announceTeam } = await import('./actions.ts')
+  for (const canvasId of detached) announceTeam(canvasId)
 }
 
 /** Mirror a Stripe subscription onto the row. The one place billing state
@@ -313,6 +408,12 @@ async function applySubscriptionNow(
   return { ws, applied: true }
 }
 
+function setSeatsBought(ws: WorkspaceRecord, seatsBought: number): void {
+  if (ws.seatsBought === seatsBought) return
+  ws.seatsBought = seatsBought
+  swallow(db.update(t.workspaces).set({ seatsBought }).where(eq(t.workspaces.id, ws.id)))
+}
+
 export function setCustomer(id: string, stripeCustomerId: string): void {
   const ws = records.get(id)
   if (!ws || ws.stripeCustomerId === stripeCustomerId) return
@@ -320,7 +421,8 @@ export function setCustomer(id: string, stripeCustomerId: string): void {
   swallow(db.update(t.workspaces).set({ stripeCustomerId }).where(eq(t.workspaces.id, id)))
 }
 
-/** Keep Stripe's quantity equal to the member count, in the background:
+/** Keep Stripe's quantity at the seats bought or the member count, whichever
+ *  is larger (`billedSeats`), in the background:
  *  seat changes must never make the invite itself fail. One chain per
  *  workspace, and the count is read when the update runs, not when it was
  *  queued — so a burst of adds and removes settles on the real number
@@ -328,20 +430,35 @@ export function setCustomer(id: string, stripeCustomerId: string): void {
 const seatChains = new Map<string, Promise<void>>()
 
 function reconcileSeats(ws: WorkspaceRecord): void {
+  onSeatChain(ws, () => syncSeatsNow(ws)).catch(() => {}) // logged on the chain
+}
+
+/** Run seat work after whatever this workspace already has queued. The
+ *  owner's seat change runs here whole (the choice, Stripe, the rollback),
+ *  so a failed change can never undo a later one. Rejects with the work's
+ *  error; the chain itself only logs it. */
+function onSeatChain<T>(ws: WorkspaceRecord, work: () => Promise<T>): Promise<T> {
+  const result = (seatChains.get(ws.id) ?? Promise.resolve()).then(work)
+  seatChains.set(
+    ws.id,
+    result.then(
+      () => {},
+      (err) => console.error(`[billing] seat sync failed for workspace ${ws.id}`, err),
+    ),
+  )
+  return result
+}
+
+/** Tell Stripe the quantity this workspace should be billed for now. */
+async function syncSeatsNow(ws: WorkspaceRecord): Promise<void> {
   if (!billing.billingEnabled() || !ws.stripeSubscriptionId) return
-  const run = async () => {
-    const seats = members.get(ws.id)?.size ?? 0
-    if (!records.has(ws.id)) return // deleted while queued
-    await billing.syncSeats(ws, seats)
-    if (ws.seats !== seats) {
-      ws.seats = seats
-      await db.update(t.workspaces).set({ seats }).where(eq(t.workspaces.id, ws.id))
-    }
+  if (!records.has(ws.id)) return // deleted while queued
+  const seats = billedSeats(ws.seatsBought, members.get(ws.id)?.size ?? 0)
+  await billing.syncSeats(ws, seats)
+  if (ws.seats !== seats) {
+    ws.seats = seats
+    await db.update(t.workspaces).set({ seats }).where(eq(t.workspaces.id, ws.id))
   }
-  const next = (seatChains.get(ws.id) ?? Promise.resolve())
-    .then(run)
-    .catch((err) => console.error(`[billing] seat sync failed for workspace ${ws.id}`, err))
-  seatChains.set(ws.id, next)
 }
 
 export function addMember(workspaceId: string, userId: string, role: WorkspaceRole, addedBy: string): boolean {
@@ -605,9 +722,19 @@ workspacesRouter.get('/:id', async (req, res) => {
 workspacesRouter.patch('/:id', (req, res) => {
   const ws = requireWorkspace(req, res, req.params.id, 'admin')
   if (!ws) return
+  /* a name, the library's publish setting, link sharing, or any of them */
+  const policy: unknown = req.body?.libraryPublish
+  if (policy !== undefined && !isLibraryPublishPolicy(policy))
+    return res.status(400).json({ error: 'libraryPublish must be everyone or admins' })
+  const linkSharing: unknown = req.body?.linkSharing
+  if (linkSharing !== undefined && !isLinkSharingPolicy(linkSharing))
+    return res.status(400).json({ error: 'linkSharing must be allowed or off' })
   const name = workspaceName(req.body?.name)
-  if (!name) return res.status(400).json({ error: 'name required' })
-  renameWorkspace(ws.id, name)
+  if (!name && policy === undefined && linkSharing === undefined)
+    return res.status(400).json({ error: 'name required' })
+  if (name) renameWorkspace(ws.id, name)
+  if (policy !== undefined) setLibraryPublish(ws.id, policy)
+  if (linkSharing !== undefined && linkSharing !== ws.linkSharing) setLinkSharing(ws.id, linkSharing)
   res.json(summaryFor(ws, req.user!.id))
 })
 
@@ -723,6 +850,8 @@ workspacesRouter.post('/:id/billing/checkout', async (req, res) => {
   if (!billing.billingEnabled()) return res.status(400).json({ error: 'billing is not configured on this server' })
   const interval = req.body?.interval
   if (!isBillingInterval(interval)) return res.status(400).json({ error: 'interval must be month or year' })
+  const wanted = req.body?.seats === undefined ? ws.seatsBought : parseSeats(req.body.seats)
+  if (wanted === null) return res.status(400).json({ error: 'seats must be a whole number from 1 to 500' })
   /* one subscription per workspace: a second checkout would bill twice
      while only the last one is on file */
   if (ws.stripeSubscriptionId && isWorkspaceActive(ws.status))
@@ -730,13 +859,41 @@ workspacesRouter.post('/:id/billing/checkout', async (req, res) => {
   try {
     const customerId = await billing.ensureCustomer(ws, req.user!.email)
     setCustomer(ws.id, customerId)
-    const seats = members.get(ws.id)?.size ?? 1
+    setSeatsBought(ws, wanted)
+    const seats = billedSeats(wanted, members.get(ws.id)?.size ?? 1)
     const url = await billing.createCheckout({ ...ws, stripeCustomerId: customerId }, interval, seats)
     res.json({ url })
   } catch (err) {
     console.error('[billing] checkout failed', err)
     res.status(502).json({ error: err instanceof Error ? err.message : 'could not start checkout' })
   }
+})
+
+/* The seats the owner pays for. Fewer than the people in the workspace is
+   allowed: the bill follows the people then, and freed seats are not kept.
+   Answered once Stripe has the new quantity; a refusal puts the old choice
+   back, so the page never shows a bill Stripe is not charging. */
+workspacesRouter.put('/:id/billing/seats', async (req, res) => {
+  const ws = requireWorkspace(req, res, req.params.id, 'owner')
+  if (!ws) return
+  if (!billing.billingEnabled()) return res.status(400).json({ error: 'billing is not configured on this server' })
+  const seats = parseSeats(req.body?.seats)
+  if (seats === null) return res.status(400).json({ error: 'seats must be a whole number from 1 to 500' })
+  try {
+    await onSeatChain(ws, async () => {
+      const before = ws.seatsBought
+      setSeatsBought(ws, seats)
+      try {
+        await syncSeatsNow(ws)
+      } catch (err) {
+        setSeatsBought(ws, before)
+        throw err
+      }
+    })
+  } catch {
+    return res.status(502).json({ error: 'Stripe did not take the seat change — nothing was changed, try again' })
+  }
+  res.json(summaryFor(ws, req.user!.id))
 })
 
 workspacesRouter.post('/:id/billing/portal', async (req, res) => {

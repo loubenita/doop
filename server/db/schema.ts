@@ -14,6 +14,7 @@ import {
 import { open, seal } from '../secretBox.ts'
 import type { CanvasGuide, CanvasPageInfo, FrameApproval } from '../../shared/types.ts'
 import type { AutomationRunState, AutomationTrigger, Schedule, Step } from '../../shared/automations.ts'
+import type { StorybookRunResult, StorybookSourceComponent } from '../../shared/storybookSource.ts'
 import type {
   ComponentCode,
   ComponentDef,
@@ -110,6 +111,9 @@ export const workspaces = pgTable('workspaces', {
   interval: text('interval'),
   /** the paid seat count Stripe is billing for */
   seats: integer('seats').notNull().default(0),
+  /** the seats the owner chose to pay for: the billed quantity is this or
+   *  the member count, whichever is larger, so invites fill bought seats first */
+  seatsBought: integer('seats_bought').notNull().default(1),
   stripeCustomerId: text('stripe_customer_id'),
   stripeSubscriptionId: text('stripe_subscription_id'),
   /** epoch ms the current billing period ends (= the next renewal) */
@@ -118,6 +122,12 @@ export const workspaces = pgTable('workspaces', {
   /** Stripe's `created` of the last subscription event applied (epoch s) —
    *  an older event arriving late must not roll the mirror back */
   billingEventAt: bigint('billing_event_at', { mode: 'number' }),
+  /** who may publish to the workspace's component library: 'admins' (owner and
+   *  admins only); null is everyone who can edit the library canvas */
+  libraryPublish: text('library_publish'),
+  /** 'off': no canvas in it may be shared by link or listed in the Community
+   *  gallery; null allows both (each canvas's owner decides) */
+  linkSharing: text('link_sharing'),
   createdAt: bigint('created_at', { mode: 'number' }).notNull(),
   updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
 })
@@ -245,6 +255,28 @@ export const syncKeys = pgTable(
   (t) => [index('sync_keys_canvas_idx').on(t.canvasId), index('sync_keys_secret_idx').on(t.secret)],
 )
 
+/** A Storybook a canvas imported components from, kept so it can be synced again
+ *  (.context/specs/storybook-import.md, "Sync"). One per canvas and Storybook URL; cold path,
+ *  read when someone imports or syncs. */
+export const storybookSources = pgTable(
+  'storybook_sources',
+  {
+    id: text('id').primaryKey(),
+    canvasId: text('canvas_id').notNull(),
+    url: text('url').notNull(),
+    /** the components picked, and what each became */
+    components: jsonb('components').$type<StorybookSourceComponent[]>().notNull(),
+    /** tokens this source made, which a sync may update (any other token of the name is left alone) */
+    tokens: jsonb('tokens').$type<string[]>().notNull(),
+    /** the last run's outcome per component, for the import section */
+    lastResult: jsonb('last_result').$type<StorybookRunResult | null>(),
+    createdBy: text('created_by').notNull(),
+    createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+    syncedAt: bigint('synced_at', { mode: 'number' }),
+  },
+  (t) => [uniqueIndex('storybook_sources_canvas_url_idx').on(t.canvasId, t.url)],
+)
+
 /** Link hotspots a synced page declares: where each same-app link sits in the
  *  snapshot and which page it leads to. Replaced wholesale on every capture
  *  of that page — the set mirrors the CURRENT design, it is not history. */
@@ -335,6 +367,8 @@ export const tasks = pgTable(
     id: text('id').primaryKey(),
     canvasId: text('canvas_id').notNull(),
     agentName: text('agent_name').notNull(),
+    /** an outside agent's identity when its name is not enough (shared/agentIdentity.ts) */
+    agentKey: text('agent_key'),
     owner: text('owner'),
     color: text('color').notNull(),
     status: text('status').notNull(),
@@ -362,6 +396,8 @@ export const tasks = pgTable(
     frameIds: text('frame_ids'),
     /** JSON RunnerPick: the connection and model the composer picked for a card */
     runner: text('runner'),
+    /** a card's agent answer: the latest run's closing words */
+    reply: text('reply'),
   },
   (t) => [index('tasks_canvas_idx').on(t.canvasId)],
 )
@@ -380,11 +416,17 @@ export const feedback = pgTable(
     at: bigint('at', { mode: 'number' }).notNull(),
     deliveredAt: bigint('delivered_at', { mode: 'number' }),
     claimedBy: text('claimed_by'),
+    /** the claim came from a resident run (in-process), not an outside agent
+     *  that happens to share a resident's name; null on claims made before
+     *  custom agents, when only built-in names were resident */
+    claimedByResident: boolean('claimed_by_resident'),
     completedAt: bigint('completed_at', { mode: 'number' }),
     failedAt: bigint('failed_at', { mode: 'number' }),
     failureReason: text('failure_reason'),
     /** JSON RunnerPick of the task it answers, kept from when it was left */
     runner: text('runner'),
+    /** the closing words of the run that handled it */
+    reply: text('reply'),
   },
   (t) => [index('feedback_canvas_idx').on(t.canvasId)],
 )
@@ -494,6 +536,68 @@ export const fonts = pgTable(
   (t) => [index('fonts_workspace_idx').on(t.workspaceId), index('fonts_owner_idx').on(t.ownerId)],
 )
 
+/** Custom agents (shared/customAgents.ts): specialists a workspace or a
+ *  person adds to the built-in team. `scope` is 'ws:<workspaceId>' or
+ *  'user:<userId>'; a handle is unique within it. */
+export const customAgents = pgTable(
+  'custom_agents',
+  {
+    id: text('id').primaryKey(),
+    scope: text('scope').notNull(),
+    handle: text('handle').notNull(),
+    name: text('name').notNull(),
+    color: text('color').notNull(),
+    blurb: text('blurb').notNull(),
+    brief: text('brief').notNull(),
+    reviewer: boolean('reviewer').notNull().default(false),
+    createdBy: text('created_by').notNull(),
+    createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+    updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
+  },
+  (t) => [
+    uniqueIndex('custom_agents_scope_handle_idx').on(t.scope, t.handle),
+    uniqueIndex('custom_agents_scope_name_idx').on(t.scope, t.name),
+  ],
+)
+
+/** Skills (shared/skills.ts): named instructions a workspace or a person
+ *  writes once and asks for with `/handle`. `scope` as in `custom_agents`;
+ *  a handle is unique within it. */
+export const skills = pgTable(
+  'skills',
+  {
+    id: text('id').primaryKey(),
+    scope: text('scope').notNull(),
+    handle: text('handle').notNull(),
+    description: text('description').notNull(),
+    body: text('body').notNull(),
+    createdBy: text('created_by').notNull(),
+    createdAt: bigint('created_at', { mode: 'number' }).notNull(),
+    updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
+  },
+  (t) => [uniqueIndex('skills_scope_handle_idx').on(t.scope, t.handle)],
+)
+
+/** A workspace's or a person's changes to one built-in agent
+ *  (shared/agents.ts): switched off, or its colour, one-liner, instructions or
+ *  reviewer flag replaced. A null field keeps the built-in value; no row is
+ *  the built-in agent as it ships. `scope` as in `custom_agents`. */
+export const agentOverrides = pgTable(
+  'agent_overrides',
+  {
+    scope: text('scope').notNull(),
+    roleId: text('role_id').notNull(),
+    disabled: boolean('disabled').notNull().default(false),
+    color: text('color'),
+    blurb: text('blurb'),
+    brief: text('brief'),
+    reviewer: boolean('reviewer'),
+    updatedBy: text('updated_by').notNull(),
+    updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.scope, t.roleId] })],
+)
+
 /** Named design docs per canvas (brand rules, style recipes) — markdown
  *  written mostly for agents. Small and cold-path; hydrated with the canvas. */
 export const guidelines = pgTable(
@@ -515,8 +619,7 @@ export const guidelines = pgTable(
 
 /** Reusable designs. Keyed per canvas: a copied canvas keeps its ids, so the
  *  instance markers in its copied frames still point at the right rows. Mirrored
- *  in memory like guidelines. `history` holds recent revisions inline because
- *  merging a stale save needs them synchronously. */
+ *  in memory like guidelines. Earlier revisions are rows of `component_revisions`. */
 export const components = pgTable(
   'components',
   {
@@ -531,13 +634,70 @@ export const components = pgTable(
     props: jsonb('props').$type<ComponentProp[]>().notNull(),
     slots: jsonb('slots').$type<ComponentSlot[]>().notNull(),
     rev: integer('rev').notNull(),
+    /** `ComponentDef.renderRev`: the revision instances are marked with. Null means `rev` */
+    renderRev: integer('render_rev'),
     mainFrameId: text('main_frame_id'),
     code: jsonb('code').$type<ComponentCode>(),
     source: jsonb('source').$type<NonNullable<ComponentDef['source']>>(),
-    history: jsonb('history').$type<ComponentSnapshot[]>().notNull(),
+    /** Retired: revisions live in `component_revisions`. Neither read nor written; kept, with
+     *  a default, so the release before this one still runs on the table. A later migration drops it. */
+    legacyHistory: jsonb('history').$type<ComponentSnapshot[]>().notNull().default([]),
+    /** 'deleted' is a soft delete: the row stays, so instances keep what they were
+     *  rendered from and the component can be restored */
+    status: text('status').$type<'active' | 'deleted'>().notNull().default('active'),
+    deletedAt: bigint('deleted_at', { mode: 'number' }),
+    deletedBy: text('deleted_by'),
     createdAt: bigint('created_at', { mode: 'number' }).notNull(),
     updatedAt: bigint('updated_at', { mode: 'number' }).notNull(),
     updatedBy: text('updated_by').notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.canvasId, t.id] })],
+)
+
+/** A component's earlier states, one row per revision: inserted once, never updated, and
+ *  pruned to the newest `MAX_COMPONENT_HISTORY` per component. Mirrored in memory as
+ *  `ComponentDef.history`, because merging a stale save needs them synchronously. */
+export const componentRevisions = pgTable(
+  'component_revisions',
+  {
+    canvasId: text('canvas_id').notNull(),
+    componentId: text('component_id').notNull(),
+    rev: integer('rev').notNull(),
+    /** `ComponentSnapshot.renderRev`; null means `rev` */
+    renderRev: integer('render_rev'),
+    template: text('template').notNull(),
+    rawCss: text('raw_css').notNull(),
+    head: jsonb('head').$type<string[]>().notNull(),
+    props: jsonb('props').$type<ComponentProp[]>().notNull(),
+    savedAt: bigint('saved_at', { mode: 'number' }).notNull(),
+    savedBy: text('saved_by').notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.canvasId, t.componentId, t.rev] })],
+)
+
+/** What a workspace library has published: one snapshot per component of a
+ *  library canvas. A canvas is a library while it has rows here, and serves the
+ *  workspace it is in at that moment (read from the canvas, not stored). Small
+ *  and read on frame writes, so mirrored in memory (server/componentLibrary.ts). */
+export const libraryComponents = pgTable(
+  'library_components',
+  {
+    canvasId: text('canvas_id').notNull(),
+    id: text('id').notNull(),
+    name: text('name').notNull(),
+    description: text('description').notNull(),
+    template: text('template').notNull(),
+    css: text('css').notNull(),
+    rawCss: text('raw_css').notNull(),
+    head: jsonb('head').$type<string[]>().notNull(),
+    props: jsonb('props').$type<ComponentProp[]>().notNull(),
+    slots: jsonb('slots').$type<ComponentSlot[]>().notNull(),
+    code: jsonb('code').$type<ComponentCode>(),
+    /** nested components from other libraries: component id → library canvas id */
+    nested: jsonb('nested').$type<Record<string, string>>(),
+    rev: integer('rev').notNull(),
+    publishedAt: bigint('published_at', { mode: 'number' }).notNull(),
+    publishedBy: text('published_by').notNull(),
   },
   (t) => [primaryKey({ columns: [t.canvasId, t.id] })],
 )

@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import type { Frame as PuppeteerFrame, Page } from 'puppeteer-core'
 import { findBrowserPath } from '../server/screenshot'
 import { fixtureUrl, pagePerTest } from './browser'
-import type { Canvas, Frame } from '../shared/types'
+import type { Canvas, ElementComment, Frame } from '../shared/types'
 
 type Message = { type?: string; interaction?: { action?: string; target?: string } }
 /* what tests/fixtures/prototype.html puts on window */
@@ -11,11 +11,14 @@ type Fixture = {
   fixtureReady: boolean
   playerClosed: boolean
   seed: (canvas: Canvas) => void
+  seedComments: (comments: ElementComment[]) => void
   play: (frameId: string) => void
   playSynced: (frameId: string) => void
   editFrame: (id: string, html: string) => void
   addRawFrame: () => void
   mountStage: (prototypeMode: boolean) => void
+  selectFrame: (id: string | null) => void
+  pickElement: (el: { frameId: string; selector: string } | null) => void
 }
 
 const doc = (body: string) =>
@@ -87,6 +90,11 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 /* The first load transforms the app through a cold Vite dev server, which can
    take longer than the default test timeout on CI. */
+/* the player's control bar above the screens, in px */
+const BAR = 40
+/* the pager's strip under them, on a page with frames to step to */
+const PAGER = 56
+
 describe.skipIf(!findBrowserPath())('prototype player', { timeout: 30_000 }, () => {
   const pages = pagePerTest()
   let page: Page
@@ -150,7 +158,8 @@ describe.skipIf(!findBrowserPath())('prototype player', { timeout: 30_000 }, () 
 
     /* the scrim closes an overlay too */
     await clickUntil(back, '#help', async () => !!(await page.$('[data-proto-overlay="menu"]')))
-    await page.mouse.click(20, 20)
+    /* on the scrim, below the bar */
+    await page.mouse.click(20, BAR + 20)
     await page.waitForFunction(() => !document.querySelector('[data-proto-overlay]'))
   })
 
@@ -173,6 +182,40 @@ describe.skipIf(!findBrowserPath())('prototype player', { timeout: 30_000 }, () 
     expect(await home.$('#go[data-v-proto-flash]')).not.toBeNull()
   })
 
+  it('keeps a restarted hotspot flash for its whole run', async () => {
+    await page.evaluate((canvas) => (window as unknown as Fixture).seed(canvas), CANVAS)
+    await page.evaluate(() => (window as unknown as Fixture).play('home'))
+    const home = await screen('home')
+    /* a miss flashes once the runtime is in prototype mode; let that flash end */
+    for (let attempt = 0; attempt < 20; attempt++) {
+      await home.$eval('#blank', (el) => (el as HTMLElement).click())
+      if (await home.$('[data-v-proto-flash]')) break
+      await sleep(50)
+    }
+    await home.waitForFunction(() => !document.querySelector('[data-v-proto-flash]'), { timeout: 3000 })
+    /* timed inside the frame, so no round trip stretches the gaps: the first
+       miss's clear must not cut the second miss's flash short */
+    const run = await home.evaluate(async () => {
+      const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+      const go = document.getElementById('go')!
+      const alpha = () => Number(/rgba?\(([^)]+)\)/.exec(getComputedStyle(go).outlineColor)?.[1]?.split(',')[3] ?? 1)
+      const blank = document.getElementById('blank')!
+      blank.click()
+      await wait(500)
+      blank.click()
+      await wait(100)
+      const early = alpha()
+      await wait(500)
+      const late = alpha()
+      await wait(200)
+      return { early, late, lit: go.hasAttribute('data-v-proto-flash') }
+    })
+    expect(run.lit).toBe(true)
+    /* and the ring fades over the run rather than holding until it is cleared */
+    expect(run.late).toBeLessThan(run.early)
+    await home.waitForFunction(() => !document.querySelector('[data-v-proto-flash]'), { timeout: 3000 })
+  })
+
   it('sits below the app inset and rescales from its scaling menu', async () => {
     await page.evaluate(() => document.documentElement.style.setProperty('--app-inset', '40px'))
     /* the scaling pick is kept in storage, which the file's pages share */
@@ -182,11 +225,45 @@ describe.skipIf(!findBrowserPath())('prototype player', { timeout: 30_000 }, () 
       await screen('home')
       expect(await page.$eval('[data-prototype-player]', (el) => el.getBoundingClientRect().top)).toBe(40)
       const width = () => page.$eval('[data-proto-screen="home"] > div', (el) => el.getBoundingClientRect().width)
-      /* 1000 × 660 fits the 400 × 300 frame at 2.2× */
-      expect(await width()).toBe(880)
+      /* the screens get 1000 × 660 less the bar and the pager, room for the 400 × 300 frame
+         nearly twice over, and Fit (the default) draws it at its design size, not larger */
+      expect(await width()).toBe(400)
+      /* the bar sits above the screens and the pager below, never over them */
+      const box = (selector: string) =>
+        page.$eval(selector, (el) => {
+          const { top, bottom, height } = el.getBoundingClientRect()
+          return { top, bottom, height }
+        })
+      const bar = await box('[data-proto-bar]')
+      expect((await box('[data-proto-stage]')).top).toBe(bar.bottom)
+      expect(bar).toMatchObject({ top: 40, height: BAR })
+      const pager = await box('[data-proto-pager]')
+      expect((await box('[data-proto-stage]')).bottom).toBe(pager.top)
+      expect(pager).toMatchObject({ bottom: 700, height: PAGER })
+
+      const widthBecomes = (px: number) =>
+        page.waitForFunction(
+          (want) => document.querySelector('[data-proto-screen="home"] > div')?.getBoundingClientRect().width === want,
+          {},
+          px,
+        )
+      const pick = async (label: string) => {
+        await page.click('[aria-label="Scaling"]')
+        await page.waitForSelector('[data-proto-menu]')
+        await page.$$eval(
+          '[data-proto-menu] [role="menuitemradio"]',
+          (items, text) => (items.find((item) => item.textContent === text) as HTMLElement | undefined)?.click(),
+          label,
+        )
+      }
+
+      /* Fit width fills the player's width, enlarging the screen */
+      await pick('Fit width')
+      await widthBecomes(1000)
 
       await page.click('[aria-label="Scaling"]')
       await page.waitForSelector('[data-proto-menu]')
+      /* the first item, Actual size, by keyboard */
       await page.keyboard.press('ArrowDown')
       await page.keyboard.press('Enter')
       await page.waitForFunction(() => !document.querySelector('[data-proto-menu]'))
@@ -194,21 +271,36 @@ describe.skipIf(!findBrowserPath())('prototype player', { timeout: 30_000 }, () 
       expect(await page.evaluate(() => (window as unknown as Fixture).playerClosed)).toBe(false)
       /* and the keys are the screen's again: a keyboard user is not left nowhere */
       await page.waitForFunction(() => document.activeElement?.matches('iframe[data-doop-proto-frame="home"]'))
-      await page.waitForFunction(
-        () => document.querySelector('[data-proto-screen="home"] > div')?.getBoundingClientRect().width === 400,
-      )
+      await widthBecomes(400)
 
-      await page.click('[aria-label="Scaling"]')
-      await page.waitForSelector('[data-proto-menu]')
-      await page.$$eval('[data-proto-menu] [role="menuitemradio"]', (items) =>
-        (items.find((item) => item.textContent === 'Responsive') as HTMLElement | undefined)?.click(),
-      )
-      await page.waitForFunction(
-        () => document.querySelector('[data-proto-screen="home"] > div')?.getBoundingClientRect().width === 1000,
-      )
+      await pick('Responsive')
+      await widthBecomes(1000)
     } finally {
       await page.evaluate(() => localStorage.removeItem('doop:proto-scaling'))
     }
+  })
+
+  it('cuts a long frame name short on a phone instead of running it under the buttons', async () => {
+    const long: Canvas = {
+      ...CANVAS,
+      frames: CANVAS.frames.map((f) => (f.id === 'home' ? { ...f, name: 'A very long frame name '.repeat(4) } : f)),
+    }
+    await page.setViewport({ width: 320, height: 700 })
+    await page.evaluate((canvas) => (window as unknown as Fixture).seed(canvas), long)
+    await page.evaluate(() => (window as unknown as Fixture).play('home'))
+    await screen('home')
+    const edges = await page.evaluate(() => {
+      /* the left group's last button: the name pushes it along */
+      const left = document.querySelector('[aria-label="Restart prototype"]')!.getBoundingClientRect()
+      const hotspots = document.querySelector('[aria-label="Show hotspots"]')!.getBoundingClientRect()
+      return {
+        leftEnd: left.right,
+        buttonsLeft: hotspots.left,
+        overflow: document.querySelector('[data-proto-bar]')!.scrollWidth,
+      }
+    })
+    expect(edges.leftEnd).toBeLessThanOrEqual(edges.buttonsLeft)
+    expect(edges.overflow).toBeLessThanOrEqual(320)
   })
 
   it('opens the scaling menu from the keyboard without driving the screen', async () => {
@@ -239,15 +331,17 @@ describe.skipIf(!findBrowserPath())('prototype player', { timeout: 30_000 }, () 
     expect(await page.evaluate(() => (window as unknown as Fixture).playerClosed)).toBe(false)
   })
 
-  it('scrolls an oversized screen to its far corner, and crops it centred under Fill', async () => {
+  it('scrolls an oversized screen to its far corner, crops it under Fill and shrinks it under Fit', async () => {
     const big: Canvas = {
       ...CANVAS,
       frames: [{ ...frame('big', '<button>Big</button>'), width: 2000, height: 1400 }],
     }
-    /* the player's box, the screen's box, and how far its scroller can go */
+    /* the screens' box (the player between its bar and its pager strip, kept
+       even for this one-frame page), the screen's box,
+       and how far its scroller can go */
     const measure = () =>
       page.$eval('[data-proto-screen="big"]', (scroller) => {
-        const player = scroller.closest('[data-prototype-player]')!.getBoundingClientRect()
+        const player = scroller.closest('[data-proto-stage]')!.getBoundingClientRect()
         scroller.scrollTo(scroller.scrollWidth, scroller.scrollHeight)
         const box = scroller.firstElementChild!.getBoundingClientRect()
         return {
@@ -266,15 +360,26 @@ describe.skipIf(!findBrowserPath())('prototype player', { timeout: 30_000 }, () 
     }
     try {
       await page.evaluate((canvas) => (window as unknown as Fixture).seed(canvas), big)
+      await page.setViewport({ width: 1000, height: 700 + BAR + PAGER })
       /* 2000 × 1400 at 1× in a 1000 × 700 player: scrolled to the far corner */
       expect(await playAt('actual')).toMatchObject({ scrolled: true, right: 0, bottom: 0 })
       /* at 0.5×: 1000 × 700 fills the width exactly, no room to scroll */
       expect(await playAt('fit-width')).toMatchObject({ right: 0, bottom: 0, left: 0, top: 0 })
-      await page.setViewport({ width: 1000, height: 600 })
+      await page.setViewport({ width: 1000, height: 600 + BAR + PAGER })
       /* 1000 × 700 in 1000 × 600: scrolls down to the bottom edge */
       expect(await playAt('fit-width')).toMatchObject({ scrolled: true, bottom: 0, left: 0 })
       /* 0.5× covers 1000 × 600: 100px cropped, 50 each side, nothing to scroll */
       expect(await playAt('fill')).toEqual({ scrolled: false, right: 0, bottom: 50, left: 0, top: -50 })
+      /* Fit shrinks it whole, letterboxed: at 600 / 1400 it is 857 × 600, 71 spare each side */
+      const fit = await playAt('fit')
+      expect(fit.scrolled).toBe(false)
+      for (const [edge, want] of [
+        ['top', 0],
+        ['bottom', 0],
+        ['left', 500 / 7],
+        ['right', -500 / 7],
+      ] as const)
+        expect(fit[edge]).toBeCloseTo(want, 0)
     } finally {
       await page.evaluate(() => localStorage.removeItem('doop:proto-scaling'))
     }
@@ -301,6 +406,34 @@ describe.skipIf(!findBrowserPath())('prototype player', { timeout: 30_000 }, () 
     /* home → detail and home → menu; detail's Back and menu's Close are labels */
     await page.waitForFunction(() => document.querySelectorAll('[data-proto-connector]').length === 2)
     expect(await page.$eval('[data-flow-start]', (el) => (el as HTMLElement).dataset.flowStart)).toBe('home')
+
+    /* a selected frame shows only the links into and out of it: connectors
+       and the label-only links (detail's Back, menu's Close) alike */
+    const shown = (connectors: number, labels: number) =>
+      page.waitForFunction(
+        (connectors, labels) =>
+          document.querySelectorAll('[data-proto-connector]').length === connectors &&
+          document.querySelectorAll('[data-prototype-overlay] text').length === labels,
+        {},
+        connectors,
+        labels,
+      )
+    await shown(2, 2)
+    await page.evaluate(() => (window as unknown as Fixture).selectFrame('detail'))
+    await shown(1, 1)
+    await page.evaluate(() => (window as unknown as Fixture).selectFrame('home'))
+    await shown(2, 0)
+    await page.evaluate(() => (window as unknown as Fixture).selectFrame('menu'))
+    await shown(1, 1)
+    await page.evaluate(() => (window as unknown as Fixture).selectFrame(null))
+    await shown(2, 2)
+    /* a picked element counts as its frame being selected */
+    await page.evaluate(() =>
+      (window as unknown as Fixture).pickElement({ frameId: 'detail', selector: 'body > button' }),
+    )
+    await shown(1, 1)
+    await page.evaluate(() => (window as unknown as Fixture).pickElement(null))
+    await shown(2, 2)
   })
 
   it('keeps interactions inert in a frame the editor drives', async () => {
@@ -546,6 +679,217 @@ describe.skipIf(!findBrowserPath())('prototype player', { timeout: 30_000 }, () 
         ),
       )
       await page.waitForFunction(() => document.querySelector('[data-proto-current]')?.textContent === 'DETAIL')
+    })
+  })
+
+  describe('frame menu and comments', () => {
+    const current = () => page.$eval('[data-proto-current]', (el) => el.textContent)
+
+    it('jumps to any frame from the menu, and Back returns', async () => {
+      await page.evaluate((canvas) => {
+        const w = window as unknown as Fixture
+        w.seed(canvas)
+        w.play('home')
+      }, CANVAS)
+      await screen('home')
+      await page.click('[data-proto-frame-menu]')
+      await page.waitForSelector('[data-proto-jump="detail"]')
+      const listed = await page.$$eval('[data-proto-jump]', (items) => items.map((i) => i.textContent))
+      expect(listed).toEqual(['HOME', 'DETAIL', 'MENU'])
+      await page.click('[data-proto-jump="detail"]')
+      await page.waitForFunction(() => document.querySelector('[data-proto-current]')?.textContent === 'DETAIL')
+      await screen('detail')
+      await page.click('[aria-label="Back"]')
+      await page.waitForFunction(() => document.querySelector('[data-proto-current]')?.textContent === 'HOME')
+      expect(await current()).toBe('HOME')
+    })
+
+    it('steps through the page with the pager, and a click around the screen hides the UI', async () => {
+      await page.evaluate((canvas) => {
+        const w = window as unknown as Fixture
+        w.seed(canvas)
+        w.play('home')
+      }, CANVAS)
+      await screen('home')
+      const count = () => page.$eval('[data-proto-count]', (el) => el.textContent)
+      expect(await count()).toBe('1 / 3')
+      expect(await page.$eval('[aria-label="Previous frame"]', (el) => (el as HTMLButtonElement).disabled)).toBe(true)
+      await page.click('[aria-label="Next frame"]')
+      await page.waitForFunction(() => document.querySelector('[data-proto-count]')?.textContent === '2 / 3')
+      expect(await current()).toBe('DETAIL')
+      await page.click('[aria-label="Next frame"]')
+      await page.waitForFunction(() => document.querySelector('[data-proto-count]')?.textContent === '3 / 3')
+      expect(await page.$eval('[aria-label="Next frame"]', (el) => (el as HTMLButtonElement).disabled)).toBe(true)
+      await page.click('[aria-label="Previous frame"]')
+      await page.waitForFunction(() => document.querySelector('[data-proto-count]')?.textContent === '2 / 3')
+      /* the screen stepped to takes the keys, not the pager's button */
+      await page.waitForFunction(() => document.activeElement?.matches('iframe[data-doop-proto-frame="detail"]'))
+
+      /* the letterbox around the 400x300 screen, then back */
+      const stage = (await page.$eval('[data-proto-stage]', (el) => {
+        const r = el.getBoundingClientRect()
+        return { x: r.left + 5, y: r.top + r.height / 2 }
+      }))!
+      const screenBox = () =>
+        page.$eval('[data-proto-screen="detail"] > div', (el) => JSON.stringify(el.getBoundingClientRect()))
+      const before = await screenBox()
+      const shown = () =>
+        page.$$eval('[data-proto-bar], [data-proto-pager]', (els) =>
+          els.map((el) => getComputedStyle(el).visibility === 'visible'),
+        )
+      await page.mouse.click(stage.x, stage.y)
+      await page.waitForFunction(() =>
+        [...document.querySelectorAll('[data-proto-bar], [data-proto-pager]')].every(
+          (el) => getComputedStyle(el).visibility === 'hidden',
+        ),
+      )
+      /* the UI keeps its room: the screen neither moves nor rescales */
+      expect(await screenBox()).toBe(before)
+      /* where the bar was brings it back, for a screen with no space around it */
+      await page.mouse.click(500, BAR / 2)
+      await page.waitForFunction(() =>
+        [...document.querySelectorAll('[data-proto-bar], [data-proto-pager]')].every(
+          (el) => getComputedStyle(el).visibility === 'visible',
+        ),
+      )
+      expect(await shown()).toEqual([true, true])
+    })
+
+    it('pins a comment to the element clicked in comment mode, without playing it', async () => {
+      await page.evaluate((canvas) => {
+        const w = window as unknown as Fixture & { posted: { url: string; body: Record<string, unknown> }[] }
+        w.posted = []
+        const real = window.fetch.bind(window)
+        window.fetch = (input, init) => {
+          const url = String(input)
+          if (url.includes('/comments') && init?.method === 'POST') {
+            w.posted.push({ url, body: JSON.parse(String(init.body)) as Record<string, unknown> })
+            return Promise.resolve(new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }))
+          }
+          return real(input, init)
+        }
+        w.seed(canvas)
+        w.play('home')
+      }, CANVAS)
+      const home = await screen('home')
+      await page.click('[data-proto-comments]')
+      await page.waitForSelector('[data-proto-comment-surface]')
+      const box = (await (await page.$('iframe[data-doop-proto-frame="home"]'))!.boundingBox())!
+      const help = (await home.$eval('#help', (el) => {
+        const r = el.getBoundingClientRect()
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2 }
+      })) as { x: number; y: number }
+      /* the screen is drawn scaled: design px to the page's */
+      const scale = box.width / 400
+      await page.mouse.click(box.x + help.x * scale, box.y + help.y * scale)
+      await page.waitForSelector('[data-proto-composer] textarea')
+      /* "c" types into the comment; it does not leave comment mode */
+      await page.type('[data-proto-composer] textarea', 'Nice copy')
+      await page.keyboard.down('Control')
+      await page.keyboard.press('Enter')
+      await page.keyboard.up('Control')
+      await page.waitForFunction(() => (window as unknown as { posted: unknown[] }).posted.length === 1)
+      const [posted] = await page.evaluate(
+        () => (window as unknown as { posted: { url: string; body: Record<string, unknown> }[] }).posted,
+      )
+      expect(posted!.url).toContain('/api/frames/home/comments')
+      expect(posted!.body.text).toBe('Nice copy')
+      expect(String(posted!.body.snippet)).toContain('Help')
+      expect(await page.$('[data-proto-composer]')).toBeNull()
+      /* the click commented: the Help overlay never opened */
+      expect(await page.$('[data-proto-overlay]')).toBeNull()
+      expect(await page.$('[data-proto-comment-surface]')).not.toBeNull()
+      /* Esc leaves comment mode before it closes the player */
+      await page.keyboard.press('Escape')
+      await page.waitForFunction(() => !document.querySelector('[data-proto-comment-surface]'))
+      expect(await page.evaluate(() => (window as unknown as Fixture).playerClosed)).toBe(false)
+    })
+
+    it("leaves C to a screen's own key:c interaction, and switches comment mode otherwise", async () => {
+      const keyed: Canvas = {
+        ...CANVAS,
+        frames: [
+          frame(
+            'home',
+            `<button id="go">Go</button><div data-doop-on="key:c" data-doop-action="navigate:detail"></div>`,
+          ),
+          ...CANVAS.frames.slice(1),
+        ],
+      }
+      await page.evaluate((canvas) => {
+        const w = window as unknown as Fixture
+        w.seed(canvas)
+        w.play('home')
+      }, keyed)
+      await screen('home')
+      await page.keyboard.press('c')
+      await page.waitForFunction(() => document.querySelector('[data-proto-current]')?.textContent === 'DETAIL')
+      expect(await page.$('[data-proto-comment-surface]')).toBeNull()
+      /* DETAIL has no key:c: C is comment mode */
+      await screen('detail')
+      await page.keyboard.press('c')
+      await page.waitForSelector('[data-proto-comment-surface]')
+    })
+
+    it('scrolls a long screen under the comment cover', async () => {
+      await page.evaluate((canvas) => {
+        const w = window as unknown as Fixture
+        w.seed(canvas)
+        w.play('home')
+      }, FLOW)
+      const home = await screen('home')
+      await page.click('[data-proto-comments]')
+      const surface = (await (await page.waitForSelector('[data-proto-comment-surface]'))!.boundingBox())!
+      await page.mouse.move(surface.x + 50, surface.y + 50)
+      await page.mouse.wheel({ deltaY: 400 })
+      await home.waitForFunction(() => window.scrollY > 0)
+    })
+
+    it('picking the screen under an open overlay closes the overlay', async () => {
+      await page.evaluate((canvas) => {
+        const w = window as unknown as Fixture
+        w.seed(canvas)
+        w.play('home')
+      }, CANVAS)
+      const home = await screen('home')
+      await clickUntil(home, '#help', async () => !!(await page.$('[data-proto-overlay]')))
+      await page.click('[data-proto-frame-menu]')
+      await page.waitForSelector('[data-proto-jump="home"]')
+      await page.click('[data-proto-jump="home"]')
+      await page.waitForFunction(() => !document.querySelector('[data-proto-overlay]'))
+      /* nothing was pushed: Back has nowhere to go */
+      expect(await page.$eval('[aria-label="Back"]', (b) => (b as HTMLButtonElement).disabled)).toBe(true)
+    })
+
+    it("shows the screen's threads as pins in comment mode", async () => {
+      const comment: ElementComment = {
+        id: 'k1',
+        canvasId: 'c',
+        frameId: 'home',
+        snippet: '',
+        x: 200,
+        y: 150,
+        from: 'Ana',
+        text: 'Too tight',
+        at: 1,
+      }
+      await page.evaluate(
+        (canvas, c) => {
+          const w = window as unknown as Fixture
+          w.seed(canvas)
+          w.seedComments([c])
+          w.play('home')
+        },
+        CANVAS,
+        comment,
+      )
+      await screen('home')
+      expect(await page.$('[title^="Ana: Too tight"]')).toBeNull()
+      await page.click('[data-proto-comments]')
+      const pin = await page.waitForSelector('[title^="Ana: Too tight"]')
+      await pin!.click()
+      await page.waitForFunction(() => document.body.textContent?.includes('Too tight'))
+      expect(await page.$('[data-comment-popover]')).not.toBeNull()
     })
   })
 })

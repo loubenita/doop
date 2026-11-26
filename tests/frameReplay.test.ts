@@ -13,7 +13,8 @@ declare global {
     stopReplay: () => void
     snapshot: () => void
     renderReplay: (events: ReplayEvent[]) => void
-    addFrame: () => void
+    addFrame: (attribute?: string) => void
+    heldTimers: Map<number, () => void>
   }
 }
 
@@ -161,6 +162,19 @@ describe.skipIf(!findBrowserPath())('sandboxed frame replay', () => {
     await captured('Presentation frame')
   })
 
+  it('records prototype player screens', async () => {
+    await recordDesign()
+    await page.evaluate(() => window.addFrame('data-doop-proto-frame'))
+    await page.waitForFunction(() => window.messages.filter((m) => m.type === 'doop:frame-ready').length === 2)
+    await render('<h1>Prototype screen</h1>', 1)
+    await captured('Prototype screen')
+    const frame = await page.evaluate(
+      () => JSON.stringify(window.events).match(/"data-doop-proto-frame":""[^}]*}/)?.[0],
+    )
+    expect(frame).toContain('"sandbox":"allow-same-origin"')
+    expect(frame).not.toContain('srcdoc')
+  })
+
   it('stops child recording, resumes with current content, and applies updated privacy settings', async () => {
     await recordDesign()
     await page.evaluate(() => window.stopReplay())
@@ -197,32 +211,44 @@ describe.skipIf(!findBrowserPath())('sandboxed frame replay', () => {
       await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 1100)))
       expect(attempts).toBe(3)
 
-      /* The next failure schedules a 250ms retry, and this test has to stop
-         recording while that retry is still pending. On a loaded machine the
-         steps below took longer than 250ms and the retry ran first, so the
-         frame's timers run 8x slower from here (the retry waits 2s), and the
-         check after the stop waits past that. */
+      // A new generation gets a fresh budget, so its first failure schedules a
+      // 250ms retry. Hold the frame's timers: a slow runner must not let that
+      // retry fire before stopReplay gets its chance to cancel it.
       const child = page.frames().find((f) => f !== page.mainFrame())!
       await child.evaluate(() => {
-        const original = window.setTimeout
-        window.setTimeout = ((handler: TimerHandler, ms?: number, ...rest: unknown[]) =>
-          original(handler, (ms ?? 0) * 8, ...rest)) as typeof window.setTimeout
+        /* only the retry's first backoff (250ms) is held; every other timer
+           of the frame runs as usual. Held ids sit far above the browser's
+           own, so clearing a real timer never touches a held one. */
+        const held = new Map<number, () => void>()
+        const realSet = window.setTimeout.bind(window)
+        const realClear = window.clearTimeout.bind(window)
+        let next = 1_000_000_000
+        window.setTimeout = ((callback: () => void, delay?: number, ...rest: unknown[]) => {
+          if (delay !== 250) return realSet(callback, delay, ...rest)
+          held.set(++next, callback)
+          return next
+        }) as typeof setTimeout
+        window.clearTimeout = ((id?: number) => {
+          if (id !== undefined && held.has(id)) held.delete(id)
+          else realClear(id)
+        }) as typeof clearTimeout
+        window.heldTimers = held
       })
       await page.evaluate(() => {
         window.stopReplay()
         window.startReplay()
       })
       await vi.waitFor(() => expect(attempts).toBe(4))
-      await child.waitForFunction(() => !document.querySelector('script[data-doop-replay]'))
+      await child.waitForFunction(
+        () => !document.querySelector('script[data-doop-replay]') && window.heldTimers.size === 1,
+      )
       await page.evaluate(() => window.stopReplay())
-      await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 2500)))
+      await child.waitForFunction(() => window.heldTimers.size === 0)
       expect(attempts).toBe(4)
       expect(await page.evaluate(() => window.messages.filter((m) => m.type === 'rrweb'))).toEqual([])
     } finally {
       page.off('request', onRequest)
       await page.setRequestInterception(false)
     }
-    /* about 5s of the time is fixed waits: the backoff, the 1.1s hold and the
-       2.5s after the stop, past vitest's 5s default on a loaded machine */
-  }, 20_000)
+  })
 })

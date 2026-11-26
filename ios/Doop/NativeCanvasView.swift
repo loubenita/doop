@@ -8,10 +8,12 @@ struct NativeCanvasView: View {
     @State private var sheet: Panel?
     @State private var prompt = ""
     @State private var agentAssignment = AgentAssignment.automatic
-    @State private var modelAccount: AgentModelAccount?
+    /// The connections a task may run on (`GET /api/agent-runners`).
+    @State private var runners: AgentRunners?
+    /// This phone's pick, sent with every task as the card's `runner`, as the web composer does.
+    @State private var storedPick: RunnerPick? = Self.loadPick()
     @State private var modelPickerOpen = false
     @State private var loadingModels = false
-    @State private var changingModel = false
     @State private var modelError: String?
     @State private var contextReferences: [PromptContextReference] = []
     @State private var contextPickerOpen = false
@@ -29,7 +31,7 @@ struct NativeCanvasView: View {
     @State private var actionBusy = false
     @State private var clipboardAvailable = CanvasClipboard.isAvailable
     @State private var copiedSelection = false
-    private let summary: CanvasSummary
+    private let initialName: String
     private let currentUser: DoopUser?
     private enum Panel: Identifiable {
         case frames, inspector, tasks, comments, pages
@@ -46,10 +48,10 @@ struct NativeCanvasView: View {
         }
     }
 
-    init(summary: CanvasSummary, client: DoopClient, currentUser: DoopUser? = nil) {
+    init(id: String, name: String, client: DoopClient, currentUser: DoopUser? = nil) {
         self.currentUser = currentUser
-        self.summary = summary
-        _model = StateObject(wrappedValue: CanvasModel(id: summary.id, client: client))
+        self.initialName = name
+        _model = StateObject(wrappedValue: CanvasModel(id: id, client: client))
     }
 
     var body: some View {
@@ -63,6 +65,11 @@ struct NativeCanvasView: View {
             }
             ZStack(alignment: .bottom) {
                 VStack(spacing: 10) {
+                    if let id = model.focusedCommentID, model.comments.contains(where: { $0.id == id }) {
+                        PinnedThreadCard(model: model, rootID: id).id(id)
+                    } else if model.commentDraft != nil {
+                        NewCommentCard(model: model)
+                    } else {
                     if peoplePickerOpen {
                         peoplePicker
                     } else if pagePickerOpen {
@@ -75,6 +82,7 @@ struct NativeCanvasView: View {
                         selectionActions
                     }
                     composer
+                    }
                 }.frame(maxWidth: 620).padding(12)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
@@ -130,34 +138,76 @@ struct NativeCanvasView: View {
             }
             .animation(.snappy(duration: 0.25), value: sidePanel?.id)
             .overlay(alignment: .top) {
-                // A live connection needs no badge; say so only while it is not.
-                if !model.connected {
-                    Label(model.connecting ? "Connecting…" : "Offline", systemImage: model.connecting ? "arrow.triangle.2.circlepath" : "wifi.slash")
-                        .font(.caption).foregroundStyle(.secondary)
-                        .padding(.horizontal, 10).padding(.vertical, 5)
-                        .background(.regularMaterial, in: Capsule())
-                        .padding(.top, 12)
-                        .accessibilityIdentifier("canvas.connectionStatus")
+                VStack(spacing: 6) {
+                    // A live connection needs no badge; say so only while it is not.
+                    if !model.connected {
+                        Label(model.connecting ? "Connecting…" : "Offline", systemImage: model.connecting ? "arrow.triangle.2.circlepath" : "wifi.slash")
+                            .font(.caption).foregroundStyle(.secondary)
+                            .padding(.horizontal, 10).padding(.vertical, 5)
+                            .background(.regularMaterial, in: Capsule())
+                            .accessibilityIdentifier("canvas.connectionStatus")
+                    }
+                    // Agents at work, as the web's WorkingNow pills: tap for the task list.
+                    // With a side rail they sit beside the canvas name instead.
+                    ForEach(sideRailWidth > 0 ? [] : model.workingAgents) { agent in
+                        Button { model.goToWork(of: agent) } label: { WorkingAgentPill(agent: agent) }
+                            .buttonStyle(.plain)
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+                }
+                .frame(maxWidth: 420)
+                .padding(.horizontal, 64)
+                .padding(.top, 12)
+                .animation(.snappy(duration: 0.25), value: model.workingAgents)
+            }
+            .overlay(alignment: .topLeading) {
+                // With a side rail the bar's title is hidden, and items placed in the bar are
+                // moved into its overflow menu once the rail fills up (a collaborator's people
+                // button is enough). The name and the first working agent are pills of our own.
+                if sideRailWidth > 0 {
+                    // The agent gets a line of its own: beside a long canvas name its status had no room.
+                    VStack(alignment: .leading, spacing: 8) {
+                        Button { openPagePicker() } label: {
+                            Text(model.canvas?.name ?? initialName).font(.headline).lineLimit(1)
+                                .padding(.horizontal, 22).frame(height: 40)
+                                .modifier(ComposerGlass(cornerRadius: 20))
+                                .contentShape(Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .layoutPriority(1)
+                        .accessibilityLabel("Canvas \(model.canvas?.name ?? initialName), pages")
+                        .accessibilityIdentifier("canvas.name")
+                        if let agent = model.workingAgents.first {
+                            // At most 420 pt wide, and as narrow as its status: the spacer takes
+                            // the rest of the cap, so the glass never stretches past the words.
+                            HStack(spacing: 0) {
+                                Button { model.goToWork(of: agent) } label: {
+                                    WorkingAgentLabel(agent: agent, others: model.workingAgents.count - 1)
+                                        .padding(.leading, 18).padding(.trailing, 20).frame(height: 40)
+                                        .modifier(ComposerGlass(cornerRadius: 20))
+                                        .contentShape(Capsule())
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityIdentifier("canvas.workingAgent")
+                                Spacer(minLength: 0)
+                            }
+                            .frame(maxWidth: 420)
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                        }
+                    }
+                    .padding(.leading, 16).padding(.top, 8)
+                    // Clear of the rail, and of a panel open beside the canvas.
+                    .padding(.trailing, sideRailWidth + 16 + (sidePanel == nil ? 0 : sidePanelWidth + 8))
+                    .animation(.snappy(duration: 0.25), value: model.workingAgents)
                 }
             }
         }
         .background(CanvasBackSwipeGuard())
         // With a side rail the buttons live in the rail and the name is a glass pill over the
         // canvas, so the bar holds nothing: let the canvas show through it, as through the rail.
-        .navigationTitle(sideRailWidth > 0 ? "" : model.canvas?.name ?? summary.name).navigationBarTitleDisplayMode(.inline)
+        .navigationTitle(sideRailWidth > 0 ? "" : model.canvas?.name ?? initialName).navigationBarTitleDisplayMode(.inline)
         .toolbarBackground(sideRailWidth > 0 ? .hidden : .automatic, for: .navigationBar)
         .toolbar {
-            if sideRailWidth > 0 {
-                // The bar's title is hidden with a side rail; the name is a leading item, which
-                // the system draws as a glass pill level with the rail's clock. It opens Pages.
-                ToolbarItem(placement: .topBarLeading) {
-                    Button { openPagePicker() } label: {
-                        Text(model.canvas?.name ?? summary.name).font(.headline).lineLimit(1)
-                    }
-                    .accessibilityLabel("Canvas \(model.canvas?.name ?? summary.name), pages")
-                    .accessibilityIdentifier("canvas.name")
-                }
-            }
             ToolbarItem(placement: .primaryAction) {
                 if !model.presences.isEmpty {
                     Button { openPeoplePicker() } label: { Image(systemName: "person.2") }
@@ -215,7 +265,7 @@ struct NativeCanvasView: View {
     }
 
     private var canSend: Bool {
-        !sending && !changingModel && model.connected && !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        !sending && model.connected && !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private var hasComposerContext: Bool {
@@ -275,18 +325,18 @@ struct NativeCanvasView: View {
                     if modelPickerOpen { Task { await loadModels() } }
                 } label: {
                     HStack(spacing: 6) {
-                        ComposerBrandMark(name: modelAccount?.kind == "anthropic-key" ? "claude" : "chatgpt", color: ComposerColors.muted)
+                        ComposerBrandMark(name: runnerBrand, color: ComposerColors.muted)
                             .frame(width: 14, height: 14)
-                        Text(modelAccount?.label ?? "Auto")
+                        Text(runnerLabel)
                             .font(.subheadline)
                             .lineLimit(1).minimumScaleFactor(0.8)
                     }
                     .foregroundStyle(ComposerColors.muted).padding(.horizontal, 8).frame(minHeight: 44)
                     .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain).disabled(sending || changingModel)
+                .buttonStyle(.plain).disabled(sending)
                 .accessibilityLabel("Choose model")
-                .accessibilityValue(modelAccount?.label ?? "Auto")
+                .accessibilityValue(runnerLabel)
                 .accessibilityIdentifier("canvas.modelPicker")
                 Button(action: sendPrompt) {
                     Group {
@@ -441,44 +491,47 @@ struct NativeCanvasView: View {
             }.padding(.leading, 12)
             ScrollView {
                 VStack(alignment: .leading, spacing: 4) {
-                    if loadingModels || changingModel {
-                        ProgressView(changingModel ? "Saving model…" : "Loading models…")
-                            .padding(12).frame(maxWidth: .infinity)
+                    if loadingModels && runners == nil {
+                        ProgressView("Loading models…").padding(12).frame(maxWidth: .infinity)
                     }
                     if let modelError {
                         Text(modelError).font(.callout).foregroundStyle(.secondary).padding(.horizontal, 12)
                         Button("Retry") { Task { await loadModels() } }.padding(12)
                     }
-                    if let account = modelAccount, !loadingModels {
-                        if account.options.isEmpty {
-                            Text(account.connected ? "No models are available for this account." :
-                                 "Auto uses the server’s model. Connect a model account to choose your own.")
-                                .font(.callout).foregroundStyle(.secondary).padding(12)
+                    if let runners, runners.runners.isEmpty {
+                        Text("Auto uses the server’s model. Connect a model account to choose your own.")
+                            .font(.callout).foregroundStyle(.secondary).padding(12)
+                    }
+                    ForEach(runners?.runners ?? []) { runner in
+                        if (runners?.runners.count ?? 0) > 1 {
+                            Text(runner.name).font(.caption).foregroundStyle(.secondary)
+                                .padding(.horizontal, 12).padding(.top, 8)
                         }
-                        ForEach(account.options) { option in
-                            Button { Task { await chooseModel(option.id) } } label: {
+                        ForEach(runner.models) { option in
+                            let chosen = resolved?.pick.provider == runner.provider && resolved?.pick.model == option.id
+                            Button { choose(option.id, on: runner) } label: {
                                 HStack(spacing: 12) {
                                     VStack(alignment: .leading, spacing: 3) {
                                         Text(option.name).font(.body)
-                                        if let blurb = option.blurb {
+                                        if let blurb = option.blurb, !blurb.isEmpty {
                                             Text(blurb).font(.caption).foregroundStyle(.secondary)
                                                 .multilineTextAlignment(.leading)
                                         }
                                     }
                                     Spacer(minLength: 0)
-                                    if option.id == account.model { Image(systemName: "checkmark").font(.callout).foregroundStyle(ComposerColors.action) }
+                                    if chosen { Image(systemName: "checkmark").font(.callout).foregroundStyle(ComposerColors.action) }
                                 }
                                 .padding(12).frame(minHeight: 48).contentShape(Rectangle())
                             }
-                            .buttonStyle(.plain).disabled(changingModel)
-                            .accessibilityLabel("Use " + option.name)
-                            .accessibilityAddTraits(option.id == account.model ? [.isSelected] : [])
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Use " + option.name + " on " + runner.name)
+                            .accessibilityAddTraits(chosen ? [.isSelected] : [])
                         }
                     }
                 }
-            }.frame(height: modelAccount?.options.isEmpty == false ? 240 : 100)
+            }.frame(height: runners?.runners.isEmpty == false ? 240 : 100)
             Divider().padding(.horizontal, 12)
-            Link(modelAccount?.connected == true ? "Model settings…" : "Connect a model…",
+            Link(runners?.runners.isEmpty == false ? "Model settings…" : "Connect a model…",
                  destination: modelSettingsURL)
                 .font(.callout).padding(12).frame(minHeight: 44)
         }
@@ -493,26 +546,37 @@ struct NativeCanvasView: View {
     }
 
     private func loadModels() async {
-        guard !loadingModels, !changingModel else { return }
+        guard !loadingModels else { return }
         loadingModels = true
         defer { loadingModels = false }
         do {
-            modelAccount = try await model.client.get("/api/model-account")
+            runners = try await model.client.get("/api/agent-runners")
             modelError = nil
         } catch { modelError = error.localizedDescription }
     }
 
-    private func chooseModel(_ id: String) async {
-        guard !changingModel, modelAccount?.options.contains(where: { $0.id == id }) == true else { return }
-        if id == modelAccount?.model { modelPickerOpen = false; return }
-        changingModel = true
-        defer { changingModel = false }
-        do {
-            let data = try await model.client.data("/api/model-account", method: "PATCH", body: ["model": id])
-            modelAccount = try JSONDecoder().decode(AgentModelAccount.self, from: data)
-            modelError = nil
-            modelPickerOpen = false
-        } catch { modelError = error.localizedDescription }
+    /// The pick this phone sends, against what is connected now; nil runs on the server's default.
+    private var resolved: (runner: AgentRunner, pick: RunnerPick)? { runners?.resolve(storedPick) }
+    private var runnerLabel: String {
+        guard let resolved else { return "Auto" }
+        return resolved.runner.modelName(resolved.pick.model ?? resolved.runner.model)
+    }
+    private var runnerBrand: String {
+        guard let resolved else { return "doop" }
+        return resolved.runner.provider.contains("anthropic") || resolved.runner.provider.contains("claude")
+            ? "claude" : resolved.runner.name + " " + (resolved.pick.model ?? "")
+    }
+
+    private func choose(_ modelID: String, on runner: AgentRunner) {
+        let effort = resolved?.pick.provider == runner.provider ? resolved?.pick.effort : runner.effort
+        storedPick = RunnerPick(provider: runner.provider, model: modelID, effort: effort)
+        if let data = try? JSONEncoder().encode(storedPick) { UserDefaults.standard.set(data, forKey: Self.pickKey) }
+        modelPickerOpen = false
+    }
+
+    private static let pickKey = "agentRunnerPick"
+    private static func loadPick() -> RunnerPick? {
+        UserDefaults.standard.data(forKey: pickKey).flatMap { try? JSONDecoder().decode(RunnerPick.self, from: $0) }
     }
 
     private var mentionQuery: String? { PromptContextReference.mentionQuery(in: prompt) }
@@ -711,8 +775,17 @@ struct NativeCanvasView: View {
         let assignment = agentAssignment
         let title = PromptContextReference.taskTitle(value, references: contextReferences)
         Task {
+            // A saved pick is only honoured once the runner list is known: without it the task
+            // would go out with no runner and quietly run on the server's default instead.
+            if storedPick != nil && runners == nil { await loadModels() }
+            if storedPick != nil && runners == nil {
+                model.error = "Couldn’t load your models, so the task wasn’t sent. Try again."
+                sending = false
+                return
+            }
+            let runner = resolved?.pick
             do {
-                try await model.queue(title, scope: scope, assignment: assignment)
+                try await model.queue(title, scope: scope, assignment: assignment, runner: runner)
                 prompt = ""
                 contextReferences = []
                 agentAssignment = .automatic
@@ -774,7 +847,7 @@ struct NativeCanvasView: View {
                 guard let selection = model.selection else { return }
                 runSelectionAction { try await model.deleteSelection(selection) }
             }
-            selectionAction("Comment", symbol: "bubble.left", id: "comment", disabled: model.selection == nil) { sheet = .comments }
+            selectionAction("Comment", symbol: "bubble.left", id: "comment", disabled: model.selected == nil) { model.startCommentOnSelection() }
             selectionAction("Export", symbol: "square.and.arrow.up", id: "export", disabled: model.selection == nil) { openExport() }
         }.padding(.horizontal, 4).padding(.vertical, 1)
     }
@@ -981,6 +1054,79 @@ private struct PresenceAvatar: View {
     }
 }
 
+/// One agent at work and what it is doing: its brand mark, its name and its status,
+/// and the web's twinkling dot matrix, which says the work is underway.
+private struct WorkingAgentPill: View {
+    let agent: WorkingAgent
+    var body: some View {
+        WorkingAgentLabel(agent: agent)
+            .padding(.leading, 16).padding(.trailing, 18).frame(height: 32)
+            .modifier(ComposerGlass(cornerRadius: 16))
+            .contentShape(Capsule())
+            .accessibilityIdentifier("canvas.workingAgent")
+    }
+}
+
+/// What a working pill says; in the bar (side rail) the system draws the glass around it.
+private struct WorkingAgentLabel: View {
+    let agent: WorkingAgent
+    /// Further agents at work, shown as "+N" when the bar has room for one pill only.
+    var others = 0
+    var body: some View {
+        let color = Color(UIColor(hex: agent.color) ?? .systemBlue)
+        HStack(spacing: 7) {
+            ComposerBrandMark(name: agent.name, color: color).frame(width: 14, height: 14)
+            Text(agent.name).font(.footnote.weight(.semibold)).foregroundStyle(.primary).fixedSize()
+            // As wide as its words, truncated to the room it is given; the name, count and
+            // matrix keep theirs. (A flexible frame here stretched the pill past short statuses.)
+            Text(agent.status).font(.footnote).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+            if others > 0 { Text("+\(others)").font(.footnote.weight(.medium)).foregroundStyle(.secondary).fixedSize() }
+            DotMatrix()
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(agent.name): \(agent.status)\(others > 0 ? ", and \(others) more" : "")")
+        .accessibilityHint("Goes to the frame it is working on, once it has one")
+    }
+}
+
+/// The web's 3×3 "working" matrix (`ui/dot-matrix.tsx`): nine 3 pt dots, each twinkling
+/// on its own offset into a 1.8 s cycle, so it reads as busy rather than as a marching wave.
+struct DotMatrix: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    /// Each dot's offset into the cycle, in seconds, as on the web.
+    private static let delays: [Double] = [0.9, 0.3, 1.4, 1.1, 0, 0.6, 0.45, 1.6, 0.2]
+    private static let period = 1.8
+    var body: some View {
+        // 20 redraws a second is smooth for a 1.8 s twinkle and far cheaper than every display frame.
+        TimelineView(.periodic(from: .now, by: reduceMotion ? 3600 : 1.0 / 20)) { context in
+            let time = context.date.timeIntervalSinceReferenceDate
+            Grid(horizontalSpacing: 2, verticalSpacing: 2) {
+                ForEach(0..<3, id: \.self) { row in
+                    GridRow {
+                        ForEach(0..<3, id: \.self) { column in
+                            Circle().fill(Color.secondary).frame(width: 3, height: 3)
+                                .opacity(reduceMotion ? 0.3 : Self.opacity(at: time - Self.delays[row * 3 + column]))
+                        }
+                    }
+                }
+            }
+        }
+        .fixedSize()
+        .accessibilityHidden(true)
+    }
+
+    /// The web's `twinkle`: 0.3 at rest, up to 1 at 20% of the cycle, back to 0.3 by 70%,
+    /// each step eased in and out.
+    static func opacity(at time: Double) -> Double {
+        let phase = time.truncatingRemainder(dividingBy: period) / period
+        let p = phase < 0 ? phase + 1 : phase
+        let ease = { (t: Double) in t * t * (3 - 2 * t) }
+        if p < 0.2 { return 0.3 + 0.7 * ease(p / 0.2) }
+        if p < 0.7 { return 1 - 0.7 * ease((p - 0.2) / 0.5) }
+        return 0.3
+    }
+}
+
 /// Reuses the exact brand paths already used by native collaborator cursors.
 private struct ComposerBrandMark: View {
     let name: String
@@ -1081,136 +1227,138 @@ private struct TasksPanel: View {
 
 private struct CommentsPanel: View {
     @ObservedObject var model: CanvasModel
-    @State private var text = ""
-    @State private var sending = false
-    @State private var error: String?
-    @FocusState private var composing: Bool
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.closeCanvasPanel) private var closePanel
+    @State private var showResolved = false
 
-    private var threads: [(root: CanvasComment, replies: [CanvasComment])] {
+    struct Thread: Identifiable {
+        var root: CanvasComment
+        var replies: [CanvasComment]
+        var id: String { root.id }
+        var lastAt: Double { replies.last?.at ?? root.at }
+    }
+
+    struct Group: Identifiable {
+        var id: String
+        var title: String
+        var threads: [Thread]
+    }
+
+    private var threads: [Thread] {
         let comments = model.pageComments
-        return comments.filter { $0.parentId == nil }.sorted { $0.at > $1.at }.map { root in
-            (root, comments.filter { $0.parentId == root.id }.sorted { $0.at < $1.at })
+        return comments.filter { $0.parentId == nil }.map { root in
+            Thread(root: root, replies: comments.filter { $0.parentId == root.id }.sorted { $0.at < $1.at })
         }
     }
 
-    private var canPost: Bool {
-        !sending && model.selectedID != nil && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    /// Threads under their frame (canvas comments together), the most recently active first.
+    private func groups(_ list: [Thread]) -> [Group] {
+        let sorted = list.sorted { $0.lastAt > $1.lastAt }
+        var order: [String] = []
+        var byKey: [String: [Thread]] = [:]
+        for thread in sorted {
+            let key = thread.root.frameId ?? "canvas"
+            if byKey[key] == nil { order.append(key) }
+            byKey[key, default: []].append(thread)
+        }
+        return order.map { key in
+            let title = key == "canvas" ? "Canvas" : (model.canvas?.frames.first { $0.id == key }?.name ?? "Deleted frame")
+            return Group(id: key, title: title, threads: byKey[key] ?? [])
+        }
     }
 
     var body: some View {
+        let open = threads.filter { $0.root.resolvedAt == nil }
+        let resolved = threads.filter { $0.root.resolvedAt != nil }
         PanelNavigation("Comments") {
             ScrollView {
-                LazyVStack(spacing: 0) {
-                    if threads.isEmpty {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    if open.isEmpty {
                         VStack(spacing: 8) {
                             Image(systemName: "bubble.left.and.bubble.right").font(.largeTitle).foregroundStyle(.secondary)
-                            Text("No comments yet").font(.headline)
-                            Text("Feedback on this page shows up here.").font(.subheadline).foregroundStyle(.secondary)
+                            Text("No open comments").font(.headline)
+                            Text("Press and hold anywhere on the canvas to leave one.")
+                                .font(.subheadline).foregroundStyle(.secondary)
                         }
-                        .multilineTextAlignment(.center).padding(.top, 64)
+                        .multilineTextAlignment(.center).frame(maxWidth: .infinity).padding(.vertical, 48)
                     }
-                    ForEach(Array(threads.enumerated()), id: \.element.root.id) { index, thread in
-                        if index > 0 { Divider() }
-                        CommentThreadCard(root: thread.root, replies: thread.replies, frameName: frameName(thread.root))
+                    groupList(groups(open))
+                    if !resolved.isEmpty {
+                        Button { withAnimation(.snappy) { showResolved.toggle() } } label: {
+                            HStack(spacing: 6) {
+                                Text("Resolved (\(resolved.count))")
+                                Image(systemName: "chevron.right").rotationEffect(.degrees(showResolved ? 90 : 0))
+                                Spacer(minLength: 0)
+                            }
+                            .font(.subheadline.weight(.medium)).foregroundStyle(.secondary)
+                            .padding(.vertical, 14).contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        if showResolved { groupList(groups(resolved)).opacity(0.6) }
+                    }
+                    if !open.isEmpty {
+                        Label("Press and hold on the canvas to comment.", systemImage: "hand.point.up.left")
+                            .font(.caption).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity).padding(.vertical, 18)
                     }
                 }
-                .padding(.horizontal, 22).padding(.vertical, 4)
+                .padding(.horizontal, 20)
             }
-            .scrollDismissesKeyboard(.interactively)
-            .safeAreaInset(edge: .bottom, spacing: 0) { composer }
         }
     }
 
-    private var composer: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if let element = model.selectedElement {
-                Label(element.label, systemImage: "scope")
-                    .font(.caption.weight(.medium)).foregroundStyle(.secondary).lineLimit(1)
-                    .padding(.horizontal, 6)
+    @ViewBuilder private func groupList(_ groups: [Group]) -> some View {
+        ForEach(groups) { group in
+            Text(group.title)
+                .font(.caption.weight(.semibold)).foregroundStyle(.secondary).lineLimit(1)
+                .padding(.top, 16).padding(.bottom, 2)
+            ForEach(group.threads) { thread in
+                Button { show(thread) } label: { ThreadRow(thread: thread) }
+                    .buttonStyle(.plain)
+                    .accessibilityHint("Shows the comment on the canvas")
             }
-            TextField("Leave feedback…", text: $text, axis: .vertical)
-                .lineLimit(1...5).focused($composing)
-                .padding(.horizontal, 6).padding(.top, 4)
-            HStack(spacing: 8) {
-                Menu {
-                    Picker("Frame", selection: Binding(get: { model.selectedID }, set: { model.select($0) })) {
-                        ForEach(model.pageFrames) { Text($0.name).tag(Optional($0.id)) }
-                    }
-                } label: {
-                    Label(model.pageFrames.first { $0.id == model.selectedID }?.name ?? "Choose a frame",
-                          systemImage: "rectangle.on.rectangle")
-                        .font(.subheadline).lineLimit(1)
-                        .padding(.horizontal, 12).padding(.vertical, 7)
-                        .background(.primary.opacity(0.06), in: Capsule())
-                }
-                .foregroundStyle(model.selectedID == nil ? .secondary : .primary)
-                Spacer(minLength: 0)
-                Button(action: post) {
-                    Group {
-                        if sending { ProgressView() } else { Image(systemName: "arrow.up").font(.body.weight(.semibold)) }
-                    }
-                    .frame(width: 34, height: 34)
-                    .foregroundStyle(canPost ? Color(uiColor: .systemBackground) : .secondary)
-                    .background(canPost ? Color.primary : Color.primary.opacity(0.08), in: Circle())
-                }
-                .disabled(!canPost)
-                .accessibilityLabel("Post comment")
-            }
-            if let error { Text(error).font(.caption).foregroundStyle(.red).padding(.horizontal, 6) }
-        }
-        .padding(10)
-        .background(.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-        .padding(.horizontal, 14).padding(.bottom, 14).padding(.top, 6)
-    }
-
-    private func frameName(_ comment: CanvasComment) -> String {
-        guard let id = comment.frameId else { return "Canvas" }
-        return model.canvas?.frames.first { $0.id == id }?.name ?? "Deleted frame"
-    }
-
-    private func post() {
-        guard let id = model.selectedID else { return }
-        sending = true
-        error = nil
-        Task {
-            do { try await model.comment(text, frameID: id); text = "" } catch { self.error = error.localizedDescription }
-            sending = false
         }
     }
-}
 
-private struct CommentThreadCard: View {
-    let root: CanvasComment
-    let replies: [CanvasComment]
-    let frameName: String
+    /// Close the list and show the thread at its pin.
+    private func show(_ thread: Thread) {
+        model.commentDraft = nil
+        model.focusedCommentID = thread.root.id
+        model.flyToCommentID = thread.root.id
+        if let closePanel { closePanel() } else { dismiss() }
+    }
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 6) {
-                Label(frameName, systemImage: "rectangle.on.rectangle").lineLimit(1)
-                Spacer(minLength: 0)
-                if root.resolvedAt != nil {
-                    Label("Resolved", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+    private struct ThreadRow: View {
+        let thread: Thread
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: 6) {
+                CommentRow(comment: thread.root, lineLimit: 3)
+                if !thread.replies.isEmpty {
+                    Text("\(thread.replies.count) \(thread.replies.count == 1 ? "reply" : "replies") · "
+                         + Date(timeIntervalSince1970: thread.lastAt / 1000).formatted(.relative(presentation: .named)))
+                        .font(.caption.weight(.medium)).foregroundStyle(.tint)
+                        .padding(.leading, 38)
                 }
             }
-            .font(.caption.weight(.medium)).foregroundStyle(.secondary)
-            CommentRow(comment: root)
-            ForEach(replies) { CommentRow(comment: $0).padding(.leading, 38) }
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
         }
-        .padding(.vertical, 14)
-        .opacity(root.resolvedAt == nil ? 1 : 0.7)
     }
 }
 
 private struct CommentRow: View {
     let comment: CanvasComment
+    var lineLimit: Int? = nil
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Text(comment.from.split(separator: " ").prefix(2).compactMap { $0.first.map(String.init) }.joined())
-                .font(.caption.weight(.semibold)).foregroundStyle(.tint)
+            Text(commentInitials(comment.from))
+                .font(.caption.weight(.semibold)).foregroundStyle(.white)
                 .frame(width: 28, height: 28)
-                .background(.tint.opacity(0.15), in: Circle())
+                // Solid, as the person's pin on the canvas: a tint vanishes on the glass panel.
+                .background(Color(uiColor: commentAuthorColor(comment.from)), in: Circle())
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
@@ -1218,7 +1366,11 @@ private struct CommentRow: View {
                     Text(Date(timeIntervalSince1970: comment.at / 1000).formatted(.relative(presentation: .named)))
                         .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 }
-                Text(comment.text).font(.subheadline).textSelection(.enabled)
+                if let lineLimit {
+                    Text(comment.text).font(.subheadline).lineLimit(lineLimit)
+                } else {
+                    Text(comment.text).font(.subheadline).textSelection(.enabled)
+                }
             }
             Spacer(minLength: 0)
         }
@@ -1260,5 +1412,128 @@ private struct CanvasBackSwipeGuard: UIViewControllerRepresentable {
             for (gesture, enabled) in gestures { gesture.isEnabled = enabled }
             gestures.removeAll()
         }
+    }
+}
+
+/// The composer a long-press opens: one new comment at the pressed spot, apart from
+/// the Comments list, the way the web's Comment tool asks right at the pin.
+private struct NewCommentCard: View {
+    @ObservedObject var model: CanvasModel
+    @State private var text = ""
+    @State private var sending = false
+    @State private var error: String?
+    @FocusState private var focused: Bool
+
+    private var canPost: Bool { !sending && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Label(model.commentDraft?.label ?? "", systemImage: "mappin").lineLimit(1)
+                Spacer(minLength: 0)
+                Button { model.commentDraft = nil } label: { Image(systemName: "xmark").font(.caption.weight(.semibold)) }
+                    .buttonStyle(.plain).frame(width: 28, height: 28).contentShape(Rectangle())
+                    .accessibilityLabel("Cancel comment")
+            }
+            .font(.caption.weight(.medium)).foregroundStyle(.secondary)
+            .padding(.horizontal, 6)
+            HStack(alignment: .bottom, spacing: 8) {
+                TextField("Add a comment…", text: $text, axis: .vertical)
+                    .lineLimit(1...5).focused($focused)
+                    .padding(.horizontal, 6).padding(.vertical, 7)
+                CommentSendButton(enabled: canPost, sending: sending, label: "Post comment", action: post)
+            }
+            if let error { Text(error).font(.caption).foregroundStyle(.red).padding(.horizontal, 6) }
+        }
+        .padding(10)
+        .modifier(ComposerGlass(cornerRadius: 22))
+        .onAppear { focused = true }
+        // A new spot pressed while the card is open keeps what was typed.
+    }
+
+    private func post() {
+        sending = true
+        error = nil
+        Task {
+            do { try await model.postDraft(text); text = "" } catch { self.error = error.localizedDescription }
+            sending = false
+        }
+    }
+}
+
+/// One thread, opened by tapping its pin: its messages and a reply field, without
+/// the frame line the full list needs (the pin already shows where it is).
+private struct PinnedThreadCard: View {
+    @ObservedObject var model: CanvasModel
+    let rootID: String
+    @State private var text = ""
+    @State private var sending = false
+    @State private var error: String?
+
+    private var root: CanvasComment? { model.comments.first { $0.id == rootID } }
+    private var replies: [CanvasComment] {
+        model.comments.filter { $0.parentId == rootID }.sorted { $0.at < $1.at }
+    }
+    private var canPost: Bool { !sending && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    if let root { CommentRow(comment: root) }
+                    ForEach(replies) { CommentRow(comment: $0) }
+                }
+                .padding(.horizontal, 6).padding(.top, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 240)
+            .fixedSize(horizontal: false, vertical: true)
+            .overlay(alignment: .topTrailing) {
+                Button { model.focusedCommentID = nil } label: { Image(systemName: "xmark").font(.caption.weight(.semibold)) }
+                    .buttonStyle(.plain).foregroundStyle(.secondary)
+                    .frame(width: 28, height: 28).contentShape(Rectangle())
+                    .accessibilityLabel("Close thread")
+            }
+            HStack(alignment: .bottom, spacing: 8) {
+                TextField("Reply…", text: $text, axis: .vertical)
+                    .lineLimit(1...5)
+                    .padding(.horizontal, 10).padding(.vertical, 7)
+                    .background(.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 17, style: .continuous))
+                CommentSendButton(enabled: canPost, sending: sending, label: "Post reply", action: post)
+            }
+            if let error { Text(error).font(.caption).foregroundStyle(.red).padding(.horizontal, 6) }
+        }
+        .padding(10)
+        .modifier(ComposerGlass(cornerRadius: 22))
+    }
+
+    private func post() {
+        sending = true
+        error = nil
+        Task {
+            do { try await model.reply(text, to: rootID); text = "" } catch { self.error = error.localizedDescription }
+            sending = false
+        }
+    }
+}
+
+/// The round send button under a comment field.
+private struct CommentSendButton: View {
+    let enabled: Bool
+    let sending: Bool
+    let label: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Group {
+                if sending { ProgressView() } else { Image(systemName: "arrow.up").font(.body.weight(.semibold)) }
+            }
+            .frame(width: 34, height: 34)
+            .foregroundStyle(enabled ? Color(uiColor: .systemBackground) : .secondary)
+            .background(enabled ? Color.primary : Color.primary.opacity(0.08), in: Circle())
+        }
+        .disabled(!enabled)
+        .accessibilityLabel(label)
     }
 }

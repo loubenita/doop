@@ -1,6 +1,8 @@
 import type { Frame } from '../../shared/types'
 import { api } from './api'
 import { useStore } from './store'
+import { frameHtmlReady } from './pages'
+import { t } from './i18n'
 import { posthog } from './posthog'
 import { historyEpoch, recordCreates, replaceFramesTracked } from './history'
 import { ELEMENT_CLIP_KEY, FRAME_CLIP_KEY as CLIP_KEY } from './clipboardKeys'
@@ -25,8 +27,14 @@ interface FrameClip {
   frames: ClipFrame[]
 }
 
-export function copyFrames(frames: Frame[]) {
-  if (!frames.length) return
+/** Put these frames on the canvas clipboard; false (nothing copied) for none,
+ *  or while one's page is on its way, its HTML here a blank or stale copy. */
+export function copyFrames(frames: Frame[]): boolean {
+  if (!frames.length) return false
+  if (!frames.every((frame) => frameHtmlReady(useStore.getState(), frame.id))) {
+    useStore.getState().pushNotice(t('stage.pageLoading'))
+    return false
+  }
   const left = Math.min(...frames.map((f) => f.x))
   const top = Math.min(...frames.map((f) => f.y))
   const clip: FrameClip = {
@@ -42,6 +50,7 @@ export function copyFrames(frames: Frame[]) {
   }
   localStorage.setItem(CLIP_KEY, JSON.stringify(clip))
   localStorage.removeItem(ELEMENT_CLIP_KEY)
+  return true
 }
 
 function readClip(): ClipFrame[] {
@@ -114,8 +123,8 @@ export function pasteFrameAtScreen(canvasId: string, clientX: number, clientY: n
   const vp = useStore.getState().viewport
   createFromClip(
     canvasId,
-    (clientX - (stage?.left ?? 0) - vp.x) / vp.zoom,
-    (clientY - (stage?.top ?? 0) - vp.y) / vp.zoom,
+    Math.round((clientX - (stage?.left ?? 0) - vp.x) / vp.zoom),
+    Math.round((clientY - (stage?.top ?? 0) - vp.y) / vp.zoom),
   )
 }
 
@@ -129,8 +138,8 @@ export function pasteFrameCentered(canvasId: string) {
   const stage = stageViewportSize()
   createFromClip(
     canvasId,
-    (stage.width / 2 - vp.x) / vp.zoom - width / 2,
-    (stage.height / 2 - vp.y) / vp.zoom - height / 2,
+    Math.round((stage.width / 2 - vp.x) / vp.zoom - width / 2),
+    Math.round((stage.height / 2 - vp.y) / vp.zoom - height / 2),
   )
 }
 
@@ -391,12 +400,21 @@ async function importIncoming(
 export async function pasteFilesCentered(canvasId: string, incoming: IncomingFiles) {
   const landed = await importIncoming(canvasId, incoming, { fallbackName: 'Pasted image' })
   posthog.capture('files_pasted', landed)
+  trackFileImports(landed, 'paste')
 }
 
 /** Files dragged in from the desktop land centered on the drop point. */
 export async function dropFiles(canvasId: string, incoming: IncomingFiles, at: { x: number; y: number }) {
   const landed = await importIncoming(canvasId, incoming, { fallbackName: 'Dropped image', at })
   posthog.capture('files_dropped', landed)
+  trackFileImports(landed, 'drop')
+}
+
+/** SVG and PDF imports as features of their own, beside the paste or drop
+ *  that brought them. */
+function trackFileImports(landed: Landed, via: 'paste' | 'drop') {
+  if (landed.vectors) posthog.capture('svg_imported', { count: landed.vectors, via })
+  if (landed.pages) posthog.capture('pdf_imported', { page_count: landed.pages, via })
 }
 
 /** Duplicate frames 40px down-right of the originals, keeping their layout;

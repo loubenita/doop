@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { Canvas, CanvasMeta, WorkspaceSummary } from '../../shared/types'
+import type { ClientCanvas, CanvasMeta, WorkspaceSummary } from '../../shared/types'
 import { colorFor } from '../../shared/types'
+import { MAX_CANVAS_NAME } from '../../shared/pages'
 import { api, errorMessage, paywalledWorkspace } from '../lib/api'
 import { authClient } from '../lib/auth'
 import { useUserEvents } from '../hooks/use-user-events'
@@ -10,22 +11,25 @@ import { useStore } from '../lib/store'
 import { isResidentLimit } from '../components/TeamAllowance'
 import { canvasNameFromPrompt, draftsCardTitle, type DraftCount } from '../lib/homePrompt'
 import { currentRunnerPick } from '../lib/runnerPick'
-import { AgentIcon } from '../components/AgentIcon'
+import { AgentTile } from '../components/AgentIcon'
 import { AppRail, railLayout } from '../components/AppRail'
 import { ConnectModal } from '../components/ConnectModal'
 import { FramePreview, FrameThumb } from '../components/FramePreview'
 import { HomeHero } from '../components/HomeHero'
+import { IosAppPrompt } from '../components/NativeAppPromo'
+import { StarCard } from '../components/StarCard'
 import { SourcePicker } from '../components/ImportSources'
 import { importSources } from '../components/importSourceList'
-import { Modal } from '../components/ui/modal'
+import { Modal, ModalActions, ModalTitle } from '../components/ui/modal'
+import { Input } from '../components/ui/input'
 import { ShareModal } from '../components/ShareModal'
 import { CreateWorkspaceModal, MoveCanvasModal, UpgradeModal } from '../components/WorkspaceModals'
 import { posthog } from '../lib/posthog'
-import { closeTab, openCanvasTab, pruneTabs } from '../lib/desktop'
+import { closeTab, openCanvasTab, pruneTabs, renameTab } from '../lib/desktop'
 import { AvatarStack } from '../components/ui/avatar'
 import { EmptyState } from '../components/ui/empty-state'
 import { Button } from '../components/ui/button'
-import { IconButton, frostedSurface } from '../components/ui/icon-button'
+import { IconButton } from '../components/ui/icon-button'
 import { MenuButton } from '../components/ui/menu-button'
 import { Pressable } from '../components/ui/pressable'
 import { Badge } from '../components/ui/badge'
@@ -45,6 +49,7 @@ import {
 import {
   BuildingIcon,
   CopyIcon,
+  EditIcon,
   GridIcon,
   ListIcon,
   MoreHorizontalIcon,
@@ -58,7 +63,6 @@ import { Toast } from '../components/ui/toast'
 import { DashContent, DashHeader, DashLayout, DashMain } from '../components/ui/dash'
 import { useT, type PlainMessageKey } from '../lib/i18n'
 import { prefetchWorkspace } from '../lib/workspaceCache'
-import { cn } from '@/lib/utils'
 
 /** the three fixed views, or one workspace (`ws:<id>`) */
 type Scope = 'all' | 'mine' | 'shared' | `ws:${string}`
@@ -87,9 +91,10 @@ export function Home() {
   })
   const [sort, setSort] = useState<Sort>('updated')
   const [view, setView] = useState<'grid' | 'list'>('grid')
-  const [shareCanvas, setShareCanvas] = useState<Canvas | null>(null)
+  const [shareCanvas, setShareCanvas] = useState<ClientCanvas | null>(null)
   const [deleteCanvas, setDeleteCanvas] = useState<CanvasMeta | null>(null)
   const [moveCanvas, setMoveCanvas] = useState<CanvasMeta | null>(null)
+  const [renameCanvas, setRenameCanvas] = useState<CanvasMeta | null>(null)
   const [creatingWorkspace, setCreatingWorkspace] = useState(
     () => new URLSearchParams(location.search).get('workspace') === 'new',
   )
@@ -352,6 +357,7 @@ export function Home() {
             firstName={first}
             busy={starting}
             focusAt={composerFocusAt}
+            skillScope={scopedWorkspace ? { workspaceId: scopedWorkspace } : { personal: true }}
             actions={{
               onPrompt: promptCanvas,
               onImport: () => setImporting(true),
@@ -463,6 +469,7 @@ export function Home() {
                       duplicating={duplicatingId === c.id}
                       onShare={() => share(c)}
                       onDuplicate={() => duplicate(c)}
+                      onRename={() => setRenameCanvas(c)}
                       onMove={workspaces.length && canManage(c) ? () => setMoveCanvas(c) : undefined}
                       onDelete={canManage(c) ? () => setDeleteCanvas(c) : undefined}
                     />
@@ -502,7 +509,7 @@ export function Home() {
                       </span>
                       <span className="hidden w-[62px] flex-none gap-[3px] xs:flex">
                         {(c.agents ?? []).slice(0, 3).map((a) => (
-                          <AgentIcon key={a.name} name={a.name} size={11} color={colorFor(a.name)} />
+                          <AgentTile key={a.name} name={a.name} size={14} />
                         ))}
                       </span>
                       <span className="w-auto flex-none text-right text-caption text-ink-faint md:w-[66px]">
@@ -516,6 +523,7 @@ export function Home() {
                         duplicating={duplicatingId === c.id}
                         onShare={() => share(c)}
                         onDuplicate={() => duplicate(c)}
+                        onRename={() => setRenameCanvas(c)}
                         onMove={workspaces.length && canManage(c) ? () => setMoveCanvas(c) : undefined}
                         onDelete={canManage(c) ? () => setDeleteCanvas(c) : undefined}
                       />
@@ -574,6 +582,18 @@ export function Home() {
           }}
         />
       )}
+      {renameCanvas && (
+        <RenameCanvasModal
+          key={renameCanvas.id}
+          canvas={renameCanvas}
+          onClose={() => setRenameCanvas(null)}
+          onRenamed={(id, name) => {
+            setRenameCanvas(null)
+            setCanvases((list) => list?.map((c) => (c.id === id ? { ...c, name } : c)) ?? list)
+            renameTab(id, name)
+          }}
+        />
+      )}
       {moveCanvas && (
         <MoveCanvasModal
           canvas={moveCanvas}
@@ -607,6 +627,8 @@ export function Home() {
         }}
       />
       {toast && <Toast>{toast}</Toast>}
+      <IosAppPrompt />
+      <StarCard />
     </DashLayout>
   )
 }
@@ -630,13 +652,8 @@ function AgentStack({ canvas }: { canvas: CanvasMeta }) {
   return (
     <span className="absolute left-2 top-2 flex gap-1">
       {agents.map((a) => (
-        <i
-          key={a.name}
-          className={cn('grid size-5 place-items-center rounded-row', frostedSurface)}
-          style={{ color: colorFor(a.name) }}
-          title={a.name}
-        >
-          <AgentIcon name={a.name} size={11} />
+        <i key={a.name} className="flex" title={a.name}>
+          <AgentTile name={a.name} size={20} />
         </i>
       ))}
     </span>
@@ -697,6 +714,7 @@ function CanvasActions({
   duplicating,
   onShare,
   onDuplicate,
+  onRename,
   onMove,
   onDelete,
 }: {
@@ -705,6 +723,7 @@ function CanvasActions({
   duplicating: boolean
   onShare: () => void
   onDuplicate: () => void
+  onRename: () => void
   onMove?: () => void
   onDelete?: () => void
 }) {
@@ -733,6 +752,9 @@ function CanvasActions({
         <DropdownMenuItem disabled={duplicating} onSelect={onDuplicate}>
           <CopyIcon className="size-4" /> {duplicating ? t('home.duplicating') : t('home.duplicate')}
         </DropdownMenuItem>
+        <DropdownMenuItem onSelect={onRename}>
+          <EditIcon className="size-4" /> {t('home.rename')}
+        </DropdownMenuItem>
         {onMove && (
           <DropdownMenuItem onSelect={onMove}>
             <BuildingIcon className="size-4" /> {canvas.workspaceId ? t('home.move') : t('home.moveToWorkspace')}
@@ -748,5 +770,65 @@ function CanvasActions({
         )}
       </DropdownMenuContent>
     </DropdownMenu>
+  )
+}
+
+/** the canvas's name, changed from its tile: the same PATCH the editor's title uses */
+function RenameCanvasModal({
+  canvas,
+  onClose,
+  onRenamed,
+}: {
+  canvas: CanvasMeta
+  onClose: () => void
+  onRenamed: (id: string, name: string) => void
+}) {
+  const [name, setName] = useState(canvas.name)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const t = useT()
+  const clean = name.trim()
+
+  async function save() {
+    if (!clean || busy) return
+    if (clean === canvas.name) return onClose()
+    setBusy(true)
+    setError(null)
+    try {
+      await api.renameCanvas(canvas.id, clean)
+      posthog.capture('canvas_renamed', { source: 'home' })
+      onRenamed(canvas.id, clean)
+    } catch (caught) {
+      setError(errorMessage(caught, t('home.renameFailed')))
+      setBusy(false)
+    }
+  }
+
+  return (
+    /* held open while saving, so a late answer never lands on another canvas's modal */
+    <Modal size="sm" onClose={() => !busy && onClose()}>
+      <ModalTitle>{t('home.renameTitle')}</ModalTitle>
+      <Input
+        variant="well"
+        className="mt-5"
+        autoFocus
+        onFocus={(event) => event.target.select()}
+        value={name}
+        maxLength={MAX_CANVAS_NAME}
+        disabled={busy}
+        onChange={(event) => setName(event.target.value)}
+        onKeyDown={(event) => event.key === 'Enter' && !event.nativeEvent.isComposing && void save()}
+        aria-label={t('home.canvasNameAria')}
+      />
+      {error && <p className="mt-2 text-label text-accent-ink">{error}</p>}
+      <ModalActions>
+        <Button onClick={onClose} disabled={busy}>
+          {t('common.cancel')}
+        </Button>
+        <Button variant="primary" onClick={() => void save()} disabled={busy || !clean}>
+          {busy ? t('home.renaming') : t('common.save')}
+        </Button>
+      </ModalActions>
+    </Modal>
   )
 }

@@ -6,6 +6,9 @@ lists every file in this folder.
 
 ## Active
 
+- [skills.md](skills.md) - Team skills: named markdown instructions a workspace or person writes
+  once, invoked by `/handle` in a request and added to the resident agent's system prompt for that
+  run; storage, `/api/skills`, the settings card. Issue #380.
 - [image-descriptions.md](image-descriptions.md) - Model-written descriptions of uploaded images,
   stored once per asset, billed to the uploader, eligible owner or server behind an
   Agents setting, and surfaced to MCP and resident agents as `images` per frame.
@@ -42,3 +45,10 @@ lists every file in this folder.
   editor's read-only mode.
 - [workspaces-billing.md](workspaces-billing.md) - Shared workspaces (org-level canvas access with
   roles) and the per-seat Team plan on Stripe: data model, entitlement rules, API, webhook flow.
+- [workspace-component-library.md](workspace-component-library.md) - Workspace component libraries:
+  published snapshots, linked definitions without a local main, resolve-on-write, updates pulled on
+  request, the agent and editor surfaces, who may publish, the Team-plan upsell on canvases without
+  a library and resuming after checkout.
+- [storybook-import.md](storybook-import.md) - Storybook import: a team's real components from its
+  published Storybook (or, through the CLI, one on localhost) as Doop components with variants as
+  CSS, tokens light and dark and fonts in the library; sync, fidelity check, REST, MCP and CLI.

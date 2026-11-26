@@ -1,20 +1,59 @@
-import { createContext, useContext, useState, type ReactNode } from 'react'
+import {
+  createContext,
+  useContext,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type MouseEvent,
+  type ReactNode,
+  type RefObject,
+} from 'react'
 
 import { cn } from '@/lib/utils'
 import { useT } from '@/lib/i18n'
 import { useValueScrub } from '@/hooks/use-value-scrub'
+import { slidePosition, useValueSlide } from '@/hooks/use-value-slide'
 import { ChevronDownIcon, UnlinkIcon } from './icons'
 
 /* The dense property controls of an inspector rail: a 26px row with a label
    column and one or more 26px fields, each carrying a faint unit at its
    right edge. Every field keeps a draft while it is being typed into and
-   commits on blur or Enter; a new value from outside replaces the draft. */
+   commits on blur or Enter; a new value from outside replaces the draft,
+   unless keys have been typed into it since: the panel re-reads the layer
+   once an edit is saved, a few hundred ms later, just when the next field
+   is being typed into, and replacing the draft then lost the keys already
+   typed. */
 
 const fieldCls =
   'group relative flex h-[26px] min-h-[26px] min-w-0 flex-1 shrink-0 items-center gap-1 rounded-[7px] bg-sub px-2 font-mono text-[11px] text-ink focus-within:bg-surface focus-within:shadow-elevation-1-focus'
 const unitCls = 'ml-auto flex-none font-sans text-[10.5px] text-ink-ghost'
 const scrubUnitCls =
   'self-stretch content-center -mr-2 pr-2 pl-1 cursor-ew-resize touch-none select-none hover:text-ink'
+/* a field's icon is its scrub handle, widened to the field's edge so it is easy to catch */
+const scrubIconCls = 'self-stretch -ml-2 w-[22px] pl-2 cursor-ew-resize touch-none select-none hover:text-ink'
+
+/** A field's whole text, selected (a triple-click, a tab into it) to be
+ *  typed over, stays selected when a new value replaces it: setting an
+ *  input's value drops the selection, and the keys typed next would land
+ *  after the new value instead of replacing it. The returned `onSelect`
+ *  tracks the selection; `onChange` forgets it, so a typed key is never
+ *  selected and typed over by the next. */
+function useWholeSelection(input: RefObject<HTMLInputElement | null>, text: string) {
+  const whole = useRef(false)
+  useLayoutEffect(() => {
+    const el = input.current
+    if (el && whole.current && el.ownerDocument.activeElement === el) el.select()
+  }, [input, text])
+  return {
+    onSelect: (event: { currentTarget: HTMLInputElement }) => {
+      const el = event.currentTarget
+      whole.current = el.value !== '' && el.selectionStart === 0 && el.selectionEnd === el.value.length
+    },
+    onChange: () => {
+      whole.current = false
+    },
+  }
+}
 
 /** The panel owns CSS snapshots and persistence; fields only own the gesture. */
 export const PropertyScrubContext = createContext<{
@@ -54,7 +93,9 @@ export function PropertySection({
 export function PropertyRow({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div className="mt-1.5 grid min-h-[26px] grid-cols-[58px_1fr] items-center gap-1.5">
-      <span className="text-[11.5px] text-ink-faint">{label}</span>
+      <span className="truncate text-[11.5px] text-ink-faint" title={label}>
+        {label}
+      </span>
       <div className="flex min-w-0 gap-1.5">{children}</div>
     </div>
   )
@@ -107,6 +148,7 @@ export function NumberField({
   onCommit,
   min = 0,
   max = Infinity,
+  slider,
 }: {
   label?: string
   value: number | null
@@ -121,10 +163,17 @@ export function NumberField({
   onCommit: (v: number) => void
   min?: number
   max?: number
+  /** the field doubles as a slider over this range: press and drag across it
+   *  to set the value by the pointer's place; a click still edits the text */
+  slider?: readonly [number, number]
 }) {
   const t = useT()
+  const input = useRef<HTMLInputElement>(null)
   const shown = value === null ? '' : String(value)
   const [draft, setDraft] = useState(shown)
+  /* keys typed since the field last committed or took up a value */
+  const [typed, setTyped] = useState(false)
+  const selection = useWholeSelection(input, draft)
   const [seen, setSeen] = useState({ value: shown, scrubbing: false })
   const scrubLifecycle = useContext(PropertyScrubContext)
   const scrub = useValueScrub({
@@ -134,35 +183,95 @@ export function NumberField({
     min,
     max,
     onChange: (v) => {
+      setTyped(false)
       setDraft(v)
       onCommit(Number(v))
     },
   })
+  const slide = useValueSlide({
+    ...scrubLifecycle,
+    value: Number(draft),
+    range: slider,
+    enabled: !disabled && !token && draft.trim() !== '',
+    onChange: (v) => {
+      const next = Math.min(max, Math.max(min, v))
+      setTyped(false)
+      setDraft(String(next))
+      onCommit(next)
+    },
+    onClick: () => {
+      input.current?.focus()
+      input.current?.select()
+    },
+  })
+  const dragging = scrub.scrubbing || slide.sliding
   // A reply received during the drag still needs to replace the draft on
   // release, even when CSS constrained or rounded it back to the old value.
-  if (seen.value !== shown || seen.scrubbing !== scrub.scrubbing) {
-    setSeen({ value: shown, scrubbing: scrub.scrubbing })
-    if (!scrub.scrubbing) setDraft(shown)
+  if (seen.value !== shown || seen.scrubbing !== dragging) {
+    setSeen({ value: shown, scrubbing: dragging })
+    if (!dragging && !typed) setDraft(shown)
   }
   function commit() {
-    if (scrub.scrubbing) return
+    setTyped(false)
+    if (dragging) return
     const n = Number(draft)
-    if (draft.trim() !== '' && Number.isFinite(n) && n !== value) {
+    if (typed && draft.trim() !== '' && Number.isFinite(n) && n !== value) {
       const next = Math.min(max, Math.max(min, n))
       setDraft(String(next))
       onCommit(next)
     } else setDraft(shown)
   }
+  const fill = slider ? slidePosition(Number(draft), slider) : 0
+  /* the drag-to-adjust handle: the icon when the field has one, else the unit */
+  const handle = scrub.canScrub
+    ? {
+        'data-scrub': true,
+        title: t('inspector.scrubHint'),
+        onPointerDown: scrub.onPointerDown,
+        onClick: (e: MouseEvent) => e.preventDefault(),
+      }
+    : {}
+  const iconHandle = !!prefix && !token
   return (
-    <label className={cn(fieldCls, disabled && 'opacity-50', className)}>
-      <span className="flex min-w-0 flex-1 items-baseline gap-1">
+    <label
+      className={cn(
+        fieldCls,
+        /* the whole field slides until it is being typed into */
+        slide.canSlide &&
+          'overflow-hidden cursor-ew-resize focus-within:cursor-auto [&:hover:not(:focus-within)>[data-slide]]:opacity-100',
+        disabled && 'opacity-50',
+        className,
+      )}
+      onPointerDown={slide.onPointerDown}
+    >
+      {/* the value's place on the track: shown on hover, held through a drag,
+          gone while the text is being typed into */}
+      {slide.canSlide && (
+        <span
+          aria-hidden
+          data-slide
+          className={cn(
+            'pointer-events-none absolute inset-0 transition-opacity duration-100',
+            slide.sliding ? 'opacity-100' : 'opacity-0',
+          )}
+        >
+          <span className="absolute inset-y-0 left-0 bg-ink/10" style={{ width: `${fill * 100}%` }} />
+          <span
+            className="absolute top-1/2 h-3.5 w-[3px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-white shadow-[0_0_0_0.5px_rgba(0,0,0,.12),0_1px_2px_rgba(0,0,0,.25)]"
+            style={{ left: `clamp(5px, ${fill * 100}%, calc(100% - 5px))` }}
+          />
+        </span>
+      )}
+      <span className="relative flex min-w-0 flex-1 items-baseline gap-1">
         {prefix && (
           <span
             className={cn(
               'grid w-3.5 flex-none place-items-center font-sans text-ink-faint',
               typeof prefix !== 'string' && 'self-center',
+              iconHandle && scrub.canScrub && scrubIconCls,
             )}
             aria-hidden
+            {...(iconHandle ? handle : {})}
           >
             {prefix}
           </span>
@@ -171,16 +280,23 @@ export function NumberField({
           <TokenChip token={token} />
         ) : (
           <input
+            ref={input}
             aria-label={label}
             disabled={disabled}
             placeholder={placeholder}
             className={cn(
               'w-full min-w-0 bg-transparent font-mono text-[11px] text-ink outline-none placeholder:text-ink-faint',
               trailing && 'group-hover:pr-5',
+              slide.canSlide && 'cursor-[inherit]',
             )}
             value={draft}
             inputMode="decimal"
-            onChange={(e) => setDraft(e.target.value)}
+            onSelect={selection.onSelect}
+            onChange={(e) => {
+              selection.onChange()
+              setTyped(true)
+              setDraft(e.target.value)
+            }}
             onBlur={commit}
             onKeyDown={(e) => {
               if (e.key === 'Enter') (e.target as HTMLInputElement).blur()
@@ -188,6 +304,7 @@ export function NumberField({
                 e.preventDefault()
                 const n = Number(draft) || 0
                 const next = Math.min(max, Math.max(min, n + (e.key === 'ArrowUp' ? 1 : -1) * (e.shiftKey ? 10 : 1)))
+                setTyped(false)
                 setDraft(String(next))
                 onCommit(next)
               }
@@ -198,15 +315,13 @@ export function NumberField({
       {!token && (
         <span
           data-unit
-          className={cn(unitCls, scrub.canScrub && scrubUnitCls)}
-          title={scrub.canScrub ? t('inspector.scrubHint') : undefined}
-          onPointerDown={scrub.onPointerDown}
-          onClick={(e) => scrub.canScrub && e.preventDefault()}
+          className={cn(unitCls, 'relative', !iconHandle && scrub.canScrub && scrubUnitCls)}
+          {...(iconHandle ? {} : handle)}
         >
           {u}
         </span>
       )}
-      {/* over the value's tail, left of the unit, so the unit stays where a scrub finds it */}
+      {/* over the value's tail, left of the unit, so a scrub on the unit still finds it */}
       {trailing && <span className="absolute inset-y-0 right-7 flex items-center">{trailing}</span>}
     </label>
   )
@@ -215,54 +330,80 @@ export function NumberField({
 export function TextField({
   label,
   value,
+  mixed = false,
   unit: u,
   placeholder,
   className,
   onCommit,
   scrub: scrubbable = false,
   min,
+  disabled,
 }: {
   label?: string
   value: string
+  mixed?: boolean
   unit?: string
   placeholder?: string
+  /** `font-sans` on a field holding prose rather than a value */
   className?: string
   onCommit: (v: string) => void
   scrub?: boolean
   min?: number
+  disabled?: boolean
 }) {
   const t = useT()
+  const input = useRef<HTMLInputElement>(null)
   const [draft, setDraft] = useState(value)
+  const [typed, setTyped] = useState(false)
+  const selection = useWholeSelection(input, draft)
   const [seen, setSeen] = useState({ value, scrubbing: false })
   const scrubLifecycle = useContext(PropertyScrubContext)
   const scrub = useValueScrub({
     ...scrubLifecycle,
     value: draft,
-    enabled: scrubbable,
+    enabled: scrubbable && !disabled,
     min,
     onChange: (v) => {
+      setTyped(false)
       setDraft(v)
       onCommit(v)
     },
   })
   if (seen.value !== value || seen.scrubbing !== scrub.scrubbing) {
     setSeen({ value, scrubbing: scrub.scrubbing })
-    if (!scrub.scrubbing) setDraft(value)
+    if (!scrub.scrubbing && !typed) setDraft(value)
+  }
+  function commit() {
+    setTyped(false)
+    if (scrub.scrubbing) return
+    if (typed && (mixed || draft !== value)) onCommit(draft)
+    else setDraft(value)
   }
   return (
     <label className={cn(fieldCls, className)}>
       <input
+        ref={input}
         aria-label={label}
-        className="w-full min-w-0 bg-transparent font-mono text-[11px] text-ink outline-none placeholder:text-ink-faint"
+        className="w-full min-w-0 bg-transparent font-[inherit] text-[length:inherit] text-ink outline-none placeholder:text-ink-faint disabled:opacity-50"
         value={draft}
+        disabled={disabled}
         placeholder={placeholder}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={() => !scrub.scrubbing && draft !== value && onCommit(draft)}
-        onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+        onSelect={selection.onSelect}
+        onChange={(e) => {
+          selection.onChange()
+          setTyped(true)
+          setDraft(e.target.value)
+        }}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (mixed && !draft && (e.key === 'Backspace' || e.key === 'Delete')) setTyped(true)
+          if (e.key === 'Enter') e.currentTarget.blur()
+        }}
       />
       {u && (
         <span
           data-unit
+          data-scrub={scrub.canScrub || undefined}
           className={cn(unitCls, scrub.canScrub && scrubUnitCls)}
           title={scrub.canScrub ? t('inspector.scrubHint') : undefined}
           onPointerDown={scrub.onPointerDown}
@@ -283,16 +424,17 @@ export function LengthField({
   placeholder,
 }: {
   label?: string
-  value: string
+  value: string | null
   onCommit: (v: string) => void
   placeholder?: string
 }) {
-  const length = /^(-?(?:\d+\.?\d*|\.\d+))([a-z%]+)?$/.exec(value)
+  const length = /^(-?(?:\d+\.?\d*|\.\d+))([a-z%]+)?$/.exec(value ?? '')
   const unit = length?.[2] ?? 'px'
   return (
     <TextField
       label={label}
-      value={length?.[1] ?? value}
+      value={length?.[1] ?? value ?? ''}
+      mixed={value === null}
       unit={unit}
       placeholder={placeholder}
       scrub
@@ -308,8 +450,10 @@ export function SelectField<T extends string>({
   label,
   placeholder,
   className,
+  disabled,
   onChange,
 }: {
+  disabled?: boolean
   /** null shows `placeholder` (a mixed value) until an option is picked */
   value: T | null
   /* consecutive options sharing a `group` render under one <optgroup> */
@@ -335,8 +479,9 @@ export function SelectField<T extends string>({
     <span className={cn(fieldCls, 'relative font-sans text-[11.5px]', className)}>
       <select
         aria-label={label}
-        className="w-full min-w-0 appearance-none bg-transparent pr-3 text-ink outline-none"
+        className="w-full min-w-0 appearance-none bg-transparent pr-3 text-ink outline-none disabled:opacity-50"
         value={value ?? ''}
+        disabled={disabled}
         /* a native select only ever reports one of the options it was given */
         onChange={(e) => e.target.value !== '' && onChange(e.target.value as T)}
       >
@@ -365,6 +510,8 @@ export function SelectField<T extends string>({
 export function ColorField({
   value,
   label,
+  mixed = false,
+  commitPickerOnChange = false,
   placeholder,
   className,
   trailing,
@@ -373,6 +520,8 @@ export function ColorField({
 }: {
   value: string | null
   label?: string
+  mixed?: boolean
+  commitPickerOnChange?: boolean
   /** shown for a null value in place of "none" (a mixed colour) */
   placeholder?: string
   className?: string
@@ -383,16 +532,24 @@ export function ColorField({
 }) {
   const t = useT()
   const shown = value ?? ''
+  const input = useRef<HTMLInputElement>(null)
   const [draft, setDraft] = useState(shown)
+  const [typed, setTyped] = useState(false)
+  const selection = useWholeSelection(input, draft)
   const [seen, setSeen] = useState(shown)
   if (seen !== shown) {
     setSeen(shown)
-    setDraft(shown)
+    if (!typed) setDraft(shown)
   }
   function commit() {
+    setTyped(false)
+    if (!typed) {
+      setDraft(shown)
+      return
+    }
     const v = draft.trim().toLowerCase()
     if (v === '') {
-      if (value !== null) onCommit(null)
+      if (value !== null || mixed) onCommit(null)
       return
     }
     const hex = v.startsWith('#') ? v : `#${v}`
@@ -409,11 +566,17 @@ export function ColorField({
         />
         {!token && (
           <input
+            key={commitPickerOnChange ? shown : undefined}
             type="color"
             aria-label={label ? t('inspector.pickLabel', { label: label.toLowerCase() }) : t('inspector.pickColour')}
             className="absolute -inset-1 cursor-pointer opacity-0"
-            value={value ?? '#ffffff'}
-            onChange={(e) => onCommit(e.target.value)}
+            defaultValue={commitPickerOnChange ? (value ?? '#ffffff') : undefined}
+            value={commitPickerOnChange ? undefined : (value ?? '#ffffff')}
+            onChange={commitPickerOnChange ? undefined : (e) => onCommit(e.currentTarget.value)}
+            ref={(el) => {
+              // A native change commits one pick after its stream of input events.
+              if (el && commitPickerOnChange) el.onchange = () => onCommit(el.value)
+            }}
           />
         )}
       </span>
@@ -421,6 +584,7 @@ export function ColorField({
         <TokenChip token={token} />
       ) : (
         <input
+          ref={input}
           aria-label={label}
           className={cn(
             'w-full min-w-0 bg-transparent font-mono text-[11px] uppercase text-ink outline-none placeholder:normal-case placeholder:text-ink-faint',
@@ -428,9 +592,17 @@ export function ColorField({
           )}
           value={draft}
           placeholder={placeholder ?? t('inspector.colorNone')}
-          onChange={(e) => setDraft(e.target.value)}
+          onSelect={selection.onSelect}
+          onChange={(e) => {
+            selection.onChange()
+            setTyped(true)
+            setDraft(e.target.value)
+          }}
           onBlur={commit}
-          onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+          onKeyDown={(e) => {
+            if (mixed && !draft && (e.key === 'Backspace' || e.key === 'Delete')) setTyped(true)
+            if (e.key === 'Enter') e.currentTarget.blur()
+          }}
         />
       )}
       {trailing && (

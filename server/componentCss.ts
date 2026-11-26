@@ -1,5 +1,7 @@
-import { parse, serializeOuter, type DefaultTreeAdapterTypes as Tree } from 'parse5'
-import { CSS_ATTR, DETACHED_CSS_ATTR, HEAD_ATTR, INSTANCE_ATTR } from '../shared/components.ts'
+import { serializeOuter, type DefaultTreeAdapterTypes as Tree } from 'parse5'
+import { parse } from './workBudget.ts'
+import { elementIs } from './parse5Select.ts'
+import { CSS_ATTR, DETACHED_CSS_ATTR, HEAD_ATTR, INSTANCE_ATTR, SOURCE_CSS_ATTR } from '../shared/components.ts'
 import { TOKEN_BLOCK_ATTR } from '../shared/designTokens.ts'
 import { FONT_BLOCK_ATTR } from '../shared/fonts.ts'
 import { WEB_FONT_LINK_ATTR } from '../shared/webFonts.ts'
@@ -42,25 +44,36 @@ type CssNode =
   | { kind: 'group'; prelude: string; nodes: CssNode[] }
   | { kind: 'atomic'; name: string; text: string; prelude: string; body: string }
 
-/** The end of a block whose `{` sits at `open`, skipping strings. */
+/** The end of a block whose `{` sits at `open`, skipping strings and escapes. An escaped
+ *  quote or brace (Tailwind's `\'` in `[class*='size-']`) is part of a name, not a string.
+ *  -1 when the block never closes. */
 function blockEnd(css: string, open: number): number {
   let depth = 0
   let quote = ''
   for (let i = open; i < css.length; i++) {
     const char = css[i]
-    if (quote) {
-      if (char === '\\') i++
-      else if (char === quote) quote = ''
+    if (char === '\\') i++
+    else if (quote) {
+      if (char === quote) quote = ''
     } else if (char === '"' || char === "'") quote = char
     else if (char === '{') depth++
     else if (char === '}' && --depth === 0) return i
   }
-  return css.length
+  return -1
 }
 
-function parseCss(source: string): CssNode[] {
+interface ReadCss {
+  nodes: CssNode[]
+  /** The first place reading went wrong, to the end of the sheet: text outside any rule
+   *  (skipped), or a block or string never closed (everything after it folded into it). */
+  unread: string | null
+}
+
+function readCss(source: string): ReadCss {
   const css = source.replace(/\/\*[\s\S]*?\*\//g, '')
   const nodes: CssNode[] = []
+  let unread: string | null = null
+  const note = (from: number) => (unread ??= css.slice(from).trim() || null)
   let at = 0
   while (at < css.length) {
     let open = -1
@@ -68,9 +81,9 @@ function parseCss(source: string): CssNode[] {
     let quote = ''
     for (let i = at; i < css.length; i++) {
       const char = css[i]
-      if (quote) {
-        if (char === '\\') i++
-        else if (char === quote) quote = ''
+      if (char === '\\') i++
+      else if (quote) {
+        if (char === quote) quote = ''
       } else if (char === '"' || char === "'") quote = char
       else if (char === '{') {
         open = i
@@ -84,23 +97,48 @@ function parseCss(source: string): CssNode[] {
       const text = css.slice(at, semi).trim()
       if (text.startsWith('@'))
         nodes.push({ kind: 'atomic', name: atName(text), text: `${text};`, prelude: '', body: '' })
+      else if (text) note(at)
       at = semi + 1
       continue
     }
-    if (open === -1) break
-    const end = blockEnd(css, open)
+    if (open === -1) {
+      note(at)
+      break
+    }
+    const closed = blockEnd(css, open)
+    /* never closed: like a browser, the block runs to the end, but whatever followed it
+       (the rest of the sheet, behind an unclosed string) is read as part of it */
+    const end = closed === -1 ? css.length : closed
     const prelude = css.slice(at, open).trim()
     const body = css.slice(open + 1, end)
     if (prelude.startsWith('@')) {
       const name = atName(prelude)
-      if (GROUP_AT_RULES.has(name)) nodes.push({ kind: 'group', prelude, nodes: parseCss(body) })
-      else nodes.push({ kind: 'atomic', name, text: `${prelude}{${body}}`, prelude, body })
+      if (GROUP_AT_RULES.has(name)) {
+        const inner = readCss(body)
+        nodes.push({ kind: 'group', prelude, nodes: inner.nodes })
+        unread ??= inner.unread
+      } else nodes.push({ kind: 'atomic', name, text: `${prelude}{${body}}`, prelude, body })
     } else if (prelude) {
       nodes.push({ kind: 'rule', selector: prelude, body })
     }
+    if (closed === -1) note(at)
     at = end + 1
   }
-  return nodes
+  return { nodes, unread }
+}
+
+function parseCss(source: string): CssNode[] {
+  return readCss(source).nodes
+}
+
+const UNREAD_EXCERPT = 120
+
+/** Where a stylesheet stops reading as its author meant, as an excerpt, or null when it reads
+ *  cleanly. What follows may be lost, so its author should hear about it. */
+export function unreadCss(sheet: string): string | null {
+  const { unread } = readCss(sheet)
+  if (!unread) return null
+  return unread.length > UNREAD_EXCERPT ? `${unread.slice(0, UNREAD_EXCERPT)}…` : unread
 }
 
 function atName(prelude: string): string {
@@ -228,9 +266,10 @@ function compoundTokens(compound: string): Tokens {
   return tokens
 }
 
+const within = (names: Set<string>, available: Set<string>) => [...names].every((name) => available.has(name))
+
 function compoundMatches(compound: string, tokens: Tokens): boolean {
   const wanted = compoundTokens(compound)
-  const within = (names: Set<string>, available: Set<string>) => [...names].every((name) => available.has(name))
   return (
     within(wanted.tags, tokens.tags) &&
     within(wanted.classes, tokens.classes) &&
@@ -239,16 +278,78 @@ function compoundMatches(compound: string, tokens: Tokens): boolean {
   )
 }
 
+/** A compound naming one of the main's elements in a state it is not in yet (`.faq-row[open]`,
+ *  `details[open]`, `.card.is-on`): its tag and id are there and so is one of its classes (or,
+ *  naming none, its tag or id), and what is missing is a state an element switches into. #517 */
+function compoundInState(compound: string, tokens: Tokens): boolean {
+  const wanted = compoundTokens(compound)
+  if (!within(wanted.tags, tokens.tags) || !within(wanted.ids, tokens.ids)) return false
+  if (wanted.classes.size) return [...wanted.classes].some((name) => tokens.classes.has(name))
+  return wanted.tags.size + wanted.ids.size > 0
+}
+
+/** What a main is made of: its own elements, and apart from them the components nested in it;
+ *  and the elements it sits in, nearest first. */
+interface SubtreeTokens {
+  own: Tokens
+  nested: Tokens
+  ancestors: Element[]
+}
+
+/** A selected subtree: the selector as far as it concerns it, and a condition on the document
+ *  it keeps (a theme), to be written before the scope. */
+interface Relevant {
+  selector: string
+  prefix: string
+}
+
+/** A rule's selector as kept: matched on the main (`Relevant`), or written for the component and
+ *  matching nothing in it as it stands, scoped by its subject alone (`subject`). */
+type Kept = Relevant & { subject?: true }
+
+/** A pseudo-element ends a selector and cannot sit inside `:is()`. */
+const TRAILING_PSEUDO_ELEMENT = /(::[\w-]+(?:\([^)]*\))?|:(?:before|after|first-line|first-letter))$/i
+
+/** Scoped by its subject: the element it styles has to be an instance or inside one, while what
+ *  the selector says about that element's ancestors is left as written (`html.dark`, a theme
+ *  attribute, a state on the instance root). Specificity stays the selector's own. */
+export function scopeSubject(selector: string, scope: string): string {
+  const pseudo = TRAILING_PSEUDO_ELEMENT.exec(selector)?.[0] ?? ''
+  const base = selector.slice(0, selector.length - pseudo.length).trim()
+  return `:is(${base || '*'}):where(${scope}, ${scope} *)${pseudo}`
+}
+
 /** The selector as far as it concerns the subtree: compounds naming ancestors outside it are cut off.
- *  Null when its subject is not in the subtree at all. */
-function relevantSelector(selector: string, tokens: Tokens): string | null {
+ *  Null when its subject is not in the subtree at all. A subject inside a nested component counts
+ *  only when the selector reaches it from one of the main's own elements (`.plan .btn`): that is
+ *  this component restyling what it holds, where a bare `.btn` is the nested component's business. */
+function relevantSelector(selector: string, { own, nested, ancestors }: SubtreeTokens): Relevant | null {
   const compounds = compoundsOf(selector)
-  const last = compounds[compounds.length - 1]
-  if (!last || !compoundMatches(last.compound, tokens)) return null
+  if (!compounds.length) return null
+  const isOwn = (index: number) => compoundMatches(compounds[index]!.compound, own)
+  const inState = (index: number) => compoundInState(compounds[index]!.compound, own)
+  const isNested = (index: number) => compoundMatches(compounds[index]!.compound, nested)
   let first = compounds.length - 1
-  while (first > 0 && compoundMatches(compounds[first - 1]!.compound, tokens)) first--
-  return compounds
-    .slice(first)
+  if (!isOwn(first) && !inState(first)) {
+    if (!isNested(first)) return null
+    while (first > 0 && !isOwn(first - 1) && isNested(first - 1)) first--
+    if (first === 0 || !isOwn(first - 1)) return null
+  }
+  while (first > 0 && isOwn(first - 1)) first--
+  let prefix = keptAncestors(compounds, first, ancestors)
+  /* what the main sits in is read first; a compound left over that names one of its own
+     elements in another state stays in the selector as its condition */
+  while (prefix === null && first > 0 && inState(first - 1)) {
+    first--
+    while (first > 0 && isOwn(first - 1)) first--
+    prefix = keptAncestors(compounds, first, ancestors)
+  }
+  if (prefix === null) return null
+  return { selector: joinCompounds(compounds.slice(first)), prefix }
+}
+
+function joinCompounds(pieces: { compound: string; combinator: string }[]): string {
+  return pieces
     .map((piece, index) => {
       if (index === 0) return piece.compound
       return piece.combinator === ' ' ? ` ${piece.compound}` : ` ${piece.combinator} ${piece.compound}`
@@ -256,11 +357,62 @@ function relevantSelector(selector: string, tokens: Tokens): string | null {
     .join('')
 }
 
+/**
+ * The compounds before `first` name what the main sits in: the rule is how the main looks
+ * there, and they are cut, when its ancestors meet them (matched by css-select, values and all;
+ * `>` asks it of the main's parent). When they do not (`.login__card h2` for a main outside any
+ * card) the rule is someone else's: null. A theme condition that does not hold now, wherever
+ * it sits (`html.dark .bar`, `.shell [data-doop-theme="dark"] .bar`), stays as the rule's
+ * condition when the rest holds; the rest is cut: the prefix returned. A sibling (`+`, `~`) is
+ * not checked, as it never was.
+ */
+function keptAncestors(
+  compounds: { compound: string; combinator: string }[],
+  first: number,
+  ancestors: Element[],
+): string | null {
+  if (first === 0) return ''
+  const joiner = compounds[first]!.combinator
+  if (joiner === '+' || joiner === '~') return ''
+  const candidates = joiner === '>' ? ancestors.slice(0, 1) : ancestors
+  const meets = (pieces: { compound: string; combinator: string }[]) =>
+    candidates.some((el) => elementIs(el, joinCompounds(pieces)))
+  const named = compounds.slice(0, first)
+  if (meets(named)) return ''
+  const themeless = named.map((piece) => ({ ...piece, compound: withoutTheme(piece.compound) }))
+  const themes = named.flatMap((piece, index) => (piece.compound !== themeless[index]!.compound ? [index] : []))
+  if (!themes.length || !meets(themeless)) return null
+  /* only the theme stays a condition: the wrappers around it are where the main sits, cut like
+     any. Two themes side by side keep how they were joined (`>` stays `>`) */
+  return themes
+    .map((at, index) => {
+      const compound = named[at]!.compound
+      if (index === 0) return compound
+      const joiner = themes[index - 1] === at - 1 ? named[at]!.combinator : ' '
+      return joiner === ' ' ? ` ${compound}` : ` ${joiner} ${compound}`
+    })
+    .join('')
+}
+
+/* a theme is a state the document or a part of it switches into: what the main shows now is
+   one of its themes, so a condition on another one is kept, not tested */
+const THEME_ATTRIBUTE = /\[\s*data-doop-theme\b(?:[^\]"']|"[^"]*"|'[^']*')*\]/gi
+const DOCUMENT_ROOT = /^(?::root|html|body)(?![\w-])/i
+
+function withoutTheme(compound: string): string {
+  const bare = compound.replace(THEME_ATTRIBUTE, '')
+  const root = DOCUMENT_ROOT.exec(bare)?.[0]
+  /* html.dark, :root[data-mode]: the document is always there, its classes are a theme too */
+  if (root) return root
+  return bare || '*'
+}
+
 /** A selector scoped to the instance root: at or below it, its pseudo-classes left in place. */
-export function scopeSelector(selector: string, scope: string): string {
+export function scopeSelector(selector: string, scope: string, prefix = ''): string {
   const where = `:where(${scope})`
   const lead = /^(\*|[a-zA-Z][\w-]*)?((?:[.#](?:[\w\u0080-\uffff-]|\\.)+|\[[^\]]*\])*)/.exec(selector)?.[0] ?? ''
-  return `${where} ${selector}, ${lead}${where}${selector.slice(lead.length)}`
+  const before = prefix ? `${prefix} ` : ''
+  return `${before}${where} ${selector}, ${before}${lead}${where}${selector.slice(lead.length)}`
 }
 
 function isDocumentSelector(selector: string): boolean {
@@ -284,23 +436,103 @@ function walkElements(node: Tree.ParentNode, visit: (el: Element) => void) {
   }
 }
 
-function tokensOf(root: Element, skip: (el: Element) => boolean): Tokens {
-  const tokens: Tokens = { tags: new Set(), classes: new Set(), ids: new Set(), attrs: new Set() }
-  const add = (el: Element) => {
-    tokens.tags.add(el.tagName.toLowerCase())
-    for (const attr of el.attrs) {
-      tokens.attrs.add(attr.name.toLowerCase())
-      if (attr.name === 'class') for (const name of attr.value.split(/\s+/)) if (name) tokens.classes.add(name)
-      if (attr.name === 'id') tokens.ids.add(attr.value)
+const noTokens = (): Tokens => ({ tags: new Set(), classes: new Set(), ids: new Set(), attrs: new Set() })
+
+/** `isNested` marks the root of a nested instance: it and everything below it are that component's. */
+function addTokens(el: Element, tokens: Tokens) {
+  tokens.tags.add(el.tagName.toLowerCase())
+  for (const attr of el.attrs) {
+    tokens.attrs.add(attr.name.toLowerCase())
+    if (attr.name === 'class') for (const name of attr.value.split(/\s+/)) if (name) tokens.classes.add(name)
+    if (attr.name === 'id') tokens.ids.add(attr.value)
+  }
+}
+
+function tokensOf(root: Element, isNested: (el: Element) => boolean): Omit<SubtreeTokens, 'ancestors'> {
+  const own = noTokens()
+  const nested = noTokens()
+  const add = addTokens
+  const stack: { el: Element; inside: boolean }[] = [{ el: root, inside: false }]
+  for (let next = stack.pop(); next; next = stack.pop()) {
+    const inside = next.inside || (next.el !== root && isNested(next.el))
+    add(next.el, inside ? nested : own)
+    for (const child of next.el.childNodes) if ('tagName' in child) stack.push({ el: child, inside })
+  }
+  return { own, nested }
+}
+
+const isInstanceRoot = (el: Element) => el.attrs.some((attr) => attr.name === INSTANCE_ATTR)
+
+function mainTokens(root: Element, variantAttrs: string[]): SubtreeTokens {
+  const tokens = tokensOf(root, isInstanceRoot)
+  for (const name of variantAttrs) tokens.own.attrs.add(name)
+  return { ...tokens, ancestors: ancestorsOf(root) }
+}
+
+/** Each element the main sits in, nearest first: what an ancestor compound may name. */
+function ancestorsOf(root: Element): Element[] {
+  const chain: Element[] = []
+  for (let node = root.parentNode; node && 'tagName' in node; node = node.parentNode) chain.push(node)
+  return chain
+}
+
+/** Whether a selector is about this component: one of its compounds names a class or an id the
+ *  main's own elements have, or the main's root tag in an attribute state (`details[open]`). A
+ *  rule that is not is a page's, a typo, or a nested component's, never kept on trust. */
+function anchored(selector: string, own: Tokens, rootTag: string): boolean {
+  return compoundsOf(selector).some(({ compound }) => {
+    const wanted = compoundTokens(compound)
+    if ([...wanted.classes].some((name) => own.classes.has(name))) return true
+    if ([...wanted.ids].some((id) => own.ids.has(id))) return true
+    return wanted.tags.has(rootTag) && wanted.attrs.size > 0 && wanted.classes.size === 0
+  })
+}
+
+/** Of the selectors `unmatchedSelectors` names for a main, the ones `extractComponentCss` keeps
+ *  anyway when they were written for the component (anchored to it) and the ones it leaves out. */
+export function sortUnmatched(
+  selectors: string[],
+  root: Element,
+  variantAttrs: string[] = [],
+): { kept: string[]; dropped: string[] } {
+  const { own } = mainTokens(root, variantAttrs)
+  const kept = selectors.filter((selector) => anchored(selector, own, root.tagName))
+  return { kept, dropped: selectors.filter((selector) => !kept.includes(selector)) }
+}
+
+/** The selectors in a stylesheet written for one component that name nothing in its main as it
+ *  stands. `extractComponentCss` keeps their rules (scoped by subject); this says which, so the
+ *  author can tell a state or a script-added element from a typo. */
+export function unmatchedSelectors(sheet: string, root: Element, variantAttrs: string[] = []): string[] {
+  const tokens = mainTokens(root, variantAttrs)
+  const unmatched: string[] = []
+  const visit = (list: CssNode[]) => {
+    for (const node of list) {
+      if (node.kind === 'group') visit(node.nodes)
+      if (node.kind !== 'rule') continue
+      for (const selector of splitTopLevel(node.selector, ',')) {
+        if (selector && !isDocumentSelector(selector) && !relevantSelector(selector, tokens)) unmatched.push(selector)
+      }
     }
   }
-  const stack: Element[] = [root]
-  for (let next = stack.pop(); next; next = stack.pop()) {
-    if (next !== root && skip(next)) continue
-    add(next)
-    for (const child of next.childNodes) if ('tagName' in child) stack.push(child)
-  }
-  return tokens
+  visit(parseCss(sheet))
+  return [...new Set(unmatched)]
+}
+
+/** The CSS written for each component whose main is in this frame: its `data-doop-component-source`
+ *  block, by component id. */
+export function componentSourceCss(html: string): Map<string, string> {
+  const sources = new Map<string, string[]>()
+  /* most frames hold no main made from css: no second parse for them */
+  if (!html.includes(SOURCE_CSS_ATTR)) return new Map()
+  walkElements(parse(html), (el) => {
+    if (el.tagName !== 'style') return
+    const id = el.attrs.find((attr) => attr.name === SOURCE_CSS_ATTR)?.value
+    const text = el.childNodes[0]
+    if (id) sources.set(id, [...(sources.get(id) ?? []), text && 'value' in text ? text.value : ''])
+  })
+  /* the walk runs last-to-first: back in document order, each block on its own lines */
+  return new Map([...sources].map(([id, blocks]) => [id, blocks.reverse().join('\n')]))
 }
 
 const usedFonts = (css: string) =>
@@ -316,7 +548,8 @@ function cssVarsIn(text: string): string[] {
 
 /* blocks the server writes into every frame after the components pass: not a design's own rules,
    and reading them back would freeze a token's value into a component and bump it on the next save */
-const MANAGED_STYLE_ATTRS = new Set([CSS_ATTR, DETACHED_CSS_ATTR, TOKEN_BLOCK_ATTR, FONT_BLOCK_ATTR])
+/* a component's source block is that component's own CSS (`componentSourceCss`), not the page's */
+const MANAGED_STYLE_ATTRS = new Set([CSS_ATTR, DETACHED_CSS_ATTR, TOKEN_BLOCK_ATTR, FONT_BLOCK_ATTR, SOURCE_CSS_ATTR])
 
 /** Everything in a frame's own stylesheets (never another component's copy, nor a managed block). */
 export function frameStylesheets(html: string): string {
@@ -354,18 +587,23 @@ export interface ExtractedCss {
   rawCss: string
 }
 
-/** `variantAttrs` are attributes instances wear and the main need not: `data-<enum prop>` on the root. */
+/** `variantAttrs` are attributes instances wear and the main need not: `data-<enum prop>` on the root.
+ *  `sheet` is the frame's own CSS (`frameStylesheets`, no component's source block in it): its rules are
+ *  taken when their selectors name something in the main. `own` is the CSS written for this component
+ *  (its `data-doop-component-source` block): every rule of it is the component's, whatever it names. */
 export function extractComponentCss(
   sheet: string,
   root: Element,
   componentId: string,
   variantAttrs: string[] = [],
+  own?: string,
 ): ExtractedCss {
   const scope = `[${INSTANCE_ATTR}="${componentId}"]`
-  const nested = (el: Element) => el.attrs.some((attr) => attr.name === INSTANCE_ATTR)
-  const tokens = tokensOf(root, nested)
-  for (const name of variantAttrs) tokens.attrs.add(name)
-  const nodes = parseCss(sheet)
+  const tokens = mainTokens(root, variantAttrs)
+  const pageNodes = parseCss(sheet)
+  const ownNodes = own === undefined ? [] : parseCss(own)
+  /* document rules, @keyframes and @font-face are read from both */
+  const nodes = [...pageNodes, ...ownNodes]
   const customProps = new Map<string, string>()
   const inherited: string[] = []
 
@@ -380,22 +618,37 @@ export function extractComponentCss(
   }
   collectDocumentRules(nodes)
 
-  const keptRules = (list: CssNode[], write: (selector: string) => string): string[] =>
+  /* a rule written for the component that names nothing in the main as it stands (a state it is
+     not in yet, an element a script adds, one under a theme class on <html>) is kept as written
+     and scoped by its subject, so it reaches nothing outside the instances; but only when it is
+     anchored to the component: a page's rule pasted along (.hero h1), a typo or a rule for a
+     nested component alone (.btn .label) is left out, as before */
+  const keptRules = (list: CssNode[], write: (relevant: Kept) => string, trusted: boolean): string[] =>
     list.flatMap((node) => {
       if (node.kind === 'group') {
-        const inner = keptRules(node.nodes, write)
+        const inner = keptRules(node.nodes, write, trusted)
         return inner.length ? [`${node.prelude} {\n${inner.join('\n')}\n}`] : []
       }
       if (node.kind === 'atomic') return []
       const selectors = splitTopLevel(node.selector, ',').flatMap((selector) => {
         if (isDocumentSelector(selector)) return []
-        const relevant = relevantSelector(selector, tokens)
+        const relevant: Kept | null =
+          relevantSelector(selector, tokens) ??
+          (trusted && anchored(selector, tokens.own, root.tagName)
+            ? { selector: selector.trim(), prefix: '', subject: true }
+            : null)
         return relevant ? [write(relevant)] : []
       })
       return selectors.length ? [`${selectors.join(', ')} {${node.body}}`] : []
     })
-  const rules = keptRules(nodes, (selector) => scopeSelector(selector, scope))
-  const rawRules = keptRules(nodes, (selector) => selector)
+  const scoped = (kept: Kept) =>
+    kept.subject ? scopeSubject(kept.selector, scope) : scopeSelector(kept.selector, scope, kept.prefix)
+  const raw = ({ selector, prefix }: Kept) => (prefix ? `${prefix} ${selector}` : selector)
+  /* the page's rules first, then the component's own: the order they cascade in on the main's frame.
+     A component made from a page and later given css can hold a rule twice: kept once */
+  const unique = (list: string[]) => [...new Set(list)]
+  const rules = unique([...keptRules(pageNodes, scoped, false), ...keptRules(ownNodes, scoped, true)])
+  const rawRules = unique([...keptRules(pageNodes, raw, false), ...keptRules(ownNodes, raw, true)])
   const ruleText = rules.join('\n')
 
   /* inherited and custom properties land on the instance root, so its text

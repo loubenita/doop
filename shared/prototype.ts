@@ -72,9 +72,8 @@ export interface InteractionAttrs {
 /**
  * Parse an element's interaction attributes: the single-attribute form first,
  * then every entry of the JSON form. Invalid entries are dropped, never
- * repaired. SELF-CONTAINED ON PURPOSE: the frame runtime inlines this
- * function's source (`parseInteractions.toString()`) into the sandboxed
- * iframe, so it must not reference anything outside its own body.
+ * repaired. The frame runtime bundles it too (src/frame-runtime/proto.ts),
+ * so both sides of the sandbox read interactions the same way.
  */
 export function parseInteractions(attrs: InteractionAttrs): Interaction[] {
   const transitions = [
@@ -323,7 +322,7 @@ export function scanInteractions(html: string): ScannedInteractive[] {
 
 /** The frame a page's prototype starts on: its flow start when that frame is
  *  still on the page, otherwise its first frame (top-left reading order). */
-export function flowStartFrame(canvas: Canvas, pageId: string): Frame | null {
+export function flowStartFrame(canvas: Pick<Canvas, 'id' | 'pages' | 'frames'>, pageId: string): Frame | null {
   const frames = pageFrames(canvas, pageId).filter((f) => !f.hidden)
   const page = canvasPages(canvas).find((p) => p.id === pageId)
   const start = page?.startFrameId ? frames.find((f) => f.id === page.startFrameId) : undefined

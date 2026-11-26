@@ -1,4 +1,5 @@
 import { canvasPages } from '../../shared/pages'
+import { isAgentsTask } from '../../shared/agentIdentity'
 import { useStore } from '../lib/store'
 import { useT } from '../lib/i18n'
 import { AgentIcon } from './AgentIcon'
@@ -23,7 +24,7 @@ export function GhostFrames() {
       p.kind === 'agent' &&
       p.status &&
       !p.activeFrameId &&
-      tasks.some((task) => task.queuedBy && task.agentName === p.name && !task.endedAt && !task.failedAt),
+      tasks.some((task) => task.queuedBy && isAgentsTask(task, p) && !task.endedAt && !task.failedAt),
   )
   if (working.length === 0) return null
   /* mirror store.createFrame's auto-placement: right of the right-most frame */
@@ -47,7 +48,7 @@ export function GhostFrames() {
         >
           {/* the label counter-scales against the viewport zoom, like .frame-label */}
           <div className="absolute inset-x-0 -top-[26px] flex cursor-default select-none items-center gap-2 origin-bottom-left whitespace-nowrap text-[12px] font-semibold [color:color-mix(in_srgb,var(--ghost-color,var(--ink-soft))_80%,var(--ink-soft))] [transform:scale(min(calc(1/var(--zoom,1)),2.4))]">
-            <AgentIcon name={p.name} size={13} color={p.color} />
+            <AgentIcon name={p.name} brand={p.brand} size={13} color={p.color} />
             <span className="overflow-hidden text-ellipsis">{t('stage.isOnIt', { name: p.name })}</span>
           </div>
           <div className="absolute inset-0 flex flex-col items-center justify-center gap-[18px] p-8">

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('../server/db/persist.ts', () => ({
   saveCanvas: () => {},
+  refreshAssetRefs: () => {},
   saveFrame: () => {},
   saveActivity: () => {},
   saveFrameVersion: () => {},
@@ -14,6 +15,8 @@ vi.mock('../server/db/persist.ts', () => ({
 
 import { store } from '../server/store.ts'
 import * as actions from '../server/actions.ts'
+import { settleIdleStreams } from '../server/canvasWrites.ts'
+import * as propagation from '../server/propagation.ts'
 import { blankComponent, contextFor } from '../server/components.ts'
 import { compactDocument } from '../server/componentEngine.ts'
 import {
@@ -21,6 +24,7 @@ import {
   compactFrameHtml,
   createComponentFromElement,
   deleteComponent,
+  detachAllInstances,
   facesToCarry,
   importComponent,
   restoreComponentVersion,
@@ -31,6 +35,7 @@ import {
 } from '../server/componentActions.ts'
 import { COMPONENT_ATTR, HEAD_ATTR, INSTANCE_ATTR, MAX_COMPONENT_NAME, OVERRIDES_ATTR } from '../shared/components.ts'
 import type { CustomFont } from '../shared/fonts.ts'
+import { renderedHtml } from './rendered.ts'
 import type { Actor } from '../shared/types.ts'
 
 const actor = { name: 'Tester', kind: 'user', color: '#000', clientId: 'x' } as unknown as Actor
@@ -119,7 +124,7 @@ describe('components edge cases', () => {
     expect(store.getFrame(page.id)!.html).toContain('color: red')
   })
 
-  it('an instance of a deleted component keeps its look', () => {
+  it('an instance of a deleted component keeps its look, detached or not', async () => {
     const { def } = makeComponent(
       canvasId,
       'Pill',
@@ -128,7 +133,12 @@ describe('components edge cases', () => {
     )
     const page = actions.createFrame(canvasId, { name: 'Page', html: '' }, actor)!
     actions.updateFrame(page.id, { html: doc(`<doop-use component="${def.id}"></doop-use>`) }, actor)
+    const before = store.getFrame(page.id)!.html
     deleteComponent(canvasId, def.id, actor)
+    /* deleting writes nothing: the instance is the markup it was */
+    expect(store.getFrame(page.id)!.html).toBe(before)
+    detachAllInstances(canvasId, def.id, actor)
+    await propagation.whenIdle()
     const html = store.getFrame(page.id)!.html
     expect(html).not.toContain(` ${INSTANCE_ATTR}=`)
     const [, selector] = /([^\n{]*\.pill[^{]*)\{\s*color: red/.exec(html) ?? []
@@ -202,9 +212,9 @@ describe('components edge cases', () => {
   })
 
   const revOf = (id: string) => store.getComponents(canvasId).find((candidate) => candidate.id === id)!.rev
-  const html = (frameId: string) => store.getFrame(frameId)!.html
+  const html = renderedHtml
 
-  it('a <style> inside the main does not turn an unchanged save into an override', () => {
+  it('a <style> inside the main does not turn an unchanged save into an override', async () => {
     const { def, frame } = makeComponent(
       canvasId,
       'Hero',
@@ -217,6 +227,7 @@ describe('components edge cases', () => {
     expect(html(page)).toBe(before)
     /* and the main still reaches it */
     actions.updateFrame(frame.id, { html: html(frame.id).replace('>Hi<', '>Bye<') }, actor)
+    await propagation.whenIdle()
     expect(html(page)).toContain('Bye')
   })
 
@@ -256,7 +267,7 @@ describe('components edge cases', () => {
     expect(html(page)).not.toContain('red')
   })
 
-  it('an edit inside a nested instance of the main reaches the instances in the same write', () => {
+  it('an edit inside a nested instance of the main reaches the instances', async () => {
     const button = makeComponent(
       canvasId,
       'Button',
@@ -271,6 +282,7 @@ describe('components edge cases', () => {
     const page = makeFrame(`<doop-use component="${card.def.id}"></doop-use>`)
     expect(html(page)).toContain('Go')
     actions.updateFrame(card.frame.id, { html: html(card.frame.id).replace('>Go<', '>Stop<') }, actor)
+    await propagation.whenIdle()
     expect(html(page)).toContain('Stop')
     expect(html(page)).not.toContain('>Go<')
   })
@@ -307,7 +319,7 @@ describe('components edge cases', () => {
     expect(compactDocument(before, contextFor(canvasId))).not.toContain(HEAD_ATTR)
   })
 
-  it('keeps a part rendered as another tag', () => {
+  it('keeps a part rendered as another tag', async () => {
     const { def, frame } = makeComponent(
       canvasId,
       'Action',
@@ -323,6 +335,7 @@ describe('components edge cases', () => {
     expect(html(page)).toMatch(/<a class="cta"[^>]*>Go<\/a>/)
     /* the main's own text still flows through */
     actions.updateFrame(frame.id, { html: html(frame.id).replace('>Go<', '>Run<') }, actor)
+    await propagation.whenIdle()
     expect(html(page)).toMatch(/<a class="cta"[^>]*>Run<\/a>/)
   })
 
@@ -468,6 +481,23 @@ describe('components edge cases', () => {
     expect(created.component.props.map((prop) => prop.name)).not.toContain('id')
   })
 
+  it('infers a prop name from a class that says what the element is, never from a utility class', () => {
+    const created = createComponentFromElement(
+      canvasId,
+      {
+        name: 'Row',
+        frameId: makeFrame(
+          `<li class="row"><a class="cta flex" href="/go">Go</a><span class="price text-sm font-bold">$9</span><em class="font-bold">New</em><h4>Name</h4><h4>Other</h4></li>`,
+        ),
+        element: 'li',
+      },
+      actor,
+    )
+    const names = ['cta-link', 'cta', 'price', 'item', 'title', 'title-2']
+    expect(created.component.props.map((prop) => prop.name)).toEqual(names)
+    expect(created.inferred).toEqual(names)
+  })
+
   it('keeps a boolean default when the prop is also bound to an attribute', () => {
     const { def } = makeComponent(
       canvasId,
@@ -558,13 +588,13 @@ describe('components edge cases', () => {
     expect(store.getFrame(page.id)!.html).toContain(`>${body}</code>`)
   })
 
-  it('an idle stream still catches up on a component change', () => {
+  it('an idle stream still catches up on a component change', async () => {
     const { def } = makeComponent(canvasId, 'Pill', (id) => `<div class="pill" ${COMPONENT_ATTR}="${id}">Old</div>`)
     const page = actions.createFrame(canvasId, { name: 'Page', html: '' }, actor)!
     actions.appendFrameHtml(page.id, doc(`<doop-use component="${def.id}"></doop-use>`), actor, { start: true })
     updateComponent(canvasId, def.id, { html: `<div class="pill">Fresh</div>` }, actor)
     expect(store.getFrame(page.id)!.html).not.toContain('Fresh')
-    actions.expireIdleStreams(Date.now() + 60_000)
+    await settleIdleStreams(Date.now() + 60_000)
     expect(store.getFrame(page.id)!.html).toContain('Fresh')
   })
   it('carries the fonts and keyframes a main names in its own style attributes', () => {

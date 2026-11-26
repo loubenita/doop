@@ -16,6 +16,10 @@
     "desktop/src-tauri/target/",
     "desktop/src-tauri-chromium/target/",
     "public/figma-plugin/",
+    "public/cli/",
+    "cli/dist/",
+    "vscode-extension/out/",
+    "vscode-extension/dist/",
     "storybook-static/"
   ],
   "rules": {

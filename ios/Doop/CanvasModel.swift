@@ -16,7 +16,9 @@ final class CanvasModel: ObservableObject {
             pruneSelection()
         }
     }
-    @Published var tasks: [CanvasTask] = []
+    @Published var tasks: [CanvasTask] = [] {
+        didSet { scheduleStartingExpiry() }
+    }
     @Published var comments: [CanvasComment] = []
     @Published var presences: [CanvasPresence] = []
     /// Frames an agent is streaming a design into right now, by frame id.
@@ -29,6 +31,14 @@ final class CanvasModel: ObservableObject {
     @Published var error: String?
     @Published var deleted = false
     @Published var selectedElement: SelectedElement?
+    /// A thread whose pin was tapped on the canvas: the comments panel opens on it.
+    @Published var focusedCommentID: String?
+    /// A comment being written at a spot the person long-pressed, shown as a draft pin.
+    @Published var commentDraft: CommentDraft?
+    /// A frame the canvas should glide to and fit; the canvas clears it once there.
+    @Published var flyToFrameID: String?
+    /// A thread picked in the Comments list: the canvas moves to its pin, then clears this.
+    @Published var flyToCommentID: String?
     @Published var viewportCommand = 0
     /// Measured composer height, used when fitting frames above the floating controls.
     var composerHeight: CGFloat = 160
@@ -43,6 +53,10 @@ final class CanvasModel: ObservableObject {
         var body: [String: Any]
     }
     private var connection: Task<Void, Never>?
+    /// Wakes the canvas when a "Starting…" pill's window ends (`WorkingAgents.startingExpiry`).
+    private var startingExpiry: Task<Void, Never>?
+    /// Bumped by that wake-up: a change the pills redraw on, since time passing is none.
+    @Published private var startingTick = 0
     private var connectionID: UUID?
     private var socket: URLSessionWebSocketTask?
     private let clientID = "ios-" + UUID().uuidString
@@ -72,7 +86,49 @@ final class CanvasModel: ObservableObject {
     var frameWorkers: [String: [FrameWorker]] {
         FrameWorkers.byFrame(streams: streams, presences: presences)
     }
+    /// The agents at work on the canvas, for the pills at its top.
+    var workingAgents: [WorkingAgent] {
+        WorkingAgents.list(presences: presences, tasks: tasks, now: Date().timeIntervalSince1970 * 1000)
+    }
+    /// Redraw the pills when the waiting card they show stops counting as starting, and
+    /// again for the next one.
+    private func scheduleStartingExpiry() {
+        startingExpiry?.cancel()
+        let now = Date().timeIntervalSince1970 * 1000
+        guard let expiry = WorkingAgents.startingExpiry(tasks: tasks, now: now) else { return }
+        let delay = UInt64(max(0, expiry - now) * 1_000_000)
+        startingExpiry = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: delay)
+            guard !Task.isCancelled, let self else { return }
+            self.startingTick += 1
+            self.scheduleStartingExpiry()
+        }
+    }
     var selected: DesignFrame? { pageFrames.first { $0.id == selectedID } }
+
+    /// The frame an agent is at work on, as the web follows an agent (`agentFollowFrame`):
+    /// the frame this agent's own presence has open, else the newest frame streamed under
+    /// its name. Names are not unique (two people's "Claude"), so the presence comes first.
+    func workingFrame(of agent: WorkingAgent) -> String? {
+        let frames = Set((canvas?.frames ?? []).map(\.id))
+        if let id = presences.first(where: { $0.clientId == agent.id })?.activeFrameId, frames.contains(id) {
+            return id
+        }
+        return streams.filter { $0.value.name == agent.name && frames.contains($0.key) }
+            .max { $0.value.since < $1.value.since }?.key
+    }
+
+    /// Show the frame an agent works on, switching to its page first. False when
+    /// the agent has no frame yet (a card nobody has picked up).
+    @discardableResult func goToWork(of agent: WorkingAgent) -> Bool {
+        guard let id = workingFrame(of: agent) else { return false }
+        // Selecting reveals the frame's page, the default one for a frame with no page.
+        select(id)
+        commentDraft = nil
+        focusedCommentID = nil
+        flyToFrameID = id
+        return true
+    }
     var canEdit: Bool { connected && pendingEdits == 0 && !undoing }
     var canUndo: Bool { canEdit && !undoStack.isEmpty }
 
@@ -82,6 +138,8 @@ final class CanvasModel: ObservableObject {
         connectionID = generation
         connecting = true
         connectionError = nil
+        // stop() cancelled the wake-up: the cards still shown need theirs before the room answers.
+        scheduleStartingExpiry()
         #if DEBUG
         startFakeCollaborators()
         #endif
@@ -156,6 +214,8 @@ final class CanvasModel: ObservableObject {
         connectionID = nil
         connection?.cancel()
         connection = nil
+        startingExpiry?.cancel()
+        startingExpiry = nil
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         connected = false
@@ -240,9 +300,13 @@ final class CanvasModel: ObservableObject {
         case "frame:streaming":
             guard let frameID = event.frameId else { break }
             if event.active == true, let actor = event.actor {
-                streams[frameID] = FrameStream(name: actor.name, color: actor.color)
+                streams[frameID] = FrameStream(name: actor.name, color: actor.color, since: Date().timeIntervalSince1970 * 1000)
             } else {
                 streams[frameID] = nil
+            }
+        case "status":
+            if let index = presences.firstIndex(where: { $0.clientId == event.clientId }) {
+                presences[index].status = event.status
             }
         case "viewport":
             if let index = presences.firstIndex(where: { $0.clientId == event.clientId }), let viewport = event.viewport {
@@ -347,12 +411,16 @@ final class CanvasModel: ObservableObject {
         return PromptScope(scope: CardScope(frameId: frame.id), label: frame.name, frameName: frame.name)
     }
 
-    func queue(_ prompt: String, scope: CardScope? = nil, assignment: AgentAssignment = .automatic) async throws {
-        let request = CardQueueRequest(title: prompt, scope: scope, assignment: assignment)
-        _ = try await client.data("/api/canvases/\(id)/cards", method: "POST", body: request.body)
+    func queue(_ prompt: String, scope: CardScope? = nil, assignment: AgentAssignment = .automatic, runner: RunnerPick? = nil) async throws {
+        let request = CardQueueRequest(title: prompt, scope: scope, assignment: assignment, runner: runner)
+        let data = try await client.data("/api/canvases/\(id)/cards", method: "POST", body: request.body)
+        // The answer is the queued card: show it at once, before the room's `task` echo.
+        // The room's `task` may already be here, and further along (claimed, finished): keep it.
+        if let card = try? JSONDecoder().decode(CanvasTask.self, from: data), !tasks.contains(where: { $0.id == card.id }) {
+            tasks.append(card)
+        }
     }
 
-    /// A comment pinned to an element when one is selected, else to the frame body.
     /// A picked element is only as good as the HTML it was picked in: its selector
     /// path can point elsewhere once that HTML changes, whichever way the change
     /// arrived (a frame event, a reconnect resync, a reload). Drop it then.
@@ -363,16 +431,54 @@ final class CanvasModel: ObservableObject {
         if frame == nil || frame?.html.hashValue != element.htmlHash { selectedElement = nil }
     }
 
-    func comment(_ text: String, frameID: String) async throws {
+    /// The selection bar's Comment: a draft on the picked element, else just inside
+    /// the selected frame's top-left, as the web pins a comment made from a frame's name.
+    func startCommentOnSelection() {
         pruneSelection()
-        let element = selectedElement?.frameID == frameID ? selectedElement : nil
-        let data = try await client.data("/api/frames/\(frameID)/comments", method: "POST", body: [
-            "text": text, "selector": element?.selector ?? "body", "snippet": element?.text ?? "",
-        ])
-        // A successful post is visible immediately, including when the socket
-        // is reconnecting. Its later broadcast replaces this same ID.
+        guard let frame = selected else { return }
+        let origin = CGPoint(x: frame.x, y: frame.y)
+        if let element = selectedElement, element.frameID == frame.id {
+            let point = element.rect.origin
+            commentDraft = CommentDraft(
+                target: .element(frameID: frame.id, selector: element.selector, snippet: String(element.text.prefix(400)),
+                                 point: point, origin: element.rect.origin),
+                world: CGPoint(x: origin.x + point.x, y: origin.y + point.y), label: "\(frame.name) · \(element.label)")
+        } else {
+            let point = CGPoint(x: 8, y: 8)
+            commentDraft = CommentDraft(target: .frame(frameID: frame.id, point: point),
+                                        world: CGPoint(x: origin.x + point.x, y: origin.y + point.y), label: frame.name)
+        }
+        focusedCommentID = nil
+    }
+
+    func reply(_ text: String, to rootID: String) async throws {
+        let data = try await client.data("/api/comments/\(rootID)/replies", method: "POST", body: ["text": text])
         let comment = try JSONDecoder().decode(CanvasComment.self, from: data)
         upsert(comment, into: &comments)
+    }
+
+    /// Post the draft placed by a long-press, anchored the way the web's Comment tool anchors.
+    func postDraft(_ text: String) async throws {
+        guard let draft = commentDraft else { return }
+        let data: Data
+        switch draft.target {
+        case let .element(frameID, selector, snippet, point, origin):
+            data = try await client.data("/api/frames/\(frameID)/comments", method: "POST", body: [
+                "text": text, "selector": selector, "snippet": snippet, "x": point.x, "y": point.y,
+                "elementOrigin": ["x": origin.x, "y": origin.y],
+            ])
+        case let .frame(frameID, point):
+            data = try await client.data("/api/frames/\(frameID)/comments", method: "POST", body: [
+                "text": text, "selector": "body", "x": point.x, "y": point.y,
+            ])
+        case let .canvas(pageID, point):
+            data = try await client.data("/api/canvases/\(id)/comments", method: "POST", body: [
+                "text": text, "pageId": pageID, "x": point.x, "y": point.y,
+            ])
+        }
+        let comment = try JSONDecoder().decode(CanvasComment.self, from: data)
+        upsert(comment, into: &comments)
+        if commentDraft == draft { commentDraft = nil }
     }
 
     func deleteFrame(_ frameID: String) async throws {
@@ -490,6 +596,23 @@ struct PromptScope: Equatable {
     var key: String { scope.selector.map { "\(scope.frameId):\($0)" } ?? scope.frameId }
 }
 
+/// Where a long-press asked for a new comment.
+struct CommentDraft: Equatable {
+    enum Target: Equatable {
+        /// An element: the point pressed and the element's top-left, both in frame px.
+        case element(frameID: String, selector: String, snippet: String, point: CGPoint, origin: CGPoint)
+        /// A frame's background, at a point in frame px.
+        case frame(frameID: String, point: CGPoint)
+        /// Empty canvas, at a world point on a page.
+        case canvas(pageID: String, point: CGPoint)
+    }
+    var target: Target
+    /// Where the draft pin sits in the world.
+    var world: CGPoint
+    /// What the composer says the comment is on.
+    var label: String
+}
+
 /// An element picked inside a frame by the Blitz hit test.
 struct SelectedElement: Equatable, Sendable {
     var frameID: String
@@ -510,6 +633,7 @@ extension CanvasModel {
     /// `-fakeCursors 1`: three collaborators (a person and two agents) wander
     /// over the first frame, for checking the cursor chrome without a second client.
     fileprivate func startFakeCollaborators() {
+        startFakeWork()
         guard UserDefaults.standard.bool(forKey: "fakeCursors") else { return }
         let people = [("fake-kevin", "Kevin", "user", "#E8432E"), ("fake-claude", "Claude", "agent", "#D97757"), ("fake-codex", "Codex", "agent", "#2743EE")]
         var t = 0.0
@@ -526,10 +650,47 @@ extension CanvasModel {
             }
         }
     }
+
+    /// `-fakeWorking 1`: a task queued from the phone shows as "Starting…", then Claude
+    /// picks it up and posts statuses while it streams, for checking the working pills.
+    /// `-fakeWorking 2` adds Codex at work beside it.
+    fileprivate func startFakeWork() {
+        let level = UserDefaults.standard.integer(forKey: "fakeWorking")
+        guard level > 0 else { return }
+        let card = CanvasTask(id: "fake-card", agentName: "", status: "Design a pricing page", startedAt: Date().timeIntervalSince1970 * 1000)
+        let steps = ["Reading the canvas", "Laying out the pricing tiers", "Styling the plan cards", "Checking the screenshot"]
+        Task { @MainActor [weak self] in
+            // After the room's `init`, which replaces the task list.
+            // Holds no strong reference across a sleep, so closing the canvas releases it.
+            while !Task.isCancelled {
+                guard let ready = self.map({ $0.connected && $0.canvas != nil }) else { return }
+                if ready { break }
+                try? await Task.sleep(nanoseconds: 300_000_000)
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard let model = self else { return }
+            upsert(card, into: &model.tasks)
+            for (index, step) in steps.enumerated() {
+                try? await Task.sleep(nanoseconds: index == 0 ? 6_000_000_000 : 5_000_000_000)
+                guard let model = self else { return }
+                model.tasks.removeAll { $0.id == card.id }
+                upsert(CanvasPresence(clientId: "fake-claude-work", name: "Claude", color: "#D97757", kind: "agent", status: step), into: &model.presences)
+                if index == 1, let frame = model.pageFrames.first { model.streams[frame.id] = FrameStream(name: "Claude", color: "#D97757") }
+                if level >= 2, index == 1 {
+                    upsert(CanvasPresence(clientId: "fake-codex-work", name: "Codex", color: "#2743EE", kind: "agent", status: "Writing the FAQ copy"), into: &model.presences)
+                }
+            }
+        }
+    }
 }
 #endif
 
 private func upsert<T: Identifiable>(_ item: T, into collection: inout [T]) {
     if let index = collection.firstIndex(where: { $0.id == item.id }) { collection[index] = item }
     else { collection.append(item) }
+}
+
+/// Up to two initials of a name, as pins and comment rows show it.
+func commentInitials(_ name: String) -> String {
+    name.split(separator: " ").prefix(2).compactMap { $0.first.map(String.init) }.joined().uppercased()
 }

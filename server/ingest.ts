@@ -5,7 +5,9 @@ import { and, desc, eq, inArray, sql } from 'drizzle-orm'
 import { db } from './db/index.ts'
 import { syncEdges, syncKeys, syncLinks } from './db/schema.ts'
 import { store } from './store.ts'
+import { sourceHtml } from './frameCompose.ts'
 import * as actions from './actions.ts'
+import { runImportWrite } from './canvasWrites.ts'
 import type { Frame } from '../shared/types.ts'
 import { MAX_FRAME_HTML_BYTES } from './limits.ts'
 
@@ -138,7 +140,7 @@ export function wrapSnapshotHtml(html: string, marker: string, baseUrl: string |
     `<meta http-equiv="Content-Security-Policy" content="${SNAPSHOT_CSP}">` +
     (baseUrl ? `<base href="${escapeAttr(baseUrl)}">` : '')
   const headMatch = out.match(/<head[^>]*>/i)
-  if (headMatch) out = out.replace(headMatch[0], headMatch[0] + inject)
+  if (headMatch) out = out.replace(headMatch[0], (head) => head + inject)
   else out = inject + out
   if (!/^\s*<!doctype/i.test(out)) out = '<!doctype html>\n' + out
   return out
@@ -348,7 +350,9 @@ export async function handleIngest(req: express.Request, res: express.Response) 
       res.set('X-Doop-Synced', '1')
       return res.json({ ok: true, frameId: existing.id, frozen: true })
     }
-    if (existing.html === wrapped) {
+    /* by source: what the canvas supplies to the frame (token values, under the older
+       storage form) is not the app's content */
+    if (sourceHtml(canvas.id, existing.html) === sourceHtml(canvas.id, wrapped)) {
       /* content matches, but this capture may still carry fresher hotspots —
          e.g. the first upload from a snippet version that reports links */
       await saveLinks(key.id, page, links)
@@ -361,7 +365,12 @@ export async function handleIngest(req: express.Request, res: express.Response) 
     }
     pageLastWrite.set(marker, Date.now())
     /* geometry the user may have arranged stays; content and height track the app */
-    actions.updateFrame(existing.id, { html: wrapped, name: title.slice(0, 80), height }, actor)
+    await runImportWrite('design sync', canvas.id, {
+      type: 'write-frame',
+      frameId: existing.id,
+      patch: { html: wrapped, name: title.slice(0, 80), height },
+      actor,
+    })
     await saveLinks(key.id, page, links)
     return res.json({ ok: true, frameId: existing.id, updated: true })
   }
@@ -379,7 +388,11 @@ export async function handleIngest(req: express.Request, res: express.Response) 
     y = 120
   }
   pageLastWrite.set(marker, Date.now())
-  const frame = actions.createFrame(canvas.id, { name: title.slice(0, 80), x, y, width, height, html: wrapped }, actor)
+  const frame = await runImportWrite('design sync', canvas.id, {
+    type: 'create-frame',
+    input: { name: title.slice(0, 80), x, y, width, height, html: wrapped },
+    actor,
+  })
   if (!frame) return res.status(410).json({ error: 'canvas vanished mid-sync' })
   await saveLinks(key.id, page, links)
   res.json({ ok: true, frameId: frame.id, created: true })

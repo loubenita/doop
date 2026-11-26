@@ -4,26 +4,38 @@ import { usePaper, type Paper } from '../lib/paper'
 import { roleAllows } from '../../shared/canvasRole'
 import { onViewCommand } from '../lib/viewMenu'
 import type { Frame } from '../../shared/types'
-import { usePageCanvas, currentPageCanvas } from '../lib/pages'
+import { usePageCanvas, currentPageCanvas, usePageLoading } from '../lib/pages'
 import { sendWs } from '../lib/ws'
+import { wheelScrollUnder } from '../lib/wheelScroll'
 import { throttle } from '../lib/throttle'
 import { FrameView, HiddenFrameView } from './FrameView'
 import { CanvasComments, type CanvasComposeAt } from './CanvasComments'
 import { placeComposer } from '../lib/composerPlacement'
 import { isCanvasComment, type CanvasComment } from '../../shared/comments'
 import { elementIdSelector, isElementId } from '../../shared/elementId'
-import { canvasPages } from '../../shared/pages'
+import { resolveFrameLink } from '../lib/elementLink'
+import { openExternal } from '../lib/desktop'
+import { canvasPages, framePageId } from '../../shared/pages'
 import { FlowOverlay } from './FlowOverlay'
 import { PrototypeOverlay } from './PrototypeOverlay'
 import { GhostFrames } from './GhostFrames'
 import { Cursors } from './Cursors'
 import { FollowFrame } from './FollowFrame'
-import { cameraOnCursor, cameraToFollow } from '../lib/follow'
+import {
+  agentFollowFrame,
+  agentFollowInputsChanged,
+  agentFollowKey,
+  cameraOnCursor,
+  cameraToFollow,
+  followedAgent,
+} from '../lib/follow'
+import { MeasureOverlay } from './MeasureOverlay'
 import { SnapGuides } from './SnapGuides'
 import { GuideLines, Rulers } from './Rulers'
 import { useIsMobile } from '../hooks/use-mobile'
-import { isTypingTarget, MOD_KEY } from '../lib/keys'
+import { isMenuTarget, isTypingTarget, MOD_KEY, pressedKey } from '../lib/keys'
 import { cn } from '../lib/utils'
+import { commentCursorStyle } from '../lib/commentCursor'
 import { gesture } from '../lib/gesture'
 import { hasFrameClip, pasteFrameAtScreen } from '../lib/frameClipboard'
 import { MenuHint } from './ui/menu'
@@ -46,11 +58,11 @@ import {
 } from './ui/icons'
 import { TOOLS, isDrawingTool, resolvePointerAction, toolForKey, type Tool } from '../lib/tools'
 import { useCanvasDrawing } from './CanvasDrawing'
-import { FrameLabelLayer } from './FrameLabelLayer'
+import { CommentThreadLayer, FrameLabelLayer } from './FrameLabelLayer'
 import { pixelGridLines } from './PixelGrid'
 import { layoutZoomFor } from '../lib/layoutZoom'
 import { useT, type PlainMessageKey } from '../lib/i18n'
-import { NO_INSETS, fitBox, type StageInsets } from '../lib/viewFit'
+import { NO_INSETS, fitBox, fitColumnStart, type StageInsets } from '../lib/viewFit'
 import { spaceWouldScroll } from '../lib/spaceScroll'
 import { ZOOM_DRAG_MIN, ZOOM_TOOL_STEP, zoomAtPoint, zoomToBox } from '../lib/zoomTool'
 
@@ -61,6 +73,7 @@ const MIN_ZOOM = 0.08
    viewport rather than the zoom, and frame documents never re-lay out (each
    iframe undoes the zoom). Mirrored by FOLLOW_MAX_ZOOM. */
 const MAX_ZOOM = 16
+const MAX_PAGE_CAMERAS = 64
 
 /* The Comment tool's cursor wins over everything under the stage — frames
    included, like the Hand tool's grab — except inside the comment UI itself
@@ -130,6 +143,18 @@ function lockTextSelection(): () => void {
   }
 }
 
+/* A press on the canvas cancels its pointerdown (picks, drags), and with it
+   the browser's move of focus: a field outside the stage (a Design panel
+   value, a layer being renamed) would keep its draft and its caret while the
+   selection moves on under it. Blurring it before anything on the canvas runs
+   saves the draft to what it was typed for, as leaving the field does. Focus
+   inside the stage (a frame being edited, a comment composer) is the stage's. */
+function leaveOutsideField(e: React.PointerEvent<HTMLElement>) {
+  const field = document.activeElement
+  if (e.button !== 0 || !e.isPrimary || !(field instanceof HTMLElement)) return
+  if (!e.currentTarget.contains(field)) field.blur()
+}
+
 /* zoom to an absolute level pivoting on the view center — the world point in
    the middle of the stage stays in the middle */
 function zoomCentered(el: HTMLElement, next: number) {
@@ -173,14 +198,9 @@ const sendViewport = throttle(
   50,
 )
 
-/** The stage's own paint when the page has a colour: the colour, and a dot
- *  grid that reads on it (the theme's dots are tuned to the theme paper). */
+/** The stage's own paint when the page has a colour. */
 function paperStyle(paper: Paper): CSSProperties {
-  if (!paper.background) return {}
-  return {
-    background: paper.background,
-    ['--dot' as string]: paper.tone === 'dark' ? 'rgba(255, 255, 255, 0.09)' : 'rgba(0, 0, 0, 0.09)',
-  }
+  return paper.background ? { background: paper.background } : {}
 }
 
 export function Stage({
@@ -188,6 +208,7 @@ export function Stage({
   insets = NO_INSETS,
   bounds,
   docked = false,
+  hideTools = false,
 }: {
   onAddFrame: () => void
   /** px the top bar, floating panels and islands cover at each of the
@@ -199,6 +220,7 @@ export function Stage({
   bounds?: StageInsets
   /** the panels are docked, so the tool rail is a full-height column too */
   docked?: boolean
+  hideTools?: boolean
 }) {
   const ref = useRef<HTMLDivElement>(null)
   /* read by the fit callbacks, which outlive a render */
@@ -232,14 +254,16 @@ export function Stage({
   )
   const drawing = useCanvasDrawing(ref)
   const worldRef = useRef<HTMLDivElement>(null)
-  const gridRef = useRef<HTMLDivElement>(null)
   const pixelGridRef = useRef<HTMLDivElement>(null)
   const [labelLayer, setLabelLayer] = useState<HTMLDivElement | null>(null)
+  const [threadLayer, setThreadLayer] = useState<HTMLDivElement | null>(null)
   const zoomLabelRef = useRef<HTMLSpanElement>(null)
   const setViewport = useStore((s) => s.setViewport)
   const canvas = usePageCanvas()
   const activePageId = useStore((s) => s.activePageId)
-  /* a page with a colour of its own paints the stage, dots in its contrast */
+  /* the page's frames are on their way from the room: it is fitted once they are here */
+  const pageLoading = usePageLoading()
+  /* a page with a colour of its own paints the stage */
   const paper = usePaper()
   const select = useStore((s) => s.select)
   const panMode = useStore((s) => s.panMode)
@@ -275,16 +299,14 @@ export function Stage({
      per-frame viewport writes */
   const [layoutZoom, setLayoutZoom] = useState(1)
   const layoutZoomRef = useRef(1)
-  const fitted = useRef(false)
+  const pageCameras = useRef(new Map<string, Viewport>())
+  const cameraPage = useRef<string | null>(null)
   const deepLinkHandled = useRef(false)
-  const focusedPage = useRef<string | null>(null)
   const [linkSearch, setLinkSearch] = useState(location.search)
 
   useEffect(() => {
     function onPop() {
-      fitted.current = false
       deepLinkHandled.current = false
-      focusedPage.current = null
       setLinkSearch(location.search)
     }
     window.addEventListener('popstate', onPop)
@@ -293,26 +315,18 @@ export function Stage({
 
   /* Viewport → DOM without React: no component subscribes to the viewport, so
      pan/zoom never renders anything. A store subscription writes the world
-     transform, the grid layer, the --zoom variable (which counter-scales
+     transform, the pixel grid, the --zoom variable (which counter-scales
      labels/pins/cursors from CSS), and the zoom pill's % directly. */
   useLayoutEffect(() => {
     function apply(vp: { x: number; y: number; zoom: number }) {
       const world = worldRef.current
-      const grid = gridRef.current
       const stage = ref.current
-      if (!world || !grid || !stage) return
+      if (!world || !stage) return
       world.style.transform = worldTransform(vp, layoutZoomRef.current)
       stage.style.setProperty('--zoom', String(vp.zoom))
       /* the camera's offset, for chrome drawn in screen px (FrameLabelLayer) */
       stage.style.setProperty('--vx', `${vp.x}px`)
       stage.style.setProperty('--vy', `${vp.y}px`)
-      const period = 26 * vp.zoom
-      grid.style.backgroundSize = `${period}px ${period}px`
-      /* one period of overhang: the layer slides back by up to a period */
-      grid.style.width = grid.style.height = `calc(100% + ${period}px)`
-      const gx = (((vp.x % period) + period) % period) - period
-      const gy = (((vp.y % period) + period) % period) - period
-      grid.style.transform = `translate(${gx}px, ${gy}px)`
       const pixels = pixelGridRef.current
       if (pixels) {
         const opacity = useStore.getState().viewOptions.pixelGrid ? pixelGridOpacity(vp.zoom) : 0
@@ -325,11 +339,29 @@ export function Stage({
         const py = (((vp.y % vp.zoom) + vp.zoom) % vp.zoom) - vp.zoom
         pixels.style.transform = `translate(${px}px, ${py}px)`
       }
-      if (zoomLabelRef.current) zoomLabelRef.current.textContent = `${Math.round(vp.zoom * 100)}%`
+      /* only on a change: rewriting the text replaces its node on every pan
+         tick, and a node inserted anywhere re-runs `body:has(…)` rules */
+      const zoomText = `${Math.round(vp.zoom * 100)}%`
+      if (zoomLabelRef.current && zoomLabelRef.current.textContent !== zoomText)
+        zoomLabelRef.current.textContent = zoomText
     }
     apply(useStore.getState().viewport)
     let settle = 0
     const unsub = useStore.subscribe((s, prev) => {
+      const sameCanvas = s.canvas?.id === prev.canvas?.id
+      if (!sameCanvas) pageCameras.current.clear()
+      if (!sameCanvas || s.activePageId !== prev.activePageId) {
+        /* The incoming viewport may already be reset; save the outgoing one. */
+        const page = sameCanvas ? prev.activePageId : null
+        if (page && page === cameraPage.current && !prev.following) {
+          const views = pageCameras.current
+          views.delete(page)
+          views.set(page, prev.viewport)
+          if (views.size > MAX_PAGE_CAMERAS) views.delete(views.keys().next().value!)
+        }
+        cameraPage.current = null
+        refitRef.current = null
+      }
       /* a (re)connect needs the camera announced afresh — the server only
          knows what this socket has sent */
       if (s.connected && !prev.connected && ref.current) sendViewport(s.viewport, ref.current)
@@ -366,12 +398,17 @@ export function Stage({
   }, [layoutZoom])
 
   /* following a peer: whenever their camera (or, lacking one, their cursor)
-     moves, ease ours toward the same view. Writes go through
+     moves, ease ours toward the same view. Following an agent: whenever the
+     frame it works on changes (another frame, or this one growing), ease
+     ours onto that frame, onto its page first; an idle agent leaves the
+     camera where it is until it works again. Writes go through
      setViewportFollowing so they don't count as "our own move" and end the
      follow — everything else that touches the camera does. */
   useEffect(() => {
     let raf = 0
     let target: { x: number; y: number; zoom: number } | null = null
+    /* the agent frame the camera last went to (agentFollowKey) */
+    let agentKey = ''
     function step() {
       raf = 0
       const s = useStore.getState()
@@ -394,13 +431,21 @@ export function Stage({
       const el = ref.current
       const s = useStore.getState()
       if (!el || !s.following) return
+      if (followedAgent(s)) {
+        const frame = agentFollowFrame(s)
+        agentKey = agentFollowKey(frame)
+        if (!frame || !s.canvas) return
+        const pageId = framePageId(s.canvas, frame)
+        if (pageId !== s.activePageId) s.setActivePage(pageId, { keepFollow: true })
+        target = fitView(el, frame, 1)
+        if (!raf) raf = requestAnimationFrame(step)
+        return
+      }
       const leaderViewport = s.peerViewports[s.following]
       const cursor = s.cursors[s.following]
       const stage = { width: el.clientWidth, height: el.clientHeight }
-      if (leaderViewport?.pageId && leaderViewport.pageId !== s.activePageId) {
-        s.setActivePage(leaderViewport.pageId)
-        useStore.setState({ following: s.following })
-      }
+      if (leaderViewport?.pageId && leaderViewport.pageId !== s.activePageId)
+        s.setActivePage(leaderViewport.pageId, { keepFollow: true })
       if (leaderViewport) target = cameraToFollow(leaderViewport, stage)
       else if (cursor) target = cameraOnCursor(cursor, stage, s.viewport.zoom)
       else return
@@ -409,9 +454,15 @@ export function Stage({
     const unsub = useStore.subscribe((s, prev) => {
       if (!s.following) {
         target = null
+        agentKey = ''
         return
       }
       const started = s.following !== prev.following
+      if (followedAgent(s)) {
+        if (started || (agentFollowInputsChanged(s, prev) && agentFollowKey(agentFollowFrame(s)) !== agentKey))
+          retarget()
+        return
+      }
       const moved =
         s.peerViewports[s.following] !== prev.peerViewports[s.following] ||
         s.cursors[s.following] !== prev.cursors[s.following]
@@ -432,7 +483,7 @@ export function Stage({
       ro.disconnect()
       if (raf) cancelAnimationFrame(raf)
     }
-  }, [])
+  }, [fitView])
 
   /** where a fly-to lands: a frame fitted with padding, or a bare world
    *  point centred at the zoom we already have (a peer's cursor) */
@@ -448,7 +499,8 @@ export function Stage({
         zoom: from.zoom,
       }
     }
-    const f = currentPageCanvas()?.frames.find((x) => x.id === req.frameId)
+    /* the frame's box, even while its page's HTML is on its way */
+    const f = useStore.getState().canvas?.frames.find((x) => x.id === req.frameId)
     if (!f) return undefined
     return fitView(el, f, 1)
   }
@@ -464,6 +516,9 @@ export function Stage({
     const from = useStore.getState().viewport
     const target = flyTargetFor(flyTo, el, from)
     if (!target) return
+    /* the page it flies to is focused on the frame: fitting the whole page when
+       it arrives would take the camera off it */
+    if ('frameId' in flyTo) cameraPage.current = useStore.getState().activePageId
     const start = performance.now()
     const DURATION = 700
     const ease = (t: number) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2)
@@ -485,7 +540,7 @@ export function Stage({
       const el = ref.current
       if (!el) return
       select(f.id)
-      focusedPage.current = useStore.getState().activePageId
+      cameraPage.current = useStore.getState().activePageId
       const fit = () => setViewport(fitView(el, f, 1))
       fit()
       refitRef.current = fit
@@ -504,6 +559,33 @@ export function Stage({
     [setViewport, select, fitView],
   )
 
+  const followFrameLink = useCallback(
+    (source: Frame, href: string) => {
+      const { canvas, activePageId } = useStore.getState()
+      if (!canvas || source.canvasId !== canvas.id || framePageId(canvas, source) !== activePageId) return
+      const target = resolveFrameLink(canvas, href)
+      if (!target) return
+      if (target.kind === 'web') {
+        /* the desktop shell hands it to the system browser (its webview drops
+           popups); a browser opens a tab with no way back to this page */
+        if (openExternal(target.url)) return
+        /* mail and phone links go to the app the system has for them: a new
+           tab would stay behind empty */
+        if (/^(mailto|tel):/i.test(target.url)) window.location.href = target.url
+        else window.open(target.url, '_blank', 'noopener,noreferrer')
+        return
+      }
+      if (target.kind === 'anchor') return // the frame scrolls itself (FrameView)
+      if (target.kind === 'page') {
+        /* as a pick in the Pages panel: the Stage fits the page it opens */
+        useStore.getState().setActivePage(target.pageId)
+        return
+      }
+      focusFrame(target.frame, isElementId(target.element) ? elementIdSelector(target.element) : null)
+    },
+    [focusFrame],
+  )
+
   /* centre a canvas comment's pin at 100% on its page and open its thread
      (the link in a comment email) */
   const focusPoint = useCallback(
@@ -511,8 +593,8 @@ export function Stage({
       const el = ref.current
       if (!el) return
       const s = useStore.getState()
-      focusedPage.current = c.pageId
       s.setActivePage(c.pageId)
+      cameraPage.current = c.pageId
       setViewport({ x: el.clientWidth / 2 - c.x, y: el.clientHeight / 2 - c.y, zoom: 1 })
       s.requestOpenThread(c.id)
     },
@@ -522,7 +604,7 @@ export function Stage({
   /* fit a set of frames (with their name labels above) into the open part
      of the view; an empty set resets to the origin at 100% */
   const fitFrames = useCallback(
-    (frames: { x: number; y: number; width: number; height: number }[]) => {
+    (frames: { x: number; y: number; width: number; height: number }[], entering = false) => {
       const el = ref.current
       if (!el) return
       if (!frames.length) {
@@ -530,11 +612,32 @@ export function Stage({
         setViewport({ x: left + 80, y: top + 80, zoom: 1 })
         return
       }
-      const minX = Math.min(...frames.map((f) => f.x))
-      const minY = Math.min(...frames.map((f) => f.y - 30))
-      const maxX = Math.max(...frames.map((f) => f.x + f.width))
-      const maxY = Math.max(...frames.map((f) => f.y + f.height))
-      setViewport(fitView(el, { x: minX, y: minY, width: maxX - minX, height: maxY - minY }, 1.25))
+      let minX = Infinity
+      let minY = Infinity
+      let maxX = -Infinity
+      let maxY = -Infinity
+      let columnLeft = -Infinity
+      let columnRight = Infinity
+      for (const f of frames) {
+        const right = f.x + f.width
+        minX = Math.min(minX, f.x)
+        minY = Math.min(minY, f.y - 30)
+        maxX = Math.max(maxX, right)
+        maxY = Math.max(maxY, f.y + f.height)
+        if (entering) {
+          columnLeft = Math.max(columnLeft, f.x)
+          columnRight = Math.min(columnRight, right)
+        }
+      }
+      const box = { x: minX, y: minY, width: maxX - minX, height: maxY - minY }
+      const start =
+        entering && columnLeft < columnRight
+          ? fitColumnStart(box, { width: el.clientWidth, height: el.clientHeight }, insetsRef.current, {
+              min: MIN_ZOOM,
+              max: 1,
+            })
+          : null
+      setViewport(start ?? fitView(el, box, 1.25))
     },
     [setViewport, fitView],
   )
@@ -552,42 +655,51 @@ export function Stage({
     if (frames.length) fitFrames(frames)
   }, [fitFrames])
 
-  useEffect(() => {
-    fitted.current = focusedPage.current === activePageId
-    focusedPage.current = null
-  }, [activePageId])
-
-  /* zoom-to-fit once the canvas arrives — unless the URL deep-links a frame,
-     a comment pinned to the canvas, or a page */
-  useEffect(() => {
-    if (!canvas || fitted.current) return
-    fitted.current = true
-    if (useStore.getState().following) return
+  /* On page entry a link wins over the saved camera, which wins over the
+     first-visit view. Lay it out before the new page paints, and not before
+     the page's frames have arrived from the room. */
+  useLayoutEffect(() => {
+    if (!canvas || !activePageId || pageLoading) return
+    if (deepLinkHandled.current && cameraPage.current === activePageId) return
+    const state = useStore.getState()
+    if (state.following) {
+      cameraPage.current = activePageId
+      return
+    }
     const params = deepLinkHandled.current ? null : new URLSearchParams(linkSearch)
-    const focusId = params?.get('frame')
-    const target = focusId ? useStore.getState().canvas?.frames.find((f) => f.id === focusId) : null
+    deepLinkHandled.current = true
+    /* a thread moved since its link was made is where it is now: the
+       linked root's own frame wins over the one the link names */
+    const linkedId = params?.get('comment')
+    const linked = linkedId ? state.comments.find((c) => c.id === linkedId && !c.parentId) : undefined
+    const focusId = linked ? linked.frameId : params?.get('frame')
+    const target = focusId ? state.canvas?.frames.find((f) => f.id === focusId) : null
     if (target) {
-      deepLinkHandled.current = true
       const element = params?.get('element')
       focusFrame(target, isElementId(element) ? elementIdSelector(element) : null)
+      /* the frame may be on another page, mounting already selected and
+         with the page switch's URL: ask its view to open the thread */
+      if (linked) useStore.getState().requestOpenThread(linked.id)
       return
     }
     const pinned = params ? linkedCanvasComment(params.get('comment')) : null
     if (pinned) {
-      deepLinkHandled.current = true
       focusPoint(pinned)
       return
     }
     const page = params?.get('page')
-    const whole = useStore.getState().canvas
+    const whole = state.canvas
     if (page && whole && page !== activePageId && canvasPages(whole).some((p) => p.id === page)) {
-      /* the page switch re-runs this effect, which then fits that page */
-      deepLinkHandled.current = true
+      /* The page switch re-runs this effect on the requested page. */
       useStore.getState().setActivePage(page)
       return
     }
-    fit()
-  }, [canvas, activePageId, fit, focusFrame, focusPoint, linkSearch])
+    if (cameraPage.current === activePageId) return
+    cameraPage.current = activePageId
+    const saved = pageCameras.current.get(activePageId)
+    if (saved) setViewport(saved)
+    else fitFrames(canvas.frames, true)
+  }, [canvas, activePageId, pageLoading, fitFrames, focusFrame, focusPoint, linkSearch, setViewport])
 
   /* wheel: pan / pinch-zoom — needs a non-passive listener. Trackpads fire
      wheel events faster than the display refreshes, so deltas accumulate and
@@ -626,10 +738,17 @@ export function Stage({
     }
 
     function onWheel(e: WheelEvent) {
-      /* let overlays with their own scrollbar scroll instead of panning */
-      if ((e.target as Element | null)?.closest('[data-stage-scroll]')) return
+      /* ⌘/Ctrl+wheel (and a trackpad pinch) zooms wherever the pointer is */
+      const zooming = e.ctrlKey || e.metaKey
+      if (!zooming) {
+        /* an overlay with its own scrollbar (an open comment thread, a menu)
+           scrolls instead of panning, and keeps the turns past its end */
+        const scroll = wheelScrollUnder(e.target, el!, e)
+        if (scroll === 'scrolls') return
+        if (scroll === 'stops') return e.preventDefault()
+      }
       e.preventDefault()
-      if (e.ctrlKey || e.metaKey) {
+      if (zooming) {
         const rect = el!.getBoundingClientRect()
         pivotX = e.clientX - rect.left
         pivotY = e.clientY - rect.top
@@ -780,7 +899,7 @@ export function Stage({
         byPointer = false
         return
       }
-      if (isTyping(e) || !byPointer) return
+      if (isTyping(e) || !byPointer || (e.target instanceof Element && e.target.closest('[role="dialog"]'))) return
       const control = (e.target as HTMLElement).closest<HTMLElement>(PRESSABLE)
       if (!control) return
       control.blur()
@@ -829,17 +948,19 @@ export function Stage({
       if (s.tool === 'zoom') s.setTool(held.previous)
     }
     function onKeyUp(e: KeyboardEvent) {
-      if (e.code === 'KeyZ' || e.key.toLowerCase() === 'z') release()
+      if (e.code === 'KeyZ' || pressedKey(e) === 'z') release()
     }
     function onKey(e: KeyboardEvent) {
       if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey || e.repeat) return
+      /* an open menu's typeahead keeps its letters, and its Esc only closes it */
+      if (isMenuTarget(e.target)) return
       if (e.key === 'Escape') {
         if (isTypingTarget(e.target) && !e.target.closest('[data-comment-ui], [data-drawing-input]')) return
         if (useStore.getState().tool !== 'select') useStore.getState().setTool('select')
         return
       }
       if (isTypingTarget(e.target)) return
-      const next = toolForKey(e.key)
+      const next = toolForKey(pressedKey(e))
       if (!next) return
       e.preventDefault()
       const previous = useStore.getState().tool
@@ -1121,8 +1242,11 @@ export function Stage({
                             : 'cursor-crosshair! [&_:not([data-comment-ui]_*)]:cursor-crosshair!'
                         : 'cursor-default',
             )}
-            style={{ ...bounds, ...paperStyle(paper) }}
-            onPointerDownCapture={drawing.onPointerDown}
+            style={{ ...bounds, ...paperStyle(paper), ...(tool === 'comment' ? commentCursorStyle() : null) }}
+            onPointerDownCapture={(e) => {
+              leaveOutsideField(e)
+              drawing.onPointerDown(e)
+            }}
             onDoubleClickCapture={drawing.onDoubleClick}
             onTouchStartCapture={drawing.onTouchStart}
             onPointerDown={onPointerDown}
@@ -1140,12 +1264,6 @@ export function Stage({
               bgAt.current = { x: e.clientX, y: e.clientY }
             }}
           >
-            {/* dot grid on its own composited layer: panning is transform-only
-            (zero paint), zooming repaints just this layer's tiny tile */}
-            <div
-              className="pointer-events-none absolute left-0 top-0 origin-top-left will-change-transform [background-image:radial-gradient(circle,var(--dot)_1.2px,transparent_1.2px)]"
-              ref={gridRef}
-            />
             {/* the pixel grid over the bare paper. Each frame draws its own over
                 its document (FrameView's PixelGrid), under its pins, threads and
                 grips, so nothing the canvas puts over the frames is gridded;
@@ -1163,41 +1281,57 @@ export function Stage({
               className="world absolute left-0 top-0 origin-top-left will-change-transform data-rezoom:**:transition-none!"
               ref={worldRef}
             >
-              <FrameLabelLayer.Provider value={labelLayer}>
-                <FrameStack frames={canvas?.frames ?? []} layoutZoom={layoutZoom} />
-              </FrameLabelLayer.Provider>
-              <GhostFrames />
-              <FlowOverlay />
-              <GuideLines stage={ref} />
-              <PrototypeOverlay />
-              <SnapGuides />
-              <CanvasComments composeAt={composeAt} onComposeDone={dismissCompose} />
-              {showCursors && <Cursors />}
-              {drawing.preview}
-              {marquee && (
-                <div
-                  className="pointer-events-none absolute bg-brand/10 [box-shadow:inset_0_0_0_calc(1px/var(--zoom,1))_var(--brand)]"
-                  style={{ left: marquee.x, top: marquee.y, width: marquee.width, height: marquee.height }}
-                />
-              )}
+              <CommentThreadLayer.Provider value={threadLayer}>
+                <FrameLabelLayer.Provider value={labelLayer}>
+                  <FrameStack frames={canvas?.frames ?? []} layoutZoom={layoutZoom} onFollowLink={followFrameLink} />
+                </FrameLabelLayer.Provider>
+                <GhostFrames />
+                <FlowOverlay />
+                <GuideLines stage={ref} />
+                <PrototypeOverlay />
+                <SnapGuides />
+                <MeasureOverlay />
+                <CanvasComments composeAt={composeAt} onComposeDone={dismissCompose} />
+                {showCursors && <Cursors />}
+                {drawing.preview}
+                {marquee && (
+                  <div
+                    className="pointer-events-none absolute bg-brand/10 [box-shadow:inset_0_0_0_calc(1px/var(--zoom,1))_var(--brand)]"
+                    style={{ left: marquee.x, top: marquee.y, width: marquee.width, height: marquee.height }}
+                  />
+                )}
+              </CommentThreadLayer.Provider>
             </div>
             {/* the selected frame's size badge, in screen px (FrameLabelLayer); after
                 the world so no frame, however it stacks, covers it */}
             <div className="pointer-events-none absolute inset-0" ref={setLabelLayer} />
+            {/* an open comment thread, in screen px above the badges, so no
+                badge covers it; CommentPin keeps it on its pin */}
+            <div data-comment-ui className="pointer-events-none absolute inset-0" ref={setThreadLayer} />
             {showRulers && <Rulers stage={ref} />}
           </div>
         </ContextMenuTrigger>
         <FollowFrame />
 
+        {pageLoading && (
+          <div
+            role="status"
+            data-page-loading
+            className="pointer-events-none absolute top-[calc(var(--chrome-top,0px)+16px)] left-1/2 z-[35] -translate-x-1/2 rounded-pill bg-surface px-3 py-1.5 text-label text-ink-soft shadow-pop"
+          >
+            {t('stage.pageLoading')}
+          </div>
+        )}
         {/* the tool rail: a vertical island beside the Layers panel on desktop
-            (the page sets --rail-left and --chrome-top), a centred strip at
-            the bottom on phones */}
+            (the page sets --rail-left and --chrome-top), a centred 36px strip
+            8px off the bottom on phones and tablets: the zoom pill, the
+            working-now line and the access banner stack from its 44px top */}
         <div
           className={cn(
-            'absolute bottom-[calc(8px+env(safe-area-inset-bottom))] left-1/2 z-[35] -translate-x-1/2 sm:bottom-4',
+            'absolute bottom-[calc(8px+env(safe-area-inset-bottom))] left-1/2 z-[35] -translate-x-1/2',
             'md:top-[calc(var(--chrome-top,0px)+10px)] md:bottom-auto md:left-[var(--rail-left,14px)] md:translate-x-0 md:transition-[left] md:duration-150',
             docked && 'md:top-[var(--chrome-top,0px)] md:bottom-0',
-            uiHidden && 'hidden',
+            (uiHidden || hideTools) && 'hidden',
           )}
         >
           {isDrawingTool(tool) && (
@@ -1266,7 +1400,7 @@ export function Stage({
 
         <ZoomControls
           labelRef={zoomLabelRef}
-          hidden={uiHidden}
+          hidden={uiHidden || hideTools}
           onZoomIn={() => ref.current && zoomCentered(ref.current, useStore.getState().viewport.zoom * 1.25)}
           onZoomOut={() => ref.current && zoomCentered(ref.current, useStore.getState().viewport.zoom / 1.25)}
           onZoomTo={(zoom) => ref.current && zoomCentered(ref.current, zoom)}
@@ -1368,7 +1502,15 @@ function byCreation(a: Frame, b: Frame) {
  *  an iframe in the DOM reloads it, so a restack must not move any. The
  *  layer isolates the stack, so the overlays after it (cursors, guides, the
  *  marquee) stay above every frame. */
-function FrameStack({ frames, layoutZoom }: { frames: Frame[]; layoutZoom: number }) {
+function FrameStack({
+  frames,
+  layoutZoom,
+  onFollowLink,
+}: {
+  frames: Frame[]
+  layoutZoom: number
+  onFollowLink: (source: Frame, href: string) => void
+}) {
   const mounted = useMemo(() => [...frames].sort(byCreation), [frames])
   const rank = useMemo(() => new Map(frames.map((f, i) => [f.id, i + 1])), [frames])
   return (
@@ -1377,7 +1519,7 @@ function FrameStack({ frames, layoutZoom }: { frames: Frame[]; layoutZoom: numbe
         f.hidden ? (
           <HiddenFrameView key={f.id} frame={f} stack={rank.get(f.id)} />
         ) : (
-          <FrameView key={f.id} frame={f} stack={rank.get(f.id)} layoutZoom={layoutZoom} />
+          <FrameView key={f.id} frame={f} stack={rank.get(f.id)} layoutZoom={layoutZoom} onFollowLink={onFollowLink} />
         ),
       )}
     </div>

@@ -36,7 +36,9 @@ import {
   ungroupElements,
   type LayerNode,
 } from '../layers'
+import { FLEX_ITEM_STYLE, flexItemStyle, groupStyle, planGroup, type GroupPlan } from '../groupLayout'
 import { isLayerLocked, saveFrameHtml, setFramesHidden, setLayersHidden, standaloneSelector } from '../layerEdits'
+import { groupableCanvasShapes, groupCanvasShapes, selectedCanvasGroup, ungroupCanvasGroup } from '../canvasGroups'
 import {
   alignBoxes,
   distributeEdges,
@@ -67,6 +69,18 @@ export function pickedLayers(): Picked | null {
   if (!picked || !frame) return null
   const selectors = pickedSelectors(s)
   return { frame, selectors, standalone: selectors.length === 1 && standaloneSelector(frame) === selectors[0] }
+}
+
+/** ⌘G has something to group: layers inside one frame, or two or more
+ *  shapes on the canvas. */
+export function canGroup(): boolean {
+  return hasInnerPick() || !!groupableCanvasShapes(selectedFrames())
+}
+
+/** ⇧⌘G has something to ungroup: layers inside one frame, or a group of
+ *  shapes on the canvas. */
+export function canUngroup(): boolean {
+  return hasInnerPick() || !!selectedCanvasGroup()
 }
 
 /** Layers inside a frame (not a standalone shape) are picked. */
@@ -265,6 +279,9 @@ function pickAfterRewrite(frame: Frame, selectors: string[]) {
 /** ⌘G (and ⌥⌘G, "Frame selection"): the picked layers wrapped in one box. */
 export function groupSelection(kind: 'group' | 'frame'): boolean {
   const p = pickedLayers()
+  /* shapes on the canvas group into the frontmost one; framing them is not a thing yet */
+  const shapes = kind === 'group' && (!p || p.standalone) ? groupableCanvasShapes(selectedFrames()) : null
+  if (shapes) return groupCanvasShapes(shapes, t('actions.groupName'))
   if (!p || p.standalone || p.frame.locked) return false
   if (p.selectors.some((s) => isLayerLocked(p.frame, s))) return false
   void groupKeepingLayout(p, kind === 'group' ? t('actions.groupName') : t('actions.frameName'))
@@ -322,7 +339,214 @@ async function inheritedLayout(frameId: string, parent: string): Promise<string 
   ].join('; ')
 }
 
+/* ---- layers placed by hand: absolute at their left and top ---- */
+
+const PLACEMENT = [
+  'position',
+  'left',
+  'top',
+  'margin-left',
+  'margin-top',
+  'translate',
+  'transform',
+  'rotate',
+  'scale',
+  'width',
+  'height',
+  'box-sizing',
+  'padding-left',
+  'padding-right',
+  'padding-top',
+  'padding-bottom',
+  'border-left-width',
+  'border-right-width',
+  'border-top-width',
+  'border-bottom-width',
+]
+
+interface Placement {
+  rect: Box
+  /** used left and top, in CSS px, from the containing block */
+  left: number
+  top: number
+  /** margin plus translate: where the box shows past its left and top, in CSS px */
+  shiftX: number
+  shiftY: number
+  /** the CSS width, as the width property means it under the box's box-sizing */
+  width: string
+  absolute: boolean
+  /** the containing block's padding corner in frame px and the scale it is
+   *  drawn at, when the element wears no transform that would hide them */
+  origin: { x: number; y: number; scaleX: number; scaleY: number } | null
+}
+
+const num = (v: string | undefined) => parseFloat(v ?? '') || 0
+
+async function placementOf(frameId: string, selector: string): Promise<Placement | null> {
+  const [info, cs] = await Promise.all([
+    inspectElement(frameId, selector),
+    computedStyles(frameId, selector, PLACEMENT),
+  ])
+  if (!info || !cs) return null
+  const translate = cs.translate && cs.translate !== 'none' ? cs.translate : '0px 0px'
+  const turned = ['transform', 'rotate', 'scale'].some((prop) => cs[prop] && cs[prop] !== 'none')
+  const [tx = 0, ty = 0] = translate.split(/\s+/).map(parseFloat)
+  const left = num(cs.left)
+  const top = num(cs.top)
+  const shiftX = num(cs['margin-left']) + tx
+  const shiftY = num(cs['margin-top']) + ty
+  const { rect } = info
+  /* the box's layout size, against which its drawn size gives the scale its
+     ancestors draw it at */
+  const border = cs['box-sizing'] === 'border-box'
+  const outerWidth =
+    num(cs.width) +
+    (border
+      ? 0
+      : num(cs['padding-left']) +
+        num(cs['padding-right']) +
+        num(cs['border-left-width']) +
+        num(cs['border-right-width']))
+  const outerHeight =
+    num(cs.height) +
+    (border
+      ? 0
+      : num(cs['padding-top']) +
+        num(cs['padding-bottom']) +
+        num(cs['border-top-width']) +
+        num(cs['border-bottom-width']))
+  const scaleX = outerWidth > 0 && rect.width > 0 ? rect.width / outerWidth : 1
+  const scaleY = outerHeight > 0 && rect.height > 0 ? rect.height / outerHeight : 1
+  return {
+    rect,
+    left,
+    top,
+    shiftX,
+    shiftY,
+    width: cs.width ?? '',
+    absolute: cs.position === 'absolute' || cs.position === 'fixed',
+    origin:
+      turned || translate.includes('%')
+        ? null
+        : { x: rect.x - (left + shiftX) * scaleX, y: rect.y - (top + shiftY) * scaleY, scaleX, scaleY },
+  }
+}
+
+/* the plan, measured on screen, in the CSS px of the box it is written in */
+function planInCss(plan: GroupPlan, scaleX: number, scaleY: number): GroupPlan {
+  if (plan.kind === 'pinned') return { ...plan, width: plan.width / scaleX, height: plan.height / scaleY }
+  return { ...plan, gap: Math.max(0, Math.round(plan.gap / (plan.direction === 'row' ? scaleX : scaleY))) }
+}
+
+/** Group layers that all sit absolute (drawn shapes, earlier groups) into
+ *  one absolute box where they were: a flex row or column when they run one
+ *  after another, else pinned at their spots. False when they are not all
+ *  placed that way, for the flow-keeping group to take over. */
+async function groupPlaced(p: Picked, name: string, flex: boolean): Promise<boolean> {
+  const placed = await Promise.all(p.selectors.map((s) => placementOf(p.frame.id, s)))
+  if (placed.some((item) => !item?.absolute)) return false
+  const items = placed as Placement[]
+  const origin = items.find((item) => item.origin)?.origin
+  if (!origin) return false
+  /* a turned layer's box is its bounds, not its layout: only pinning keeps it */
+  const measured: GroupPlan = planGroup(
+    items.map((item) => item.rect),
+    { flex, pinned: !flex && items.some((item) => !item.origin) },
+  )
+  const plan = planInCss(measured, origin.scaleX, origin.scaleY)
+  const left = (measured.x - origin.x) / origin.scaleX
+  const top = (measured.y - origin.y) / origin.scaleY
+  const live = unchangedFrame(p.frame)
+  if (!live) return true
+  const doc = new DOMParser().parseFromString(live.html, 'text/html')
+  const elementOf = (selector: string) => {
+    try {
+      return doc.querySelector(selector)
+    } catch {
+      return null
+    }
+  }
+  const ordered = plan.kind === 'flex' ? plan.order.map((i) => p.selectors[i]!) : p.selectors
+  const grouped =
+    plan.kind === 'flex'
+      ? groupElements(live.html, ordered, {
+          name,
+          style: groupStyle(plan, left, top),
+          childStyle: (i) => {
+            const el = elementOf(ordered[i]!)
+            return el ? flexItemStyle(el) : FLEX_ITEM_STYLE
+          },
+          inGivenOrder: true,
+          drawing: true,
+        })
+      : groupElements(live.html, p.selectors, {
+          name,
+          drawing: true,
+          style: groupStyle(plan, left, top),
+          /* the group's corner is the layers' new containing block; a layer
+             fixed to the viewport (an older drawing) is placed in it too */
+          childStyle: (i) => ({
+            position: 'absolute',
+            left: `${round2(items[i]!.left - left)}px`,
+            top: `${round2(items[i]!.top - top)}px`,
+          }),
+        })
+  if (!grouped) {
+    notice(t('actions.groupFailed'))
+    return true
+  }
+  saveFrameHtml(live, grouped.html)
+  pickAfterRewrite(live, [grouped.selector])
+  return true
+}
+
+const round2 = (n: number) => Math.round(n * 100) / 100
+
+/** Where each layer of an absolute group goes when the group does: absolute
+ *  at the spot it shows now, in the group's own containing block. Keyed by
+ *  layer path; empty for a group in flow, whose layers flow on in its place.
+ *  Null when a group is placed absolute but turned or scaled, which its
+ *  layers could not keep once it is gone. */
+async function freedPlacements(
+  frame: Frame,
+  selectors: string[],
+): Promise<Record<string, Record<string, string | null>> | null> {
+  const styles: Record<string, Record<string, string | null>> = {}
+  for (const selector of selectors) {
+    const group = await placementOf(frame.id, selector)
+    if (!group?.absolute) continue
+    const at = group.origin
+    if (!at) return null
+    const children = childSelectors(frame, selector)
+    const placed = await Promise.all(children.map((child) => placementOf(frame.id, child)))
+    for (const [i, child] of children.entries()) {
+      const item = placed[i]
+      if (!item) continue
+      if (item.absolute) {
+        styles[child] = {
+          position: 'absolute',
+          left: `${round2(item.left + group.left)}px`,
+          top: `${round2(item.top + group.top)}px`,
+        }
+        continue
+      }
+      if (!item.origin) return null
+      /* a flex item: where its box shows, less the margin and translate the
+         absolute box keeps, in the CSS px of the group's containing block */
+      styles[child] = {
+        position: 'absolute',
+        left: `${round2((item.rect.x - at.x) / at.scaleX - item.shiftX)}px`,
+        top: `${round2((item.rect.y - at.y) / at.scaleY - item.shiftY)}px`,
+        width: item.width,
+        'flex-shrink': null,
+      }
+    }
+  }
+  return styles
+}
+
 async function groupKeepingLayout(p: Picked, name: string) {
+  if (await groupPlaced(p, name, false)) return
   /* a root layer's box is the body, which the tree does not list */
   const parent = placeOf(buildLayerTree(p.frame.html), p.selectors[0]!)?.parent
   const style = await inheritedLayout(p.frame.id, parent?.selector ?? BODY_PATH)
@@ -346,15 +570,32 @@ async function groupKeepingLayout(p: Picked, name: string) {
 /** ⇧⌘G / ⌘⌫: each picked box gives way to what it holds. */
 export function ungroupSelection(): boolean {
   const p = pickedLayers()
-  if (!p || p.standalone || p.frame.locked) return false
-  const freed = ungroupElements(p.frame.html, p.selectors)
-  if (!freed) {
-    notice(t('actions.ungroupFailed'))
+  const canvasGroup = !p || p.standalone ? selectedCanvasGroup() : null
+  if (canvasGroup) {
+    void ungroupCanvasGroup(canvasGroup)
     return true
   }
-  saveFrameHtml(p.frame, freed.html)
-  pickAfterRewrite(p.frame, freed.selectors)
+  if (!p || p.standalone || p.frame.locked) return false
+  void ungroupKeepingPlaces(p)
   return true
+}
+
+async function ungroupKeepingPlaces(p: Picked) {
+  const placements = await freedPlacements(p.frame, p.selectors)
+  if (!placements) {
+    notice(t('actions.ungroupFailed'))
+    return
+  }
+  /* the layers were measured while the frame could change */
+  const live = unchangedFrame(p.frame)
+  if (!live) return
+  const freed = ungroupElements(live.html, p.selectors, placements)
+  if (!freed) {
+    notice(t('actions.ungroupFailed'))
+    return
+  }
+  saveFrameHtml(live, freed.html)
+  pickAfterRewrite(live, freed.selectors)
 }
 
 /** Which way a run of boxes goes, and the space between the first two:
@@ -411,6 +652,7 @@ export async function addAutoLayout(): Promise<boolean> {
       return true
     }
   }
+  if (await groupPlaced(p, t('actions.frameName'), true)) return true
   const { direction, gap } = flowOf(await rectsOf(frame.id, selectors))
   const [lead, trail] = flowMargins(direction)
   /* the run's outer margins move onto the new box, which takes its place */

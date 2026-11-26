@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useStore } from '../lib/store'
 import { roleByAgentName } from '../../shared/agents'
+import { useRoster } from '../hooks/use-roster'
 import { useIsMobile } from '../hooks/use-mobile'
 import { usePanelLayout } from '../lib/panelLayout'
 import { Sheet, SheetContent, SheetDescription, SheetTitle, SheetTrigger } from './ui/sheet'
@@ -54,15 +55,16 @@ export function Onboarding({ canvasId }: { canvasId: string }) {
   const [copied, setCopied] = useState(false)
   const [showConnect, setShowConnect] = useState(false)
 
+  const roster = useRoster()
   /* live detection — flips only ever go false -> true */
   const live = useMemo(() => {
     /* "connected" means an OUTSIDE agent over MCP — the resident team
        (Doop and the specialists) doesn't count towards the setup steps */
-    const outside = (name: string) => name !== '' && !roleByAgentName(name)
+    const outside = (name: string) => name !== '' && !roleByAgentName(name, roster)
     const agentHere = Object.values(presences).some((p) => p.kind === 'agent' && outside(p.name))
     const agentWorked = tasks.some((t) => outside(t.agentName))
     return { connected: agentHere || agentWorked, tasked: agentWorked }
-  }, [tasks, presences])
+  }, [tasks, presences, roster])
 
   /* a step, once seen live, stays done: fold the live signals into the
      stored progress as they light up */
@@ -149,19 +151,21 @@ export function Onboarding({ canvasId }: { canvasId: string }) {
           <SheetTrigger asChild>
             <Button
               variant="ghost"
-              className="pointer-events-auto absolute left-3 top-3 z-30 h-10 gap-2 rounded-full bg-surface px-3 text-xs font-semibold shadow-card"
+              /* drawn as the bar's pills are (BarPill): 36px, the pill
+                 radius, the ring, the chrome's 12px medium voice */
+              className="pointer-events-auto absolute top-3 left-3 z-30 h-9 gap-2 rounded-pill bg-surface px-3 text-label font-medium text-ink shadow-ring hover:bg-surface"
             >
               <SparkIcon size={14} className="text-brand" /> {t('canvas.gettingStarted')}
-              <span className="font-mono text-[10px] text-ink-faint">{done}/2</span>
+              <span className="text-caption text-ink-faint tabular-nums">{done}/2</span>
             </Button>
           </SheetTrigger>
           <SheetContent
             side="bottom"
-            className="max-h-[min(78svh,620px)] gap-0 overflow-y-auto rounded-t-2xl border-line bg-surface p-0 shadow-pop"
+            className="max-h-[min(78svh,620px)] gap-0 overflow-y-auto rounded-t-panel border-line bg-surface p-0 shadow-pop"
           >
             <div className="border-b border-line-soft px-5 py-4 pr-14">
-              <SheetTitle className="font-display text-lg font-extrabold">{t('canvas.gettingStarted')}</SheetTitle>
-              <SheetDescription className="mt-1 text-xs text-ink-soft">
+              <SheetTitle className="text-heading font-semibold">{t('canvas.gettingStarted')}</SheetTitle>
+              <SheetDescription className="mt-1 text-copy text-ink-soft">
                 {t('canvas.gettingStartedDescription')}
               </SheetDescription>
             </div>
@@ -169,7 +173,7 @@ export function Onboarding({ canvasId }: { canvasId: string }) {
             <Button
               variant="link"
               size="sm"
-              className="mx-5 mb-5 self-start px-0 text-xs text-ink-faint"
+              className="mx-5 mb-5 self-start px-0 text-caption text-ink-faint"
               onClick={dismiss}
             >
               {t('canvas.dismissChecklist')}

@@ -1,11 +1,14 @@
 import { create } from 'zustand'
 import { canvasPages, framePageId } from '../../shared/pages'
+import { openingPageId } from './pageLink'
 import { sortByStack } from '../../shared/frameStack'
+import { sourceOf, type SharedComponent } from '../../shared/frameCompose'
 import type { DesignToken } from '../../shared/designTokens'
+import type { AgentRole } from '../../shared/agents'
 import type {
   ActivityItem,
   AgentTask,
-  Canvas,
+  ClientCanvas,
   CanvasGuide,
   DesignDecision,
   ElementComment,
@@ -16,6 +19,8 @@ import type {
   PeerViewport,
   Presence,
   TaskFeedback,
+  WireCanvas,
+  WireFrame,
 } from '../../shared/types'
 import { roleAllows, type CanvasRole } from '../../shared/canvasRole'
 import type { SnapGuide } from './snap'
@@ -39,8 +44,11 @@ export type ComposerSend =
   | { canvasId: string; status: 'sent'; at: number }
   | { canvasId: string; status: 'error'; message: string; at: number }
 
-interface State {
-  canvas: Canvas | null
+/** Who is streaming into a frame: enough to name, colour and identify them. */
+export type StreamActor = { name: string; color: string; agentKey?: string }
+
+export interface State {
+  canvas: ClientCanvas | null
   presences: Record<string, Presence>
   cursors: Record<string, { x: number; y: number }>
   /** peers' cameras, keyed by clientId. Kept out of `presences` on purpose:
@@ -88,8 +96,9 @@ interface State {
    *  the frame and the highlighted row stay in step */
   selectedElement: { frameId: string; selector: string } | null
   /** every element picked in `selectedElement`'s frame, the primary last:
-   *  ⇧-click on the surface or ⇧/⌘-click in the Layers rail adds to it.
-   *  Read it through `pickedSelectors`, which ignores a list that no longer
+   *  ⇧-click on the surface or ⌘/Ctrl-click in the Layers rail adds to it
+   *  (⇧-click there replaces it with a range). Read it through
+   *  `pickedSelectors`, which ignores a list that no longer
    *  holds the primary */
   selectedElements: string[]
   /** the element under the pointer in the Layers panel — its frame outlines
@@ -100,9 +109,13 @@ interface State {
    *  every frame, while the pin itself hides */
   commentDrag: { id: string; x: number; y: number } | null
   /** the element properties panel is showing — opened by a pick (a click on
-   *  the frame surface or a Layers row), it then follows whatever element is
-   *  selected until it is closed */
+   *  the frame surface or a Layers row) unless `elementPanelClosed`, it then
+   *  follows whatever element is selected until it is closed. Picks go through
+   *  `panelOnPick`, never a bare `setElementPanelOpen(true)` */
   elementPanelOpen: boolean
+  /** the person closed the element panel: picks no longer open it until they
+   *  open it again from the rail. Per browser, so it sticks across visits */
+  elementPanelClosed: boolean
   /** the Layers rail is showing (desktop); the choice sticks across visits */
   layersOpen: boolean
   /** which face the Layers panel shows: the layer tree, or the design tokens */
@@ -140,7 +153,8 @@ interface State {
   /** frameId -> color, set briefly when a remote actor updates a frame */
   flashes: Record<string, { color: string; at: number }>
   /** frameId -> actor currently streaming a design into it */
-  streams: Record<string, { name: string; color: string }>
+  /** frame id -> the agent streaming into it (agentKey: shared/agentIdentity.ts) */
+  streams: Record<string, StreamActor>
   /** a transient toast — in the store so long actions fired from surfaces
    *  that close at once (a context menu) can still report back. A `busy`
    *  notice (an export in flight) stays up until the next notice replaces it. */
@@ -166,15 +180,35 @@ interface State {
   composerDrafts: Record<string, string>
   composerSend: ComposerSend | null
   /** clientId of the peer whose camera this one is tracking (Figma-style
-   *  follow); any camera move of our own lets go */
+   *  follow); any camera move of our own lets go. An agent is followed to the
+   *  frame it works on, and stays followed while it is idle and out of the
+   *  presence roster: its clientId (`agent:<name>`) is the same when it comes back */
   following: string | null
+  /** the agent being followed, as last seen, so the follow pill can name it
+   *  while it is idle and not in `presences` */
+  followedAgent: Presence | null
 
   activePageId: string | null
-  setActivePage(id: string): void
+  /** `keepFollow`: the follow loop itself moving to its leader's page, so the
+   *  follow stays on (any other page switch lets go, as a camera move does) */
+  /** pages whose frames' HTML is not here, or not current: the room's `init`
+   *  left them out, or sent one of their frames without its HTML since. Their
+   *  frames carry their metadata, and their HTML is '' or an old copy, until
+   *  `page:frames` brings the page (pageReady, src/lib/pages.ts). Every other
+   *  page, one made after the join included, the room keeps current here */
+  stalePages: Record<string, true>
+  setActivePage(id: string, opts?: { keepFollow?: boolean }): void
   setPages(pages: import('../../shared/types').CanvasPageInfo[], canvasId?: string): void
   /** paint one page locally (this client's own edit, before or after its save) */
   setPageBackgroundLocal(pageId: string, background: string | null): void
-  setCanvas(c: Canvas | null): void
+  /** `loadedPageIds`: the pages whose frames carry their HTML (every other
+   *  page is stale). Left out, a new canvas counts as whole and the same canvas
+   *  keeps the pages it had. A frame without `html` keeps the copy here, or ''. */
+  setCanvas(c: ClientCanvas | WireCanvas | null, loadedPageIds?: readonly string[]): void
+  /** a page's frames whole, answering `page:load`: the page is loaded from now on */
+  setPageFrames(pageId: string, frames: Frame[]): void
+  /** the room stopped keeping this page current here (`page:dropped`): read it again before it shows */
+  setPageStale(pageId: string): void
   setConnected(v: boolean): void
   setCanvasNotFound(v: boolean): void
   setSignInRequired(v: boolean): void
@@ -198,16 +232,25 @@ interface State {
   upsertFeedback(fb: TaskFeedback): void
   setComments(comments: ElementComment[]): void
   upsertComment(c: ElementComment): void
-  upsertFrame(f: Frame): void
+  /** a frame from the room; one without `html` keeps what is here, and a
+   *  loaded page it lands on is loaded no more until it is read again */
+  upsertFrame(f: Frame | WireFrame): void
   patchFrameLocal(frameId: string, patch: Partial<Frame>): void
   removeFrame(frameId: string): void
   renameCanvasLocal(name: string): void
+  closeSharingLocal(): void
   /** upsert (doc set) or remove (doc null) a style guide on the open canvas */
   setGuidelineLocal(name: string, doc: GuidelineDoc | null): void
   /** a component changed in the room, or was deleted (null) */
-  setComponentLocal(id: string, component: import('../../shared/components').ComponentDef | null): void
+  setComponentLocal(id: string, component: import('../../shared/components').WireComponentDef | null): void
+  /** counts what the workspace's libraries have published or withdrawn since this
+   *  page loaded: the Components panel reads its library again when it moves */
+  libraryTick: number
+  bumpLibrary(): void
   /** replace the open canvas's design tokens and themes (the room sends the whole list) */
   setTokensLocal(tokens: DesignToken[], themes: string[]): void
+  /** the canvas's Doop Agent team changed (a room `team` message) */
+  setTeamLocal(team: AgentRole[]): void
   /** pin (reference set) or unpin (null) a Memory reference on the open canvas */
   setReferenceLocal(id: string, reference: MemoryReference | null): void
   setDecisions(decisions: DesignDecision[]): void
@@ -250,6 +293,7 @@ interface State {
   closeCtxMenu(): void
   setSelectedElement(el: { frameId: string; selector: string } | null): void
   setHoveredLayer(el: { frameId: string; selector: string } | null): void
+  /** ask the Layers panel to rename a frame or layer, opening the panel */
   setCommentDrag(drag: { id: string; x: number; y: number } | null): void
   /** an element picked by the user — on the frame surface or in the Layers
    *  rail: selects it and opens its properties panel; picking nothing clears
@@ -262,6 +306,10 @@ interface State {
    *  the primary (⌘A inside a frame, a keyboard walk of the tree) */
   pickElements(frameId: string, selectors: string[]): void
   setElementPanelOpen(v: boolean): void
+  /** the person closed the element panel: it stays closed across picks */
+  closeElementPanel(): void
+  /** the person opened the element panel again: picks open it once more */
+  openElementPanel(): void
   setLayersOpen(v: boolean): void
   setLayersTab(tab: 'layers' | 'components' | 'tokens'): void
   toggleUiHidden(): void
@@ -276,33 +324,64 @@ interface State {
   /** add or move (guide set) or remove (null) a ruler guide on the open canvas */
   setGuideLocal(id: string, guide: CanvasGuide | null): void
   flash(frameId: string, color: string): void
-  setStream(frameId: string, actor: { name: string; color: string } | null): void
+  setStream(frameId: string, actor: StreamActor | null): void
 }
 
 const LAYERS_OPEN_KEY = 'doop:layers-open'
+const ELEMENT_PANEL_CLOSED_KEY = 'doop:element-panel-closed'
 const RULERS_KEY = 'doop:rulers'
 /* longer than the slowest real export (Canva: render + verify, ~3 min) */
 const BUSY_NOTICE_MAX_MS = 5 * 60_000
 
-function readLayersOpen(): boolean {
+/** a per-browser on/off choice, stored as '1' / '0'; unset or unreadable is `fallback` */
+function readFlag(key: string, fallback: boolean): boolean {
   try {
-    return localStorage.getItem(LAYERS_OPEN_KEY) !== '0'
+    const value = localStorage.getItem(key)
+    return value === null ? fallback : value === '1'
   } catch {
-    return true
+    return fallback
   }
 }
 
-function readRulers(): boolean {
+function writeFlag(key: string, on: boolean): void {
   try {
-    return localStorage.getItem(RULERS_KEY) === '1'
+    localStorage.setItem(key, on ? '1' : '0')
   } catch {
-    return false
+    /* private mode: the choice just doesn't stick */
   }
+}
+
+/** ends a follow: the leader and, for an agent, its last-seen record */
+const UNFOLLOW = { following: null, followedAgent: null }
+
+/**
+ * The server renders a frame again, with no write of it, when a component it uses changes
+ * its markup: `html` and `rendered` move and `updatedAt` stays (the frame stores a reference
+ * to the component, so nothing a save could conflict with changed). A copy of the frame that
+ * left the server before that (a save's HTTP response overtaken by the room's message) has
+ * the same `updatedAt` and the older rendering: it keeps its other fields and takes the
+ * newer rendering this browser already holds.
+ */
+function newestRendering(incoming: Frame, held: Frame | undefined): Frame {
+  if (!held || held.updatedAt !== incoming.updatedAt) return incoming
+  if ((held.rendered ?? 0) <= (incoming.rendered ?? 0) || held.html === undefined) return incoming
+  return { ...incoming, html: held.html, rendered: held.rendered }
+}
+
+/** A frame as the store keeps it: its source. What the canvas supplies to every frame
+ *  (component stylesheets, token values) is composed in where a frame is shown
+ *  (src/lib/frameCompose.ts), so a frame that arrives carrying those blocks (stored before
+ *  lean storage, or sent by a server that still writes them) is taken without them. */
+function asSource<F extends { html?: string }>(frame: F, components: readonly SharedComponent[] | undefined): F {
+  if (typeof frame.html !== 'string') return frame
+  const html = sourceOf(frame.html, components ?? [])
+  return html === frame.html ? frame : { ...frame, html }
 }
 
 export const useStore = create<State>((set, get) => ({
   canvas: null,
   activePageId: null,
+  stalePages: {},
   presences: {},
   cursors: {},
   peerViewports: {},
@@ -316,6 +395,7 @@ export const useStore = create<State>((set, get) => ({
   limitWall: false,
   allowanceVersion: 0,
   flyTo: null,
+  followedAgent: null,
   threadRequest: null,
   composerFocusAt: 0,
   composerDrafts: {},
@@ -334,13 +414,14 @@ export const useStore = create<State>((set, get) => ({
   hoveredLayer: null,
   commentDrag: null,
   elementPanelOpen: false,
-  layersOpen: readLayersOpen(),
+  elementPanelClosed: readFlag(ELEMENT_PANEL_CLOSED_KEY, false),
+  layersOpen: readFlag(LAYERS_OPEN_KEY, true),
   layersTab: 'layers',
   uiHidden: false,
   prototypeMode: false,
   viewport: { x: 0, y: 0, zoom: 1 },
   snapGuides: [],
-  rulers: readRulers(),
+  rulers: readFlag(RULERS_KEY, false),
   viewOptions: readViewOptions(),
   selectedGuideId: null,
   outlines: false,
@@ -353,21 +434,61 @@ export const useStore = create<State>((set, get) => ({
   flashes: {},
   streams: {},
 
-  setCanvas: (canvas) =>
-    set((s) => ({
-      /* the stage paints frames in array order: back to front */
-      canvas: canvas && { ...canvas, frames: sortByStack(canvas.frames) },
-      /* leaving a canvas (CanvasPage unmounts or its id changes) ends ⌘.
+  setCanvas: (wire, loadedPageIds) =>
+    set((s) => {
+      const canvas: ClientCanvas | null = wire && {
+        ...wire,
+        frames: wire.frames.map((f) => withHtml(asSource(f, wire.components), s.canvas)),
+      }
+      return {
+        /* the stage paints frames in array order: back to front */
+        canvas: canvas && { ...canvas, frames: sortByStack(canvas.frames) },
+        stalePages: !canvas
+          ? {}
+          : loadedPageIds
+            ? Object.fromEntries(
+                canvasPages(canvas)
+                  .filter((page) => !loadedPageIds.includes(page.id))
+                  .map((page) => [page.id, true as const]),
+              )
+            : canvas.id === s.canvas?.id
+              ? s.stalePages
+              : {},
+        /* leaving a canvas (CanvasPage unmounts or its id changes) ends ⌘.
          hide-UI, so the next canvas never opens with its chrome gone; a
          re-join of the same canvas keeps it */
-      uiHidden: canvas ? s.uiHidden : false,
-      activePageId: canvas
-        ? canvas.id === s.canvas?.id && canvasPages(canvas).some((p) => p.id === s.activePageId)
-          ? s.activePageId
-          : canvasPages(canvas)[0]!.id
-        : null,
-    })),
-  setActivePage: (id) =>
+        uiHidden: canvas ? s.uiHidden : false,
+        /* an agent follow outlives the agent's presence, not the canvas */
+        ...(s.following && canvas?.id !== s.canvas?.id ? UNFOLLOW : {}),
+        activePageId: canvas
+          ? canvas.id === s.canvas?.id && canvasPages(canvas).some((p) => p.id === s.activePageId)
+            ? s.activePageId
+            : /* a canvas being opened starts on the page its URL asks for, so
+               the first paint is already that page */
+              openingPageId(canvas, typeof location === 'undefined' ? '' : location.search)
+          : null,
+      }
+    }),
+  setPageFrames: (pageId, frames) =>
+    set((s) => {
+      if (!s.canvas) return {}
+      const components = s.canvas.components
+      const fresh = new Map(
+        frames.filter((f) => f.canvasId === s.canvas!.id).map((f) => [f.id, asSource(f, components)]),
+      )
+      const merged = s.canvas.frames.map((f) => fresh.get(f.id) ?? f)
+      for (const f of s.canvas.frames) fresh.delete(f.id)
+      return {
+        canvas: { ...s.canvas, frames: sortByStack([...merged, ...fresh.values()]) },
+        stalePages: withoutPage(s.stalePages, pageId),
+      }
+    }),
+  setPageStale: (pageId) =>
+    set((s) => {
+      if (!s.canvas || s.stalePages[pageId] || !canvasPages(s.canvas).some((p) => p.id === pageId)) return {}
+      return { stalePages: { ...s.stalePages, [pageId]: true as const } }
+    }),
+  setActivePage: (id, opts) =>
     set((s) => {
       if (!s.canvas || !canvasPages(s.canvas).some((p) => p.id === id) || s.activePageId === id) return {}
       return {
@@ -378,7 +499,7 @@ export const useStore = create<State>((set, get) => ({
         elementPanelOpen: false,
         inspectorOpen: false,
         ctxMenu: null,
-        following: null,
+        ...(opts?.keepFollow ? {} : UNFOLLOW),
         snapGuides: [],
         selectedGuideId: null,
         viewport: { x: 0, y: 0, zoom: 1 },
@@ -416,7 +537,7 @@ export const useStore = create<State>((set, get) => ({
               inspectorOpen: false,
               elementPanelOpen: false,
               ctxMenu: null,
-              following: null,
+              ...UNFOLLOW,
             }
           : {}),
       }
@@ -429,8 +550,13 @@ export const useStore = create<State>((set, get) => ({
     set((s) => ({
       presences: Object.fromEntries(list.map((p) => [p.clientId, p])),
       peerViewports: Object.fromEntries(list.flatMap((p) => (p.viewport ? [[p.clientId, p.viewport]] : []))),
-      /* a fresh roster (new canvas, reconnect) without our leader ends the follow */
-      ...(s.following && !list.some((p) => p.clientId === s.following) ? { following: null } : {}),
+      /* a fresh roster (new canvas, reconnect) without our leader ends the
+         follow, unless the leader is an agent: it is only idle */
+      ...(s.following && !list.some((p) => p.clientId === s.following)
+        ? s.followedAgent?.clientId === s.following
+          ? { followedAgent: s.presences[s.following] ?? s.followedAgent }
+          : UNFOLLOW
+        : {}),
     })),
   upsertPresence: (p) =>
     set((s) => ({
@@ -445,15 +571,24 @@ export const useStore = create<State>((set, get) => ({
       delete presences[clientId]
       delete cursors[clientId]
       delete peerViewports[clientId]
-      /* the one we were following left: nothing to track any more */
-      return { presences, cursors, peerViewports, ...(s.following === clientId ? { following: null } : {}) }
+      /* the person we were following left: nothing to track any more. An
+         agent leaves the roster whenever it goes idle and is still followed,
+         from where it was last seen */
+      const leader =
+        s.following !== clientId
+          ? {}
+          : s.followedAgent?.clientId === clientId
+            ? { followedAgent: s.presences[clientId] ?? s.followedAgent }
+            : UNFOLLOW
+      return { presences, cursors, peerViewports, ...leader }
     }),
   setPeerViewport: (clientId, viewport) =>
     set((s) => (s.presences[clientId] ? { peerViewports: { ...s.peerViewports, [clientId]: viewport } } : {})),
   setFollowing: (following) => {
+    const leader = following ? get().presences[following] : undefined
     const pageId = following ? get().peerViewports[following]?.pageId : undefined
     if (pageId) get().setActivePage(pageId)
-    set({ following })
+    set({ following: leader || !following ? following : null, followedAgent: leader?.kind === 'agent' ? leader : null })
   },
   setViewportFollowing: (viewport) => set({ viewport }),
   setCursor: (clientId, x, y) => set((s) => ({ cursors: { ...s.cursors, [clientId]: { x, y } } })),
@@ -496,17 +631,26 @@ export const useStore = create<State>((set, get) => ({
         : [fb, ...s.feedback].slice(0, 100)
       return { feedback }
     }),
-  upsertFrame: (f) =>
+  upsertFrame: (wire) =>
     set((s) => {
-      if (!s.canvas || f.canvasId !== s.canvas.id) return {}
+      if (!s.canvas || wire.canvasId !== s.canvas.id) return {}
+      const f = newestRendering(
+        withHtml(asSource(wire, s.canvas.components), s.canvas),
+        s.canvas.frames.find((x) => x.id === wire.id),
+      )
       const frames = sortByStack(
         s.canvas.frames.some((x) => x.id === f.id)
           ? s.canvas.frames.map((x) => (x.id === f.id ? f : x))
           : [...s.canvas.frames, f],
       )
-      const hidden = s.selectedIds.includes(f.id) && framePageId(s.canvas, f) !== s.activePageId
+      const pageId = framePageId(s.canvas, f)
+      /* the room left the HTML out: this page's copy of the frame may be stale,
+         so the page is read again before it shows */
+      const stale = wire.html === undefined && !s.stalePages[pageId]
+      const hidden = s.selectedIds.includes(f.id) && pageId !== s.activePageId
       return {
         canvas: { ...s.canvas, frames },
+        ...(stale ? { stalePages: { ...s.stalePages, [pageId]: true as const } } : {}),
         ...(hidden
           ? {
               selectedIds: s.selectedIds.filter((id) => id !== f.id),
@@ -521,7 +665,8 @@ export const useStore = create<State>((set, get) => ({
   patchFrameLocal: (frameId, patch) =>
     set((s) => {
       if (!s.canvas) return {}
-      const frames = s.canvas.frames.map((f) => (f.id === frameId ? { ...f, ...patch } : f))
+      const local = asSource(patch, s.canvas.components)
+      const frames = s.canvas.frames.map((f) => (f.id === frameId ? { ...f, ...local } : f))
       return { canvas: { ...s.canvas, frames: 'z' in patch ? sortByStack(frames) : frames } }
     }),
   removeFrame: (frameId) =>
@@ -540,12 +685,28 @@ export const useStore = create<State>((set, get) => ({
       }
     }),
   renameCanvasLocal: (name) => set((s) => (s.canvas ? { canvas: { ...s.canvas, name } } : {})),
+  closeSharingLocal: () =>
+    set((s) =>
+      s.canvas
+        ? {
+            canvas: {
+              ...s.canvas,
+              linkAccess: undefined,
+              publishedAt: undefined,
+              description: undefined,
+              category: undefined,
+            },
+          }
+        : {},
+    ),
   setComponentLocal: (id, component) =>
     set((s) => {
       if (!s.canvas) return {}
       const others = (s.canvas.components ?? []).filter((def) => def.id !== id)
       return { canvas: { ...s.canvas, components: component ? [...others, component] : others } }
     }),
+  libraryTick: 0,
+  bumpLibrary: () => set((s) => ({ libraryTick: s.libraryTick + 1 })),
   setGuidelineLocal: (name, doc) =>
     set((s) => {
       if (!s.canvas) return {}
@@ -558,6 +719,7 @@ export const useStore = create<State>((set, get) => ({
     }),
   setTokensLocal: (tokens, themes) =>
     set((s) => (s.canvas ? { canvas: { ...s.canvas, tokens, tokenThemes: themes } } : {})),
+  setTeamLocal: (team) => set((s) => (s.canvas ? { canvas: { ...s.canvas, team } } : {})),
   setReferenceLocal: (id, reference) =>
     set((s) => {
       if (!s.canvas) return {}
@@ -700,16 +862,20 @@ export const useStore = create<State>((set, get) => ({
           : s
       const same = s.selectedElement?.frameId === el.frameId && s.selectedElement?.selector === el.selector
       const collapse = only && pickedSelectors(s).length > 1
-      if (same && s.elementPanelOpen && !collapse) return s
+      if (same && (s.elementPanelOpen || s.elementPanelClosed) && !collapse) return s
       return same && !collapse
         ? { elementPanelOpen: true }
-        : { selectedElement: el, selectedElements: [el.selector], elementPanelOpen: true }
+        : { selectedElement: el, selectedElements: [el.selector], ...panelOnPick(s) }
     }),
   toggleElement: (el) =>
     set((s) => {
       const picked = s.selectedElement?.frameId === el.frameId ? pickedSelectors(s) : []
       if (!picked.includes(el.selector)) {
-        return { selectedElement: el, selectedElements: [...picked, el.selector], elementPanelOpen: true }
+        return {
+          selectedElement: el,
+          selectedElements: [...picked, el.selector],
+          ...panelOnPick(s),
+        }
       }
       const rest = picked.filter((x) => x !== el.selector)
       const primary = rest.at(-1)
@@ -720,15 +886,24 @@ export const useStore = create<State>((set, get) => ({
   pickElements: (frameId, selectors) => {
     const primary = selectors.at(-1)
     if (!primary) return
-    set({ selectedElement: { frameId, selector: primary }, selectedElements: selectors, elementPanelOpen: true })
+    set((s) => ({
+      selectedElement: { frameId, selector: primary },
+      selectedElements: selectors,
+      ...panelOnPick(s),
+    }))
   },
   setElementPanelOpen: (elementPanelOpen) => set({ elementPanelOpen }),
+  /* closing the panel empties the slot: the frame Inspector it covered goes too */
+  closeElementPanel: () => {
+    writeFlag(ELEMENT_PANEL_CLOSED_KEY, true)
+    set({ elementPanelOpen: false, elementPanelClosed: true, inspectorOpen: false })
+  },
+  openElementPanel: () => {
+    writeFlag(ELEMENT_PANEL_CLOSED_KEY, false)
+    set({ elementPanelOpen: true, elementPanelClosed: false })
+  },
   setLayersOpen: (layersOpen) => {
-    try {
-      localStorage.setItem(LAYERS_OPEN_KEY, layersOpen ? '1' : '0')
-    } catch {
-      /* private mode: the choice just doesn't stick */
-    }
+    writeFlag(LAYERS_OPEN_KEY, layersOpen)
     set({ layersOpen })
   },
   setLayersTab: (layersTab) => set({ layersTab }),
@@ -736,18 +911,14 @@ export const useStore = create<State>((set, get) => ({
   toggleUiHidden: () => set((s) => ({ uiHidden: !s.uiHidden, ...(s.uiHidden ? {} : { selectedGuideId: null }) })),
   setPrototypeMode: (prototypeMode) => set({ prototypeMode }),
   /* every ordinary camera move (pan, zoom, fit, fly-to) is ours, so it ends a follow */
-  setViewport: (viewport) => set({ viewport, following: null }),
+  setViewport: (viewport) => set({ viewport, ...UNFOLLOW }),
   /* fires on every pointermove during a drag — skip the no-op transitions
      so unsnapped drags don't render the (empty) guide layer each frame */
   setSnapGuides: (snapGuides) =>
     set((s) => (snapGuides.length === 0 && s.snapGuides.length === 0 ? s : { snapGuides })),
   toggleRulers: () =>
     set((s) => {
-      try {
-        localStorage.setItem(RULERS_KEY, s.rulers ? '0' : '1')
-      } catch {
-        /* private mode: the choice just doesn't stick */
-      }
+      writeFlag(RULERS_KEY, !s.rulers)
       return { rulers: !s.rulers, ...(s.rulers ? { selectedGuideId: null } : {}) }
     }),
   toggleOutlines: () =>
@@ -829,4 +1000,24 @@ export function toolAllowed(tool: Tool, role: CanvasRole): boolean {
   if (isDrawingTool(tool)) return roleAllows(role, 'edit')
   if (tool === 'comment') return roleAllows(role, 'comment')
   return true
+}
+
+/** A frame from the room as the store keeps it: one sent without its HTML
+ *  keeps the copy here (stale, its page not loaded) or ''. */
+/** What a pick does to the properties slot: the element panel opens, unless the
+ *  person closed it, when the slot empties (a frame Inspector left showing would
+ *  describe the frame while an element is picked, and hide the rail's way back). */
+function panelOnPick(s: State): Partial<State> {
+  return s.elementPanelClosed ? { elementPanelOpen: false, inspectorOpen: false } : { elementPanelOpen: true }
+}
+
+function withHtml(frame: Frame | WireFrame, canvas: ClientCanvas | null): Frame {
+  if (typeof frame.html === 'string') return frame as Frame
+  const kept = canvas?.id === frame.canvasId ? canvas.frames.find((f) => f.id === frame.id)?.html : undefined
+  return { ...frame, html: kept ?? '' }
+}
+
+function withoutPage(pages: Record<string, true>, pageId: string): Record<string, true> {
+  const { [pageId]: _dropped, ...rest } = pages
+  return rest
 }

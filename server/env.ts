@@ -105,6 +105,7 @@ const nonNegativeInt = int(0)
 const schema = {
   NODE_ENV: str({ choices: ['development', 'test', 'production'], default: 'development' }),
   PORT: port({ default: 4400 }),
+  HOST: str({ default: undefined }),
   /* the interface language for anyone who has not picked one in Settings */
   DEFAULT_LOCALE: str({ choices: LOCALES, default: FALLBACK_LOCALE }),
   /* unset = embedded Postgres (PGlite) under ./data/pg */
@@ -122,6 +123,8 @@ const schema = {
   /* unset in production = user credentials stored unencrypted (boot warns) */
   SECRETS_ENCRYPTION_KEYS: secretKeys({ default: [], devDefault: DEV_SECRET_KEYS }),
   TRUSTED_ORIGINS: list({ default: [] }),
+  AUTH_IP_HEADERS: list({ default: [] }),
+  AUTH_TRUSTED_PROXIES: list({ default: [] }),
   SIGNUP_EMAIL_DOMAINS: list({ default: [] }),
   ADMIN_EMAILS: list({ default: [] }),
   REQUIRE_EMAIL_VERIFICATION: bool({ default: true }),
@@ -135,6 +138,8 @@ const schema = {
   MICROSOFT_CLIENT_ID: str({ default: undefined }),
   MICROSOFT_CLIENT_SECRET: str({ default: undefined }),
   MICROSOFT_TENANT_ID: str({ default: 'common' }),
+  GITHUB_CLIENT_ID: str({ default: undefined }),
+  GITHUB_CLIENT_SECRET: str({ default: undefined }),
   APPLE_CLIENT_ID: str({ default: undefined }),
   APPLE_CLIENT_SECRET: str({ default: undefined }),
   APPLE_APP_BUNDLE_IDENTIFIER: str({ default: undefined }),
@@ -147,6 +152,8 @@ const schema = {
   SMTP_PASS: str({ default: undefined }),
   SMTP_SECURE: bool({ default: false }),
   EMAIL_FROM: str({ default: 'doop <no-reply@localhost>' }),
+  /** where the app's Feedback button sends a person's note; unset = no button */
+  FEEDBACK_EMAIL: str({ default: undefined }),
 
   /* ------------------------------------------------------ webhooks */
   WEBHOOK_ALLOW_PRIVATE_URLS: bool({ default: false }),
@@ -160,9 +167,40 @@ const schema = {
   AZURE_OPENAI_API_VERSION: str({ default: undefined }),
   AZURE_OPENAI_REASONING_EFFORT: str({ default: undefined }),
   RESIDENT_TASK_LIMIT: nonNegativeInt({ default: 0 }),
-  DOOP_AGENT_MODEL: str({ default: 'claude-opus-5' }),
-  DOOP_DISTILL_MODEL: str({ default: 'claude-haiku-4-5-20251001' }),
-  DOOP_AGENT_OPENAI_MODEL: str({ default: 'gpt-5.6-terra' }),
+  /* incident kill switch: a frame write stops pushing a changed main into every
+     other frame synchronously (each catches up on its own next write) */
+  DOOP_DEFER_COMPONENT_PROPAGATION: bool({ default: false }),
+  /* temporary kill switch: false stores every frame with its component stylesheets and
+     token block written in, as before lean storage, and token changes rewrite frames again.
+     Reads compose either way (server/frameCompose.ts). To be removed once lean storage
+     has run in production */
+  DOOP_LEAN_FRAME_STORAGE: bool({ default: true }),
+  /* temporary kill switch: false stores every frame with its component instances written
+     out in full again, as before compact storage, so a change to a component's markup
+     rewrites the loaded frames using it. Reads expand either way, whatever mix of the two
+     forms the database holds (server/frameRest.ts). To be removed once compact storage
+     has run in production */
+  DOOP_COMPACT_FRAME_STORAGE: bool({ default: true }),
+  /* what one operation (a request, a tool call, one frame of the propagation queue) may
+     hand the component engine's HTML parser, and how long it may spend in it
+     (server/workBudget.ts); 0 lifts a limit */
+  DOOP_WORK_BUDGET_PARSE_MB: nonNegativeInt({ default: 96 }),
+  DOOP_WORK_BUDGET_MS: nonNegativeInt({ default: 2000 }),
+  /* what a store write outside any write boundary does (server/journal.ts): nothing, a
+     logged line per kind of write, or a thrown error. Unset: 'warn' in development, 'off'
+     in production and under test (the integration harness sets 'throw'). */
+  DOOP_WRITE_BOUNDARY: str({ choices: ['', 'off', 'warn', 'throw'], default: '' }),
+  /* the stall watchdog (server/stallWatchdog.ts): a watcher thread logs the operations in
+     flight once the event loop has not answered for STALL_LOG_MS, and ends the process
+     (for the supervisor to restart it) after STALL_EXIT_MS; an operation that took
+     SLOW_OP_LOG_MS is logged when it finishes. 0 switches one off. The exit is off
+     outside production, where a debugger's breakpoint looks exactly like a stall. */
+  STALL_LOG_MS: nonNegativeInt({ default: 5000 }),
+  STALL_EXIT_MS: nonNegativeInt({ default: 60_000, devDefault: 0 }),
+  SLOW_OP_LOG_MS: nonNegativeInt({ default: 2000 }),
+  DOOP_AGENT_MODEL: str({ default: 'claude-opus-5-5' }),
+  DOOP_DISTILL_MODEL: str({ default: 'claude-haiku-5-5' }),
+  DOOP_AGENT_OPENAI_MODEL: str({ default: 'gpt-6.2-sol' }),
   DOOP_AGENT_OPENAI_EFFORT: str({ default: 'medium' }),
   DOOP_AGENT_OPENROUTER_MODEL: str({ default: DEFAULT_OPENROUTER_MODEL }),
   DOOP_AGENT_GEMINI_MODEL: str({ default: DEFAULT_GEMINI_MODEL }),
@@ -183,9 +221,10 @@ const schema = {
   /* the Codex backend's model catalog; it answers for a Codex CLI version it
      knows, so the pin moves with the CLI releases */
   CHATGPT_MODELS_URL: str({ default: 'https://chatgpt.com/backend-api/codex/models' }),
-  CHATGPT_CODEX_CLIENT_VERSION: str({ default: '0.163.0' }),
+  CHATGPT_CODEX_CLIENT_VERSION: str({ default: '0.171.0' }),
   CHATGPT_ORIGINATOR: str({ default: 'codex_cli_rs' }),
   OPENAI_RESPONSES_URL: str({ default: 'https://api.openai.com/v1/responses' }),
+  OPENAI_IMAGES_URL: str({ default: 'https://api.openai.com/v1/images/generations' }),
   OPENAI_MODELS_URL: str({ default: 'https://api.openai.com/v1/models' }),
   OPENROUTER_CHAT_URL: str({ default: 'https://openrouter.ai/api/v1/chat/completions' }),
   GEMINI_OPENAI_CHAT_URL: str({
@@ -255,6 +294,16 @@ const schema = {
   /* ---------------------------------------------------- screenshots */
   CHROME_PATH: str({ default: undefined }),
   CHROME_NO_SANDBOX: bool({ default: false }),
+  /* pages the shared Chromium renders at once (renderBrowser.ts) */
+  RENDER_CONCURRENCY: nonNegativeInt({ default: 4 }),
+  /* a remote Chrome over the DevTools protocol instead of the local one
+     (Cloudflare Browser Run, browserless, a renderer service) */
+  REMOTE_BROWSER_URL: str({ default: undefined }),
+  REMOTE_BROWSER_TOKEN: str({ default: undefined }),
+  /* the remote browser cannot reach this server's private network (a hosted
+     provider such as Cloudflare): it may fetch public URLs itself instead of
+     through the DNS-pinned proxy. Never set it for a self-hosted renderer */
+  REMOTE_BROWSER_ISOLATED: bool({ default: false }),
 
   /* ------------------------------------------------------ analytics */
   POSTHOG_KEY: str({ default: undefined }),
@@ -326,7 +375,14 @@ function parse() {
      something other than production; doop treats an unset NODE_ENV as
      development (bun run dev, the test harness), so say so */
   source.NODE_ENV ??= 'development'
-  return cleanEnv(source, schema, { reporter })
+  const parsed = cleanEnv(source, schema, { reporter })
+  /* the stall line names what is in flight before the process is ended: a log threshold
+     above the exit threshold would be a line nobody gets to read first */
+  if (parsed.STALL_LOG_MS > 0 && parsed.STALL_EXIT_MS > 0 && parsed.STALL_LOG_MS > parsed.STALL_EXIT_MS)
+    throw new Error(
+      `Invalid environment configuration:\n  STALL_LOG_MS: ${parsed.STALL_LOG_MS} is greater than STALL_EXIT_MS (${parsed.STALL_EXIT_MS}); the log threshold must come first`,
+    )
+  return parsed
 }
 
 export type Env = ReturnType<typeof parse>

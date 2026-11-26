@@ -1,8 +1,10 @@
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { composeFrame, showFrameHtml } from '../lib/frameCompose'
 import { frameDesignPoint, frameWorldPoint, rotateVector, turnedDropRect } from '../../shared/frameRotation'
 import { createPortal } from 'react-dom'
 import type { Frame } from '../../shared/types'
 import { isCanvasElement } from '../lib/drawing'
+import { standaloneSelector } from '../lib/layerEdits'
 import { elementPath } from '../lib/layers'
 import {
   drawingDropFrame,
@@ -24,6 +26,7 @@ import {
   type LayoutDrop,
 } from '../lib/frameBridge'
 import { gesture } from '../lib/gesture'
+import { iframeBleed } from '../lib/frameBleed'
 import { FRAME_DOCUMENTS_TAKE_ZOOM_AS_DENSITY, counterZoom } from '../lib/layoutZoom'
 import { visibleGuides } from '../lib/guides'
 import { snapFrame } from '../lib/snap'
@@ -70,6 +73,9 @@ export interface ElementMoveHit {
 export function useElementMove(frame: Frame, layoutZoom: number) {
   const t = useT()
   const [preview, setPreview] = useState<Preview | null>(null)
+  /* a document of its own: the canvas's token values and component styles go in */
+  const previewHtml = preview?.html
+  const previewDocument = useMemo(() => (previewHtml ? composeFrame(previewHtml) : ''), [previewHtml])
   /* the gesture under way: its element's outline, grips and size badge stay
      hidden until it lands, so only the element itself shows */
   const [movingOwner, setMovingOwner] = useState<object | null>(null)
@@ -115,11 +121,17 @@ export function useElementMove(frame: Frame, layoutZoom: number) {
     if ((e.altKey && !duplicating) || !e.isPrimary || !frame.html) return false
     if (!e.shiftKey && s.selectedIds.includes(frame.id) && s.selectedIds.length > 1) return false
     const standalone = isCanvasElement(frame.html)
+    const shell = standalone ? standaloneSelector(frame) : null
     /* a standalone element is moved like a frame — live under the pointer,
        snapping to guides, one undo step — by the frame drag, which hands a
-       drop over a frame on to moveDrawing; there is no layer inside it to
-       move on its own */
-    if (standalone) return false
+       drop over a frame on to moveDrawing; once a layer inside it is picked
+       (a group entered), a press inside is that level's, as in a frame */
+    const entered =
+      standalone &&
+      s.selectedElement?.frameId === frame.id &&
+      !!shell &&
+      pickedSelectors(s).some((selector) => selector !== shell)
+    if (standalone && !entered) return false
     const surface = e.currentTarget
     const stage = surface.closest('.stage')
     const world = stage?.querySelector('.world')
@@ -138,7 +150,9 @@ export function useElementMove(frame: Frame, layoutZoom: number) {
       if (!iframe) return { x: 0, y: 0 }
       const b = iframe.getBoundingClientRect()
       const centre = frameDesignPoint(toWorld(b.left + b.width / 2, b.top + b.height / 2), frame)
-      return { x: centre.x - iframe.offsetWidth / 2, y: centre.y - iframe.offsetHeight / 2 }
+      /* the iframe reaches its bleed margin past the document on every side */
+      const margin = iframeBleed(iframe)
+      return { x: centre.x - iframe.offsetWidth / 2 + margin, y: centre.y - iframe.offsetHeight / 2 + margin }
     })()
     /* the document's top-left corner on the canvas, for the layout drop marks */
     const contentOrigin = frameWorldPoint(contentOffset, frame)
@@ -172,6 +186,8 @@ export function useElementMove(frame: Frame, layoutZoom: number) {
     let layerReady: Promise<ElementInfo | null> | null = null
     let layerPoint: { x: number; y: number; pointerX: number; pointerY: number } | null = null
     let layerWork: Promise<void> = Promise.resolve()
+    /* the point the last finished preview put the layer at */
+    let appliedPoint: { x: number; y: number; pointerX: number; pointerY: number } | null = null
     let inFlight = false
     let picked = false
     /* an ⌥⇧ drag's copy, once it is in the live document: the gesture moves
@@ -256,7 +272,7 @@ export function useElementMove(frame: Frame, layoutZoom: number) {
       const planned = planCopy()
       if (!planned) return null
       noteFrameDocument(frame.id, null)
-      if (!(await requestFrame(frame.id, 'doop:html', { html: planned.html }))) return null
+      if (!(await showFrameHtml(frame.id, planned.html))) return null
       noteFrameDocument(frame.id, planned.html)
       return planned.selector
     }
@@ -273,7 +289,7 @@ export function useElementMove(frame: Frame, layoutZoom: number) {
       const html = useStore.getState().canvas?.frames.find((f) => f.id === frame.id)?.html
       if (html === undefined) return
       noteFrameDocument(frame.id, null)
-      if (await requestFrame(frame.id, 'doop:html', { html })) noteFrameDocument(frame.id, html)
+      if (await showFrameHtml(frame.id, html)) noteFrameDocument(frame.id, html)
     }
     /* where the pressed layer may go: a layout drop (a new place in the
        flow) is for one layer alone, so several picked layers always move
@@ -299,6 +315,7 @@ export function useElementMove(frame: Frame, layoutZoom: number) {
         if (!info) return cancel()
         const selector = movingSelector()
         updateLayer(await editElementGeometry(frame.id, selector, { kind: 'move', x: point.x, y: point.y }))
+        appliedPoint = point
         if (closed) return
         const result = await moveTarget(selector, point.pointerX, point.pointerY)
         if (closed) return
@@ -339,12 +356,16 @@ export function useElementMove(frame: Frame, layoutZoom: number) {
           // Drain a preview before restoring styles or saving. A slow hit-test
           // must never repaint after Escape, or commit the previous pointer slot.
           await layerWork
+          /* put the layer where it was let go before asking where it lands:
+             on a busy main thread the last preview can trail the pointer,
+             and a drop reads the layer's live box */
+          if (commit && final && final !== appliedPoint && sourceUnchanged())
+            updateLayer(await editElementGeometry(frame.id, selector, { kind: 'move', x: final.x, y: final.y }))
           const result =
             commit && final && sourceUnchanged()
               ? await moveTarget(selector, final.pointerX, final.pointerY)
               : undefined
           if (commit && final && sourceUnchanged() && result?.free) {
-            updateLayer(await editElementGeometry(frame.id, selector, { kind: 'move', x: final.x, y: final.y }))
             const saves = sourceUnchanged()
             const done = await styleGesture(frame.id, selector, saves ? 'commit' : 'cancel')
             /* the runtime's save carries the copy along; the copy is the pick */
@@ -438,9 +459,15 @@ export function useElementMove(frame: Frame, layoutZoom: number) {
            travel turned back by the frame's rotation; the pointer likewise */
         const travel = rotateVector({ x: rect.x - bounds.x, y: rect.y - bounds.y }, -(frame.rotation ?? 0))
         const pointer = frameDesignPoint(point, frame)
+        /* a dragged layer lands on whole design px, as a design tool places
+           one: the pointer at a fractional zoom is never a place anyone
+           means. An axis the drag did not move (Shift holds it) keeps its
+           value, and align and distribute, which move layers through the
+           same edit, keep exact placement */
+        const onGrid = (from: number, by: number) => (by === 0 ? from : Math.round(from + by))
         layerPoint = {
-          x: layer.rect.x + travel.x,
-          y: layer.rect.y + travel.y,
+          x: onGrid(layer.rect.x, travel.x),
+          y: onGrid(layer.rect.y, travel.y),
           pointerX: pointer.x - contentOffset.x,
           pointerY: pointer.y - contentOffset.y,
         }
@@ -450,7 +477,55 @@ export function useElementMove(frame: Frame, layoutZoom: number) {
       target = drawingDropFrame(point, standalone ? frame.id : undefined)
       /* staying in its own frame is a plain move: only a new frame is marked */
       const into = target?.id === frame.id ? null : target
+      if (target?.id === frame.id) findDrawingDrop(point)
+      else clearDrawingDrop()
       setPreview({ rect, html, target: into, world: world!, owner, selector: hit!.selector })
+    }
+    /* Over its own frame a drawn shape can go into a box there, as a layer
+       dragged on the canvas does: a slot in a flex box or a div (the blue
+       line), or a spot in a group that places its layers by hand. Asked of
+       the frame as the pointer moves, one question at a time. */
+    let drawingDrop: LayoutDrop | null = null
+    let dropAsk: { x: number; y: number } | null = null
+    let dropAsking = false
+    function drawingDropQuery(point: { x: number; y: number }) {
+      const pointer = frameDesignPoint(point, frame)
+      const corner = frameDesignPoint({ x: rect!.x, y: rect!.y }, frame)
+      return elementMoveTarget(frame.id, hit!.selector, pointer.x - contentOffset.x, pointer.y - contentOffset.y, {
+        x: corner.x - contentOffset.x,
+        y: corner.y - contentOffset.y,
+        width: rect!.width,
+        height: rect!.height,
+      })
+    }
+    function findDrawingDrop(point: { x: number; y: number }) {
+      dropAsk = point
+      if (dropAsking || !hit || !rect) return
+      dropAsking = true
+      const asked = point
+      void drawingDropQuery(asked).then((result) => {
+        dropAsking = false
+        if (closed) return
+        drawingDrop = result?.drop && !result.free ? result.drop : null
+        setLayoutDrop(drawingDrop ? { drop: drawingDrop, world: world!, origin: contentOrigin } : null)
+        if (dropAsk && dropAsk !== asked) findDrawingDrop(dropAsk)
+      })
+    }
+    function clearDrawingDrop() {
+      dropAsk = null
+      drawingDrop = null
+      setLayoutDrop(null)
+    }
+    /* let go over its own frame: into the box under the pointer, asked once
+       more where it was let go, else moved to where it was dropped */
+    async function landDrawing(start: DrawingRect, moved: DrawingRect): Promise<string | undefined> {
+      if (target?.id === frame.id && dropAsk) {
+        const result = await drawingDropQuery(dropAsk)
+        if (result?.drop && !result.free && sourceUnchanged()) {
+          return dropLayer(frame, hit!.selector, result.drop.target, result.drop.styles) ? frame.id : undefined
+        }
+      }
+      return moveDrawing(frame, hit!.selector, dropRect(start, moved), target?.id, hit!)
     }
     /* a standalone shape left on the canvas moves its own frame by the
        drag's world travel; a drawing written into a frame's document goes
@@ -474,10 +549,7 @@ export function useElementMove(frame: Frame, layoutZoom: number) {
         )
         return
       }
-      const landed =
-        !layer && hit && complete && rect && bounds
-          ? moveDrawing(frame, hit.selector, dropRect(bounds, rect), target?.id, hit)
-          : undefined
+      const landed = !layer && hit && complete && rect && bounds ? landDrawing(bounds, rect) : undefined
       cancel(complete && !!layer, landed?.then(shown))
       // A Shift press remains a selection toggle until it actually drags.
       if (!complete && press.shiftKey) {
@@ -568,6 +640,8 @@ export function useElementMove(frame: Frame, layoutZoom: number) {
         })
         if (closed) return
         layer = (response?.hit ?? null) as ElementMoveHit | null
+        /* the standalone's own root moves with its shell, by the frame drag */
+        if (layer && layer.selector === shell) layer = null
         if (layer) {
           const pressed = layer.selector
           followers = duplicating || !pickedHere.includes(pressed) ? [] : pickedHere.filter((x) => x !== pressed)
@@ -621,16 +695,18 @@ export function useElementMove(frame: Frame, layoutZoom: number) {
                   }}
                 />
               )}
-              <div
-                data-element-drop-indicator
-                className="absolute bg-brand"
-                style={{
-                  left: layoutDrop.drop.line.x,
-                  top: layoutDrop.drop.line.y,
-                  width: layoutDrop.drop.line.width || 'calc(2px / var(--zoom, 1))',
-                  height: layoutDrop.drop.line.height || 'calc(2px / var(--zoom, 1))',
-                }}
-              />
+              {layoutDrop.drop.line && (
+                <div
+                  data-element-drop-indicator
+                  className="absolute bg-brand"
+                  style={{
+                    left: layoutDrop.drop.line.x,
+                    top: layoutDrop.drop.line.y,
+                    width: layoutDrop.drop.line.width || 'calc(2px / var(--zoom, 1))',
+                    height: layoutDrop.drop.line.height || 'calc(2px / var(--zoom, 1))',
+                  }}
+                />
+              )}
             </div>,
             layoutDrop.world,
           )}
@@ -664,7 +740,7 @@ export function useElementMove(frame: Frame, layoutZoom: number) {
                 <iframe
                   title={t('stage.movingDrawing')}
                   sandbox=""
-                  srcDoc={preview.html}
+                  srcDoc={previewDocument}
                   onLoad={() => hideDrawing(preview.owner, preview.selector)}
                   className="block border-0 bg-transparent"
                   style={{

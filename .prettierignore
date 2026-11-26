@@ -1,5 +1,9 @@
 dist/
 public/claude-extension/
+cli/dist/
+vscode-extension/out/
+vscode-extension/dist/
+public/cli/
 node_modules/
 package-lock.json
 bun.lock
@@ -20,3 +24,7 @@ storybook-static/
 
 # agent worktrees (git worktrees under the repo)
 .claude/
+# Android build outputs (nested .gitignore entries that Prettier does not read)
+android/.gradle/
+android/.kotlin/
+android/**/build/

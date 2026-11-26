@@ -3,6 +3,8 @@ import type { CanvasMeta, WorkspaceSummary } from '../../shared/types'
 import { AppRail, railLayout } from '@/components/AppRail'
 import { CanvasSearchModal } from '@/components/CanvasSearchModal'
 import { UpdateCardView } from '@/components/UpdateCard'
+import { StarCardView } from '@/components/StarCard'
+import { IosAppSheet, NativeAppCardView } from '@/components/NativeAppPromo'
 import {
   DashContent,
   DashHeader,
@@ -131,4 +133,31 @@ export const UpdateAvailable: Story = {
       <UpdateCardView version="0.11.0" restarting onRestart={() => {}} onLater={() => {}} />
     </div>
   ),
+}
+
+/** Home's ask for a GitHub star, once someone has used Doop on a few days. */
+export const GithubStar: Story = {
+  name: 'GitHub star ask',
+  render: () => (
+    <div className="p-6">
+      <StarCardView onLater={() => {}} onDismiss={() => {}} />
+    </div>
+  ),
+}
+
+/** The browser's suggestion to use a native app: the rail card on a computer, the App Store sheet on an iPhone. */
+export const NativeAppPromo: Story = {
+  name: 'Native app suggestion',
+  render: () => (
+    <div className="flex gap-6 bg-sub p-6">
+      {(['macos', 'windows', 'linux'] as const).map((platform) => (
+        <NativeAppCardView key={platform} platform={platform} onDismiss={() => {}} className="w-[212px]" />
+      ))}
+    </div>
+  ),
+}
+
+export const IosAppSuggestion: Story = {
+  name: 'Native app suggestion (iPhone)',
+  render: () => <IosAppSheet open onOpenChange={() => {}} />,
 }

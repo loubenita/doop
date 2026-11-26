@@ -1,11 +1,12 @@
-import { useRef, useState, type MutableRefObject } from 'react'
+import { useState, type MutableRefObject } from 'react'
 import type { Frame } from '../../shared/types'
 import { errorMessage } from '../lib/api'
 import { copyFrames, duplicateFrames, hasFrameClip, pasteFrameAtScreen } from '../lib/frameClipboard'
 import { writeCanvasClipboard } from '../lib/canvasClipboard'
 import { copyFramePng } from '../lib/frameExport'
+import { getExportSettings } from '../lib/exportSettings'
 import { deleteFramesTracked } from '../lib/history'
-import { isStackLocked, setFramesHidden, setFramesLocked } from '../lib/layerEdits'
+import { cutFrames, setFramesHidden, setFramesLocked } from '../lib/layerEdits'
 import { canEditOpenCanvas, useStore } from '../lib/store'
 import { setFramesApproval } from '../lib/frameApproval'
 import { useFrameSaves } from '../lib/frameSaves'
@@ -13,8 +14,11 @@ import { MOD_KEY } from '../lib/keys'
 import { t as translate, useT } from '../lib/i18n'
 import { ContextMenuContent, ContextMenuItem, ContextMenuSeparator } from './ui/context-menu'
 import { MenuHint } from './ui/menu'
+import { ActionHint, MoveToPageMenu } from './ActionMenuItem'
 import { FrameExportModal } from './FrameExportModal'
 import { FrameHistoryModal } from './FrameHistoryModal'
+import { trackPngCopy } from '../lib/exportEvents'
+import { copyElementLink, type LinkTarget } from '../lib/elementLink'
 
 async function copyImageUrl(frame: Frame) {
   const notify = useStore.getState().pushNotice
@@ -31,14 +35,15 @@ async function copyImageUrl(frame: Frame) {
 export function FrameContextMenu({
   frame,
   at,
-  onRename,
+  element,
 }: {
   frame: Frame
   at: MutableRefObject<{ x: number; y: number }>
-  onRename?: () => void
+  /** the element a reader has picked in the frame: readers get this menu
+   *  everywhere, so the element's link is offered here */
+  element?: LinkTarget
 }) {
   const t = useT()
-  const renameRequested = useRef(false)
   /* the frames Export… acts on: this one, or the selection it belongs to */
   const [exportFrames, setExportFrames] = useState<Frame[] | null>(null)
   const [historyOpen, setHistoryOpen] = useState(false)
@@ -89,16 +94,16 @@ export function FrameContextMenu({
     <>
       <ContextMenuContent
         onCloseAutoFocus={(event) => {
-          // Mount the editor after the menu releases focus, so it stays focused.
-          if (renameRequested.current) {
-            event.preventDefault()
-            renameRequested.current = false
-            onRename?.()
-          }
           // The export dialog owns focus once the menu closes.
           if (exportFrames || historyOpen) event.preventDefault()
         }}
       >
+        {!readOnly && (
+          <ContextMenuItem disabled={allLocked} onSelect={() => cutFrames(groupFrames())}>
+            {groupSize > 1 ? t('stage.cutFrames', { count: groupSize }) : t('common.cut')}
+            <MenuHint>{MOD_KEY}X</MenuHint>
+          </ContextMenuItem>
+        )}
         <ContextMenuItem
           onSelect={() => {
             const frames = groupFrames()
@@ -110,11 +115,6 @@ export function FrameContextMenu({
         </ContextMenuItem>
         {!readOnly && (
           <>
-            {onRename && (
-              <ContextMenuItem disabled={isStackLocked(frame)} onSelect={() => (renameRequested.current = true)}>
-                {t('panels.layersRename')}
-              </ContextMenuItem>
-            )}
             <ContextMenuItem
               disabled={!hasFrameClip()}
               onSelect={() => pasteFrameAtScreen(frame.canvasId, at.current.x, at.current.y)}
@@ -136,11 +136,30 @@ export function FrameContextMenu({
         )}
         <ContextMenuSeparator />
         <ContextMenuItem
-          onSelect={() => navigator.clipboard.writeText(`${location.origin}/c/${frame.canvasId}?frame=${frame.id}`)}
+          onSelect={() =>
+            navigator.clipboard
+              .writeText(`${location.origin}/c/${frame.canvasId}?frame=${frame.id}`)
+              .then(() => useStore.getState().pushNotice(t('stage.linkCopied')))
+              .catch(console.error)
+          }
         >
           {t('stage.copyLink')}
+          {groupSize === 1 && <ActionHint id="copy-link" />}
         </ContextMenuItem>
-        <ContextMenuItem onSelect={() => void copyFramePng(frame)}>{t('stage.copyAsPng')}</ContextMenuItem>
+        {element && (
+          <ContextMenuItem onSelect={() => void copyElementLink(frame, element)}>
+            {t('stage.copyLinkToElement')}
+          </ContextMenuItem>
+        )}
+        <ContextMenuItem
+          onSelect={() => {
+            trackPngCopy('frame', 'frame_menu')
+            void copyFramePng(frame, getExportSettings().scale)
+          }}
+        >
+          {t('stage.copyAsPng')}
+          {groupSize === 1 && <ActionHint id="copy-as-png" />}
+        </ContextMenuItem>
         <ContextMenuItem onSelect={() => void copyImageUrl(frame)}>{t('stage.copyImageUrl')}</ContextMenuItem>
         <ContextMenuItem onSelect={() => setExportFrames(groupFrames())}>{t('stage.exportEllipsis')}</ContextMenuItem>
         <ContextMenuItem onSelect={() => setHistoryOpen(true)}>{t('stage.versionHistory')}</ContextMenuItem>
@@ -155,6 +174,7 @@ export function FrameContextMenu({
               {groupSize > 1 && <MenuHint>{t('stage.framesCount', { count: groupSize })}</MenuHint>}
             </ContextMenuItem>
             <ContextMenuSeparator />
+            <MoveToPageMenu frames={groupFrames()} />
             <ContextMenuItem onSelect={() => setFramesLocked(groupFrames(), !allLocked)}>
               {groupSize > 1
                 ? t(allLocked ? 'stage.unlockFrames' : 'stage.lockFrames', { count: groupSize })

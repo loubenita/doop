@@ -2,6 +2,7 @@
 <html>
   <head>
     <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
   </head>
   <body>
     <div id="root"></div>
@@ -13,14 +14,30 @@
       import { useStore } from '/src/lib/store.ts'
       import '/src/styles.css'
 
+      const query = new URLSearchParams(location.search)
+      const canvasId = query.get('fixtureCanvasId') ?? 'c'
+
       /* the canvas page as an editor has it open, with all its chrome; the
          test hands it the canvas the room would have sent */
       window.canvasPageHarness = {
-        seed: (frames) =>
-          useStore.getState().setCanvas({ id: 'c', name: 'Canvas', frames, role: 'edit', createdAt: 0, updatedAt: 0 }),
+        seed: (frames, canvas) =>
+          useStore
+            .getState()
+            .setCanvas({ id: canvasId, name: 'Canvas', frames, role: 'edit', createdAt: 0, updatedAt: 0, ...canvas }),
+        setPages: (pages) => useStore.getState().setPages(pages, canvasId),
+        /* the canvas's shared styles as the room would send them after a change */
+        setTokens: (tokens, themes) => useStore.getState().setTokensLocal(tokens, themes),
+        setComponent: (component) => useStore.getState().setComponentLocal(component.id, component),
+        /* the agents' tasks as the room's init would carry them */
+        setTasks: (tasks) => useStore.getState().setTasks(tasks),
+        frameHtml: (id) => useStore.getState().canvas.frames.find((frame) => frame.id === id).html,
       }
       createRoot(document.getElementById('root')).render(
-        React.createElement(TooltipProvider, null, React.createElement(CanvasPage, { canvasId: 'c' })),
+        React.createElement(
+          TooltipProvider,
+          null,
+          React.createElement(CanvasPage, { canvasId, guest: query.has('fixtureGuest') }),
+        ),
       )
     </script>
   </body>

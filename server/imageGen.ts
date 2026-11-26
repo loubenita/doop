@@ -4,8 +4,8 @@ import sharp from 'sharp'
 import { getAccounts, withFreshToken } from './modelAccounts.ts'
 import type { ModelAccount } from './modelAccounts.ts'
 import { getImagePref } from './imagePrefs.ts'
-import { IMAGE_MODELS } from '../shared/modelMenu.ts'
-import type { ImageModelOption } from '../shared/modelMenu.ts'
+import { ACCOUNT_KIND_LABELS, IMAGE_MODELS } from '../shared/modelMenu.ts'
+import type { AccountKindName, ImageModelOption } from '../shared/modelMenu.ts'
 import {
   CHATGPT_URL,
   DEFAULT_OPENAI_MODEL,
@@ -27,9 +27,13 @@ import {
  * entry's provider names the credentials that can run it:
  *
  *  - `openai` (GPT Image) rides the Responses API's hosted `image_generation`
- *    tool — a connected ChatGPT subscription through the Codex backend (the
- *    same request the Codex CLI's $imagegen skill makes) or an OpenAI key,
- *    else the server's OPENAI_API_KEY;
+ *    tool — a connected ChatGPT subscription through the Codex backend or an
+ *    OpenAI key, else the server's OPENAI_API_KEY. The Codex backend ignores
+ *    the tool's `model` (ChatGPT picks), so the subscription has no choice;
+ *  - `openai-api` (the GPT Image API row: 2.6, 2.5, chatgpt-image-latest, 1.5, 1 Mini) calls OpenAI's Image API
+ *    (`/v1/images/generations`) on an OpenAI key only — the user's, else the
+ *    server's — where those models are documented and the model id is
+ *    honoured;
  *  - `gemini` (Nano Banana) calls generateContent with image output — a
  *    connected Gemini key, else the server's GEMINI_API_KEY;
  *  - `ark` (Seedream, BytePlus ModelArk) — server-only via ARK_API_KEY; there
@@ -193,6 +197,48 @@ function apiKeyGenerator(apiKey: string, label: string, routerModel: string, ima
 }
 
 /* ---------------------------------------------------------------- */
+/* OpenAI's Image API: the GPT Image models an API key can choose   */
+/* ---------------------------------------------------------------- */
+
+const OPENAI_IMAGES_URL = env.OPENAI_IMAGES_URL
+
+interface OpenAiImageResponse {
+  data?: { b64_json?: string }[]
+}
+
+/* No text model fronts this call, so the prompt reaches the image model as
+   written and the size is the request's own field. */
+function imageApiGenerator(apiKey: string, label: string, model: string): Generator {
+  /* the server's key is billed as "server" but the error names the provider */
+  const provider = 'OpenAI'
+  return {
+    ok: true,
+    label,
+    ...(label === 'server' ? { authHint: 'OPENAI_API_KEY' } : {}),
+    run: async (req) => {
+      const res = await fetch(OPENAI_IMAGES_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model,
+          prompt: req.prompt,
+          n: 1,
+          size: SIZES[req.aspect ?? 'square'],
+          quality: req.quality ?? 'medium',
+          output_format: 'png',
+        }),
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      })
+      if (!res.ok) throw await responseError(res, provider)
+      const body = (await res.json()) as OpenAiImageResponse
+      const b64 = body.data?.[0]?.b64_json
+      if (!b64) throw new Error(`${provider} returned no image`)
+      return Buffer.from(b64, 'base64')
+    },
+  }
+}
+
+/* ---------------------------------------------------------------- */
 /* Gemini (Nano Banana): generateContent with image output          */
 /* ---------------------------------------------------------------- */
 
@@ -310,9 +356,6 @@ function arkGenerator(apiKey: string, label: string, model: string): Generator {
 /* which model, on whose credentials                                */
 /* ---------------------------------------------------------------- */
 
-const NO_GENERATOR =
-  'image generation is not available: connect a ChatGPT subscription or an OpenAI or Gemini API key in Settings (or the server operator sets OPENAI_API_KEY, GEMINI_API_KEY or ARK_API_KEY). Meanwhile draw the visual as inline SVG/CSS or use search_images.'
-
 /* A connected account pays for its own provider's models and nothing else:
    the server keys only ever cover users who connected nothing — with one
    deliberate exception, Seedream, which has no BYO path at all, so setting
@@ -322,18 +365,56 @@ const NO_GENERATOR =
    the server. The ChatGPT subscription is preferred over an OpenAI key when
    both are on, since it costs the person nothing extra. */
 interface PayerAccounts {
+  /** every account connected, on or off */
+  all: readonly ModelAccount[]
   /** switched on: the credentials a run may use */
   on: readonly ModelAccount[]
   /** connected anything at all, on or off: no server key pays for them */
   own: boolean
 }
-const NO_ACCOUNTS: PayerAccounts = { on: [], own: false }
+const NO_ACCOUNTS: PayerAccounts = { all: [], on: [], own: false }
+
+/** Said to the agent once nothing can draw, in the generate_image descriptions
+ *  too, so it stops retrying a call that cannot succeed. */
+const DRAW_INSTEAD =
+  'Retrying fails the same way until the person connects one; meanwhile use search_images for photography or draw the visual as inline SVG/CSS.'
+
+/** What every generate_image description says up front: who can draw. */
+export const IMAGE_PROVIDER_NOTE =
+  'It needs an image provider: the person’s ChatGPT subscription, OpenAI API key or Gemini API key, connected and switched on in Settings → Doop Agent (a Claude, OpenRouter, DeepSeek or Kimi connection cannot draw images), or the server’s own image key for someone who has connected no model account. Without one it fails at once saying what to connect: do not retry, use search_images or draw the visual as inline SVG/CSS.'
+
+/* the accounts that can pay for some image model */
+const IMAGE_ACCOUNT_KINDS: readonly string[] = ['chatgpt', 'openai-key', 'gemini-key']
+
+function accountName(account: ModelAccount): string {
+  return account.custom?.name ?? ACCOUNT_KIND_LABELS[account.kind as AccountKindName] ?? account.kind
+}
+
+function listed(names: readonly string[]): string {
+  if (names.length < 2) return names.join('')
+  return `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`
+}
+
+/** Why no image model at all can run for this payer, and what the person can do about it. */
+function noImageProviderReason(accounts: PayerAccounts): string {
+  const connect = 'connect a ChatGPT subscription, an OpenAI API key or a Gemini API key in Settings → Doop Agent'
+  const switchedOff = accounts.all.filter((account) => !account.enabled && IMAGE_ACCOUNT_KINDS.includes(account.kind))
+  if (switchedOff.length > 0) {
+    return `image generation is not available: the person’s ${listed(switchedOff.map(accountName))} connection is switched off. Switch it on in Settings → Doop Agent, or ${connect}. ${DRAW_INSTEAD}`
+  }
+  if (accounts.own) {
+    const names = listed([...new Set(accounts.all.map(accountName))])
+    return `image generation is not available: ${connect}. The person’s ${names} connection cannot draw images, and this server’s own image keys only cover people who have connected no model account. ${DRAW_INSTEAD}`
+  }
+  return `image generation is not available: ${connect} (this server’s operator has not set OPENAI_API_KEY, GEMINI_API_KEY or ARK_API_KEY). ${DRAW_INSTEAD}`
+}
 
 function openAiAccount(accounts: readonly ModelAccount[]): ModelAccount | undefined {
-  return (
-    accounts.find((account) => account.kind === 'chatgpt') ??
-    accounts.find((account) => account.kind === 'openai-key' && Boolean(account.apiKey))
-  )
+  return accounts.find((account) => account.kind === 'chatgpt') ?? openAiKeyAccount(accounts)
+}
+
+function openAiKeyAccount(accounts: readonly ModelAccount[]): ModelAccount | undefined {
+  return accounts.find((account) => account.kind === 'openai-key' && Boolean(account.apiKey))
 }
 
 function geminiAccount(accounts: readonly ModelAccount[]): ModelAccount | undefined {
@@ -344,6 +425,9 @@ function available(option: ImageModelOption, accounts: PayerAccounts): boolean {
   switch (option.provider) {
     case 'openai':
       if (accounts.own) return Boolean(openAiAccount(accounts.on))
+      return Boolean(env.OPENAI_API_KEY)
+    case 'openai-api':
+      if (accounts.own) return Boolean(openAiKeyAccount(accounts.on))
       return Boolean(env.OPENAI_API_KEY)
     case 'gemini':
       if (accounts.own) return Boolean(geminiAccount(accounts.on))
@@ -370,7 +454,7 @@ let warnedDefault = false
 
 async function payerAccounts(payerId: string): Promise<PayerAccounts> {
   const all = await getAccounts(payerId)
-  return { on: all.filter((account) => account.enabled), own: all.length > 0 }
+  return { all, on: all.filter((account) => account.enabled), own: all.length > 0 }
 }
 
 /** The model a run will draw with: the user's pick, else the server default,
@@ -412,6 +496,17 @@ function providerGenerator(option: ImageModelOption, accounts: PayerAccounts): G
         reason: `${option.name} is not available: connect a ChatGPT subscription or OpenAI API key in Settings, or pick another image model there. Meanwhile draw the visual as inline SVG/CSS or use search_images.`,
       }
     }
+    case 'openai-api': {
+      /* a ChatGPT subscription cannot run these: its backend ignores the model id */
+      const account = openAiKeyAccount(accounts.on)
+      if (account?.apiKey) return imageApiGenerator(account.apiKey, 'OpenAI', option.id)
+      const serverKey = own ? undefined : env.OPENAI_API_KEY
+      if (serverKey) return imageApiGenerator(serverKey, 'server', option.id)
+      return {
+        ok: false,
+        reason: `${option.name} needs an OpenAI API key (a ChatGPT subscription cannot choose its image model): connect one in Settings, or pick another image model there. Meanwhile draw the visual as inline SVG/CSS or use search_images.`,
+      }
+    }
     case 'gemini': {
       const account = geminiAccount(accounts.on)
       if (account?.apiKey) return geminiGenerator(account.apiKey, 'Gemini', option.id)
@@ -437,7 +532,8 @@ function providerGenerator(option: ImageModelOption, accounts: PayerAccounts): G
  * The generator for one payer: the image model they picked (else the server
  * default), on their own credentials first, else the matching server key.
  * An explicit pick that cannot run refuses with the fix — it never quietly
- * swaps in a different model or bills a key the user did not choose.
+ * swaps in a different model or bills a key the user did not choose. When no
+ * model at all can run, the refusal names what to connect instead.
  */
 export async function generatorFor(payerId?: string): Promise<Generator> {
   /* a lookup failure must not read as "no account": that would quietly move
@@ -448,8 +544,13 @@ export async function generatorFor(payerId?: string): Promise<Generator> {
         throw new Error('could not read your connected model accounts — try again in a moment')
       })
     : NO_ACCOUNTS
+  /* nothing at all can draw: say what the person can connect, not why the
+     default model in particular cannot run (they never picked it) */
+  if (!IMAGE_MODELS.some((entry) => available(entry, accounts))) {
+    return { ok: false, reason: noImageProviderReason(accounts) }
+  }
   const option = await chosenImageModel(payerId, accounts)
-  if (!option) return { ok: false, reason: NO_GENERATOR }
+  if (!option) return { ok: false, reason: noImageProviderReason(accounts) }
   return providerGenerator(option, accounts)
 }
 

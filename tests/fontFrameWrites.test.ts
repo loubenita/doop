@@ -15,6 +15,7 @@ vi.mock('../server/db/persist.ts', () => ({
   saveDecision: () => {},
   saveProposal: () => {},
   saveCanvas: () => {},
+  refreshAssetRefs: () => {},
   saveFrame: () => {},
 }))
 
@@ -34,6 +35,8 @@ vi.mock('../server/fonts.ts', () => ({ fontsForCanvas: () => [BRAND] }))
 vi.useFakeTimers({ now: 1_000_000 })
 const actions = await import('../server/actions.ts')
 const { store } = await import('../server/store.ts')
+/* idle streams settle through the canvas write entry, as the server wires it at boot */
+;(await import('../server/canvasWrites.ts')).wireCanvasWrites()
 
 /**
  * A frame write that names a library family gets that family's @font-face —
@@ -43,12 +46,16 @@ const { store } = await import('../server/store.ts')
 
 const agent: Actor = { name: 'Claude', kind: 'agent', color: '#e5533c' }
 const DESIGN = `<!doctype html><html><head></head><body><h1 style="font-family:'Brand Sans'">Hi</h1>`
+/* a fragment: create_frame takes one, and agents stream one */
+const FRAGMENT = `<h1 style="font-family:'Brand Sans'">Hi</h1>`
+/* a document with no head or body tag yet: nothing can be placed until one arrives */
+const HEADLESS = `<!doctype html><html lang="en">${FRAGMENT}`
 
 /* what open canvases are sent: the frame HTML each frame:updated carried */
 const sent: { frameId: string; html: string }[] = []
 actions.wire(
   (_canvasId, msg) => {
-    if (msg.type === 'frame:updated') sent.push({ frameId: msg.frame.id, html: msg.frame.html })
+    if (msg.type === 'frame:updated') sent.push({ frameId: msg.frame.id, html: msg.frame.html ?? '' })
   },
   () => {},
 )
@@ -91,34 +98,53 @@ describe('library faces on frame writes', () => {
     expect(store.getFrame(frame.id)!.html).toContain('family=Space+Grotesk:')
   })
 
-  it('adds them with the done chunk of a stream, not before', () => {
+  it('adds them from the first chunk of a stream once its head is in, once', () => {
     const canvasId = store.createCanvas('fonts', 'kevin').id
     const frame = actions.createFrame(canvasId, { name: 'Hero' }, agent)!
+    sent.length = 0
     actions.appendFrameHtml(frame.id, DESIGN, agent, { start: true })
-    expect(store.getFrame(frame.id)!.html).not.toContain(BRAND.url)
-    actions.appendFrameHtml(frame.id, '</body></html>', agent, { done: true })
+    /* a mid-stream screenshot renders the store; viewers render what they are sent */
     expect(store.getFrame(frame.id)!.html).toContain(BRAND.url)
+    expect(sent.at(-1)?.html).toContain(BRAND.url)
+    actions.appendFrameHtml(frame.id, '</body></html>', agent, { done: true })
+    expect(store.getFrame(frame.id)!.html.split(BRAND.url)).toHaveLength(2)
   })
 
-  it('adds them when an unfinished stream goes idle', () => {
+  it('adds them from the first chunk of a streamed fragment, once', () => {
     const canvasId = store.createCanvas('fonts', 'kevin').id
     const frame = actions.createFrame(canvasId, { name: 'Hero' }, agent)!
-    actions.appendFrameHtml(frame.id, DESIGN, agent, { start: true })
     sent.length = 0
-    vi.advanceTimersByTime(31_000)
+    actions.appendFrameHtml(frame.id, `<style>h1{margin:0}</style>${FRAGMENT}`, agent, { start: true })
+    expect(store.getFrame(frame.id)!.html).toContain(BRAND.url)
+    expect(sent.at(-1)?.html).toContain(BRAND.url)
+    actions.appendFrameHtml(frame.id, `<p style="font-family: 'Space Grotesk'">x</p>`, agent)
+    expect(store.getFrame(frame.id)!.html.split('data-doop-webfonts')).toHaveLength(2)
+    actions.appendFrameHtml(frame.id, '<footer>end</footer>', agent, { done: true })
+    const saved = store.getFrame(frame.id)!.html
+    expect(saved.split(BRAND.url)).toHaveLength(2)
+    expect(saved.split('data-doop-webfonts')).toHaveLength(2)
+  })
+
+  it('adds them when an unfinished stream goes idle', async () => {
+    const canvasId = store.createCanvas('fonts', 'kevin').id
+    const frame = actions.createFrame(canvasId, { name: 'Hero' }, agent)!
+    actions.appendFrameHtml(frame.id, HEADLESS, agent, { start: true })
+    expect(store.getFrame(frame.id)!.html).not.toContain(BRAND.url)
+    sent.length = 0
+    await vi.advanceTimersByTimeAsync(31_000)
     expect(store.getFrame(frame.id)!.html).toContain(BRAND.url)
     /* and open canvases are sent the document with the faces, not just the store */
     expect(sent.some((m) => m.frameId === frame.id && m.html.includes(BRAND.url))).toBe(true)
   })
 
-  it('never sends viewers a script the stream left unfinished', () => {
+  it('never sends viewers a script the stream left unfinished', async () => {
     const canvasId = store.createCanvas('fonts', 'kevin').id
     const frame = actions.createFrame(canvasId, { name: 'Hero' }, agent)!
-    actions.appendFrameHtml(frame.id, `${DESIGN}<script>document.body.innerHTML = ''; // and then`, agent, {
+    actions.appendFrameHtml(frame.id, `${HEADLESS}<script>document.body.innerHTML = ''; // and then`, agent, {
       start: true,
     })
     sent.length = 0
-    vi.advanceTimersByTime(31_000)
+    await vi.advanceTimersByTimeAsync(31_000)
     const last = sent.filter((m) => m.frameId === frame.id).at(-1)!
     expect(last.html).toContain(BRAND.url)
     expect(last.html).not.toContain('<script>')

@@ -1,10 +1,12 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { stubEnv, unstubAllEnvs } from './envStub.ts'
 import type { Actor } from '../shared/types'
 import { TOKEN_BLOCK_ATTR } from '../shared/designTokens'
 
 /* Frame writes mirror into Postgres and broadcast; only the saved HTML and
    what the room is sent matter here. */
 vi.mock('../server/db/persist.ts', () => ({
+  saveComponent: () => {},
   saveTask: () => {},
   saveFeedback: () => {},
   saveComment: () => {},
@@ -12,6 +14,7 @@ vi.mock('../server/db/persist.ts', () => ({
   saveDecision: () => {},
   saveProposal: () => {},
   saveCanvas: () => {},
+  refreshAssetRefs: () => {},
   saveFrame: () => {},
   saveToken: () => {},
   deleteToken: () => {},
@@ -22,6 +25,9 @@ vi.mock('../server/fonts.ts', () => ({ fontsForCanvas: () => [] }))
 
 const actions = await import('../server/actions.ts')
 const { store } = await import('../server/store.ts')
+const { createComponentFromHtml, updateComponent } = await import('../server/componentActions.ts')
+const propagation = await import('../server/propagation.ts')
+const { previewDocument } = await import('../server/componentPreview.ts')
 
 /**
  * Design tokens on frame writes: a write that names a token gets its value
@@ -56,6 +62,12 @@ function setup() {
   expect(results.every((r) => r.result === 'created')).toBe(true)
   return canvasId
 }
+
+/* These cases follow the token block as it is written into the stored document, which
+   is what DOOP_LEAN_FRAME_STORAGE=false still does. With lean storage (the default) the
+   block is composed in on read and a value change writes no frame: leanFrameStorage.test.ts. */
+beforeEach(() => stubEnv('DOOP_LEAN_FRAME_STORAGE', 'false'))
+afterEach(() => unstubAllEnvs())
 
 describe('design tokens on frame writes', () => {
   it('writes the block on create and keeps it current on update', () => {
@@ -177,6 +189,79 @@ describe('design tokens on frame writes', () => {
     expect(store.getFrame(frame.id)!.html).toContain(':root{--spacing-8:32px}')
   })
 
+  it('writes the block into a streaming frame from its first chunk, without stacking it', () => {
+    const canvasId = setup()
+    const frame = actions.createFrame(canvasId, { name: 'Stream' }, agent)!
+    actions.appendFrameHtml(
+      frame.id,
+      '<!doctype html><html><head><style>body{color:var(--color-ink)}</style></head><body>',
+      agent,
+      { start: true },
+    )
+    /* what a mid-stream screenshot renders: the stored document, and what viewers are sent */
+    const first = store.getFrame(frame.id)!.html
+    expect(first).toContain(`<head><style ${TOKEN_BLOCK_ATTR}>:root{--color-ink:#111}</style>`)
+    expect(sent.at(-1)?.html).toContain(TOKEN_BLOCK_ATTR)
+    actions.appendFrameHtml(frame.id, '<section style="padding:var(--spacing-4)">Hero</section>', agent)
+    const second = store.getFrame(frame.id)!.html
+    expect(second.split(TOKEN_BLOCK_ATTR)).toHaveLength(2)
+    expect(second).toContain('--spacing-4:16px')
+    actions.appendFrameHtml(frame.id, '</body></html>', agent, { done: true })
+    expect(store.getFrame(frame.id)!.html.split(TOKEN_BLOCK_ATTR)).toHaveLength(2)
+  })
+
+  it('waits for a complete head or body tag before writing into a stream', () => {
+    const canvasId = setup()
+    const frame = actions.createFrame(canvasId, { name: 'Stream' }, agent)!
+    /* a block placed now would land inside the tag the next chunk finishes */
+    actions.appendFrameHtml(frame.id, '<!doctype html><ht', agent, { start: true })
+    expect(store.getFrame(frame.id)!.html).toBe('<!doctype html><ht')
+    actions.appendFrameHtml(frame.id, 'ml><head></head><body style="color:var(--color-ink)">', agent)
+    expect(store.getFrame(frame.id)!.html).toContain(
+      `<!doctype html><html><head><style ${TOKEN_BLOCK_ATTR}>:root{--color-ink:#111}</style></head>`,
+    )
+  })
+
+  it('writes the block into a streaming fragment from its first chunk, once', () => {
+    const canvasId = setup()
+    const frame = actions.createFrame(canvasId, { name: 'Stream' }, agent)!
+    /* create_frame takes a fragment, and agents stream one: no head or body tag ever arrives */
+    actions.appendFrameHtml(frame.id, '<style>h1{color:var(--color-ink)}</style><section><h1>Hero</h1>', agent, {
+      start: true,
+    })
+    const first = store.getFrame(frame.id)!.html
+    expect(first.startsWith(`<style ${TOKEN_BLOCK_ATTR}>:root{--color-ink:#111}</style><style>h1`)).toBe(true)
+    expect(sent.at(-1)?.html).toContain(TOKEN_BLOCK_ATTR)
+    actions.appendFrameHtml(frame.id, '<p style="padding:var(--spacing-4)">Body</p>', agent)
+    const second = store.getFrame(frame.id)!.html
+    expect(second.split(TOKEN_BLOCK_ATTR)).toHaveLength(2)
+    expect(second).toContain('--spacing-4:16px')
+    actions.appendFrameHtml(frame.id, '</section>', agent, { done: true })
+    expect(store.getFrame(frame.id)!.html.split(TOKEN_BLOCK_ATTR)).toHaveLength(2)
+  })
+
+  it('waits while a stream may still turn out to be a document', () => {
+    const canvasId = setup()
+    const frame = actions.createFrame(canvasId, { name: 'Stream' }, agent)!
+    const named = '<h1 style="color:var(--color-ink)">x</h1>'
+    for (const start of ['<', '<ht', '<!-- hero --><!doc', `<!-- hero ${named}`, `<html lang="en">${named}`]) {
+      actions.appendFrameHtml(frame.id, start, agent, { start: true })
+      expect(store.getFrame(frame.id)!.html).toBe(start)
+    }
+  })
+
+  it('previews a component with the canvas tokens it names', () => {
+    const canvasId = setup()
+    const { component: def } = createComponentFromHtml(
+      canvasId,
+      { name: 'Chip', html: '<span class="chip">New</span>', css: '.chip{color:var(--color-primary)}' },
+      human,
+    )
+    const { html } = previewDocument(canvasId, def)
+    expect(html).toContain(TOKEN_BLOCK_ATTR)
+    expect(html).toContain('--color-primary:var(--color-ink)')
+  })
+
   it('applies a rename to a streaming frame when its stream closes', () => {
     const canvasId = setup()
     const frame = actions.createFrame(canvasId, { name: 'Stream' }, agent)!
@@ -184,6 +269,9 @@ describe('design tokens on frame writes', () => {
     actions.setTokens(canvasId, [{ name: '--spacing-4', newName: '--space-4' }], human)
     /* mid-stream the document is left alone */
     expect(store.getFrame(frame.id)!.html).toContain('var(--spacing-4)')
+    /* a chunk before the close keeps the old name's value, so the design does not lose it */
+    actions.appendFrameHtml(frame.id, '<section style="padding:var(--spacing-4)">Hero</section>', agent)
+    expect(store.getFrame(frame.id)!.html).toContain(':root{--spacing-4:16px}')
     actions.appendFrameHtml(frame.id, '</body></html>', agent, { done: true })
     const html = store.getFrame(frame.id)!.html
     expect(html).toContain('gap:var(--space-4)')
@@ -268,5 +356,94 @@ describe('design tokens on frame writes', () => {
     const canvasId = setup()
     const copy = (await store.duplicateCanvas(canvasId, 'kevin', 'kevin'))!
     expect(copy.tokens?.map((t) => t.name)).toEqual(['--color-ink', '--color-primary', '--spacing-4'])
+  })
+})
+
+describe('renames reach component definitions', () => {
+  const definition = (canvasId: string, id: string) => store.getCanvas(canvasId)!.components!.find((d) => d.id === id)!
+
+  /** A Chip whose markup and rules name `--color-ink` and the dark theme, used on a screen. */
+  function withChip() {
+    const canvasId = setup()
+    actions.setTokens(canvasId, [{ name: '--color-ink', themes: { dark: '#eee' } }], human)
+    const { component } = createComponentFromHtml(
+      canvasId,
+      {
+        name: 'Chip',
+        html: '<span class="chip" data-doop-theme="dark" style="padding:var(--spacing-4)">New</span>',
+        css: '.chip{color:var(--color-ink)} [data-doop-theme=dark] .chip{border-color:var(--color-ink)}',
+      },
+      human,
+    )
+    const screen = actions.createFrame(
+      canvasId,
+      { name: 'Screen', html: '<html><head></head><body><doop-use component="Chip"></doop-use></body></html>' },
+      human,
+    )!
+    return { canvasId, def: component, screen }
+  }
+
+  it('gives every definition naming a renamed token a revision with the new name', () => {
+    const { canvasId, def } = withChip()
+    sent.length = 0
+    actions.setTokens(
+      canvasId,
+      [
+        { name: '--spacing-4', newName: '--space-4' },
+        { name: '--color-ink', newName: '--ink' },
+      ],
+      human,
+    )
+    const after = definition(canvasId, def.id)
+    expect(after.template).toContain('padding:var(--space-4)')
+    expect(after.css).toContain('var(--ink)')
+    expect(after.rawCss).toContain('color:var(--ink)')
+    expect(`${after.template}${after.css}${after.rawCss}`).not.toMatch(/--spacing-4|--color-ink/)
+    expect(after.rev).toBe(def.rev + 2)
+    expect(after.history.at(-1)).toMatchObject({ rev: def.rev + 1 })
+    expect(sent.filter((m) => m.type === 'component')).toHaveLength(2)
+    /* the main names the new token as its definition does */
+    expect(store.getFrame(after.mainFrameId!)!.html).toContain('padding:var(--space-4)')
+  })
+
+  it('follows a theme rename into a definition’s markup and rules', () => {
+    const { canvasId, def } = withChip()
+    actions.setTokenThemes(canvasId, ['night'], human, [{ from: 'dark', to: 'night' }])
+    const after = definition(canvasId, def.id)
+    expect(after.template).toContain('data-doop-theme="night"')
+    expect(after.rawCss).toContain('[data-doop-theme="night"] .chip')
+    expect(`${after.template}${after.css}${after.rawCss}`).not.toContain('dark')
+  })
+
+  it('keeps instances following their component, with no override for the renamed markup', async () => {
+    const { canvasId, def, screen } = withChip()
+    actions.setTokens(canvasId, [{ name: '--spacing-4', newName: '--space-4' }], human)
+    actions.setTokenThemes(canvasId, ['night'], human, [{ from: 'dark', to: 'night' }])
+    const renamed = definition(canvasId, def.id)
+    let html = store.getFrame(screen.id)!.html
+    expect(html).toContain(`data-doop-rev="${renamed.renderRev ?? renamed.rev}"`)
+    expect(html).not.toContain('data-doop-overrides')
+    /* a later change to the component still reaches the instance */
+    updateComponent(canvasId, def.id, { css: '.chip{color:red}' }, human)
+    const main = store.getFrame(renamed.mainFrameId!)!
+    actions.updateFrame(main.id, { html: main.html.replace('>New<', '>Fresh<') }, human)
+    await propagation.whenIdle()
+    html = store.getFrame(screen.id)!.html
+    expect(html).toContain('>Fresh<')
+    expect(html).toContain('padding:var(--space-4)')
+    expect(html).not.toContain('data-doop-overrides')
+    /* and the definition kept the new names through the main's write */
+    expect(definition(canvasId, def.id).template).toContain('data-doop-theme="night"')
+  })
+
+  it('leaves a definition linked to a library, and one that names nothing renamed, alone', () => {
+    const { canvasId, def } = withChip()
+    const linked = { ...definition(canvasId, def.id), id: 'linked', mainFrameId: null }
+    linked.source = { canvasId: 'library', componentId: def.id, rev: 1, library: true }
+    store.saveComponent(canvasId, linked)
+    const { component: plain } = createComponentFromHtml(canvasId, { name: 'Plain', html: '<b>Plain</b>' }, human)
+    actions.setTokens(canvasId, [{ name: '--spacing-4', newName: '--space-4' }], human)
+    expect(definition(canvasId, 'linked').template).toContain('var(--spacing-4)')
+    expect(definition(canvasId, plain.id).rev).toBe(plain.rev)
   })
 })

@@ -2,6 +2,8 @@ import { env } from './env.ts'
 import type { Frame } from '../shared/types.ts'
 import * as thumbs from './thumbs.ts'
 import { store } from './store.ts'
+import { stampRender } from './frameCompose.ts'
+import { renderStamp, stampCurrent, type RenderStamp } from './styleVersion.ts'
 
 /**
  * Everything behind GET /i/<frameId>.<ext> except HTTP: the in-process
@@ -21,7 +23,10 @@ import { store } from './store.ts'
  *    and downloads, and is only ever cached here.
  */
 
-const imgCache = new Map<string, { buf: Promise<Buffer>; updatedAt: number; at: number }>()
+/* `stamp`: the frame's own version and what its canvas supplied to the render
+   (styleVersion.ts), so a change to a token it names or to a component it uses, which
+   writes no frame, still retires the image, and a change to anything else does not */
+const imgCache = new Map<string, { buf: Promise<Buffer>; stamp: RenderStamp; at: number }>()
 const IMG_CACHE_MS = 5 * 60_000
 const IMG_CACHE_MAX = 200
 
@@ -41,6 +46,8 @@ export interface ImageRequest {
    *  meaningful for jpg — a png?preview would serve jpeg bytes under an
    *  image/png content-type, so the flag is ignored there. */
   preview: boolean
+  /** a layer export: the CSS selector of the element to cut the render to */
+  layer?: string
   ip: string
   /** consulted only when the render budget is exhausted */
   isAuthenticated: () => Promise<boolean>
@@ -51,10 +58,9 @@ export type ImageResult = { status: 'ok'; buf: Buffer } | { status: 'rate-limite
 /** May reject when the render itself fails — the caller owns the 500. */
 export async function getImage(frame: Frame, req: ImageRequest): Promise<ImageResult> {
   const preview = req.preview && req.ext === 'jpg'
-  const key = imageKey(frame.id, req.ext, req.scale, req.ext === 'jpg' ? req.quality : '', preview)
+  const key = imageKey(frame.id, req.ext, req.scale, req.ext === 'jpg' ? req.quality : '', preview, req.layer)
   const cached = imgCache.get(key)
-  let pending =
-    cached && cached.updatedAt === frame.updatedAt && Date.now() - cached.at < IMG_CACHE_MS ? cached.buf : null
+  let pending = cached && stampCurrent(frame, cached.stamp) && Date.now() - cached.at < IMG_CACHE_MS ? cached.buf : null
 
   /* previews first try the persisted thumbnail: survives redeploys, serves
      instantly even when stale (thumbs revalidates in the background), and
@@ -63,29 +69,43 @@ export async function getImage(frame: Frame, req: ImageRequest): Promise<ImageRe
     const stored = await thumbs.getStored(frame)
     if (stored) {
       pending = Promise.resolve(stored)
-      remember(key, pending, frame.updatedAt)
+      /* as current as the thumb is known to be; unknown after a restart */
+      remember(key, pending, thumbs.stampOf(frame) ?? renderStamp(frame))
     }
   }
 
   if (!pending) {
     if (!(await consumeRenderBudget(req.ip, req.isAuthenticated))) return { status: 'rate-limited' }
+    /* what the render is supplied is known once it reads the frame's HTML: until then the
+       stamp is the frame's version alone */
+    const stamp = renderStamp(frame)
     pending = preview
       ? /* renders AND persists — the next cold start serves from storage */
-        thumbs.create(frame)
-      : loadScreenshot().then(async ({ renderFrame }) =>
-          renderFrame(await store.renderSource(frame), req.scale, {
+        thumbs.create(frame, stamp)
+      : loadScreenshot().then(async ({ renderFrame }) => {
+          const source = await store.renderSource(frame)
+          stampRender(stamp, source)
+          return renderFrame(source, req.scale, {
             type: req.ext === 'jpg' ? 'jpeg' : 'png',
             quality: req.quality,
-          }),
-        )
-    remember(key, pending, frame.updatedAt)
+            layer: req.layer,
+          })
+        })
+    remember(key, pending, stamp)
   }
 
   return { status: 'ok', buf: await pending }
 }
 
-function imageKey(id: string, ext: 'png' | 'jpg', scale: number, quality: number | '', preview: boolean): string {
-  return `${id}:${ext}:${scale}:${quality}:${preview ? 'p' : ''}`
+function imageKey(
+  id: string,
+  ext: 'png' | 'jpg',
+  scale: number,
+  quality: number | '',
+  preview: boolean,
+  layer = '',
+): string {
+  return `${id}:${ext}:${scale}:${quality}:${preview ? 'p' : ''}:${layer}`
 }
 
 /** Seeds the cache with a render another path already paid for. The MCP
@@ -93,12 +113,12 @@ function imageKey(id: string, ext: 'png' | 'jpg', scale: number, quality: number
  *  preview card loads `/i/<id>.png` right after it from a cookie-less sandbox
  *  iframe — anonymous, so metered. Priming turns that load into a free
  *  cached serve instead of a second render against the per-IP budget. */
-export function primeImage(frame: Frame, scale: number, png: Buffer): void {
-  remember(imageKey(frame.id, 'png', scale, '', false), Promise.resolve(png), frame.updatedAt)
+export function primeImage(frame: Frame, scale: number, png: Buffer, stamp: RenderStamp): void {
+  remember(imageKey(frame.id, 'png', scale, '', false), Promise.resolve(png), stamp)
 }
 
-function remember(key: string, pending: Promise<Buffer>, updatedAt: number) {
-  imgCache.set(key, { buf: pending, updatedAt, at: Date.now() })
+function remember(key: string, pending: Promise<Buffer>, stamp: RenderStamp) {
+  imgCache.set(key, { buf: pending, stamp, at: Date.now() })
   /* a failed render must not be served for IMG_CACHE_MS — drop it so the
      next request retries */
   pending.catch(() => {

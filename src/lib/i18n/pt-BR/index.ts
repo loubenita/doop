@@ -10,6 +10,8 @@ import { account } from './account'
 import { agentKeys } from './agentKeys'
 import { webhooks } from './webhooks'
 import { fonts } from './fonts'
+import { agents } from './agents'
+import { skills } from './skills'
 import { models } from './models'
 import { canvas } from './canvas'
 import { stage } from './stage'
@@ -22,6 +24,7 @@ import { admin } from './admin'
 import { ui } from './ui'
 import { components } from './components'
 import { actions } from './actions'
+import { plans } from './plans'
 
 export const ptBR: Catalog = {
   common,
@@ -35,6 +38,8 @@ export const ptBR: Catalog = {
   agentKeys,
   webhooks,
   fonts,
+  agents,
+  skills,
   models,
   canvas,
   stage,
@@ -47,4 +52,5 @@ export const ptBR: Catalog = {
   ui,
   components,
   actions,
+  plans,
 }

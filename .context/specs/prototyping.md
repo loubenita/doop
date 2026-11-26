@@ -3,7 +3,7 @@
 Frames become a clickable flow: an element says what happens when it is clicked (or hovered,
 pressed, keyed, or after a delay), the player runs those interactions full screen, and the editor
 wires them up visually. Code: `shared/prototype.ts` (model, parser, canonical writer, HTML
-scanner), `src/lib/frameProtoRuntime.ts` (triggers inside the frame), `src/components/
+scanner), `src/frame-runtime/proto.ts` (triggers inside the frame), `src/components/
 PrototypePlayer.tsx` (player), `src/components/InteractionsPanel.tsx` and `PrototypeOverlay.tsx`
 (editor), `server/mcp.ts` (`get_prototype`, `set_prototype_start`).
 
@@ -49,8 +49,8 @@ canvas a click therefore still selects. The attributes have no effect on PNG/JPG
 
 ## Player
 
-`PrototypePlayer` evolves `PresentMode`: the frame fills the viewport letterboxed and scaled to
-fit, and stays live (each screen re-posts its frame's HTML when the store updates it).
+`PrototypePlayer` evolves `PresentMode`: by default the frame is letterboxed in the viewport,
+shrunk to fit but never enlarged past its design size, and stays live (each screen re-posts its frame's HTML when the store updates it).
 
 - Each screen boots the frame runtime, renders the HTML, then turns prototype mode on. Triggers
   post `doop:proto-action` with the parsed interaction; the player re-parses it

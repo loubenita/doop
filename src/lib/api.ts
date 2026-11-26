@@ -1,6 +1,9 @@
 import { useStore } from './store'
+import { frameHtmlReady } from './pages'
 import type { InstanceSettings, InstanceSettingsPatch } from '../../shared/instanceSettings'
 import { beginFrameSave } from './frameSaves'
+import { COMPOSES_HEADER } from '../../shared/frameCompose'
+import { frameSource } from './frameCompose'
 import type { StackWrite } from '../../shared/frameStack'
 import type { LocalAgentPreference, LocalAgentJob, LocalAgentResult } from '../../shared/localAgent'
 import type { ImageDescriptionMode, ImageDescriptionPreference } from '../../shared/imageDescriptions'
@@ -9,9 +12,10 @@ import type { CustomProviderConfig, CustomProviderKind } from '../../shared/cust
 import type { NotificationPrefs, NotificationSettings } from '../../shared/notifications'
 import type { WebhookDeliveryResult, WebhookEventType, WebhookInfo } from '../../shared/webhooks'
 import type { AgentFeedbackKind, AgentFeedbackReport } from '../../shared/agentFeedback'
+import type { ProductFeedbackInput } from '../../shared/productFeedback'
 import type {
   ActivityItem,
-  Canvas,
+  ClientCanvas,
   CanvasMeta,
   CardScope,
   CommunityCategory,
@@ -20,6 +24,9 @@ import type {
   Frame,
   FrameVersion,
   FrameVersionInfo,
+  GithubImportRunner,
+  LibraryPublishPolicy,
+  LinkSharingPolicy,
   WorkspaceDetail,
   WorkspaceInvite,
   WorkspaceMember,
@@ -30,7 +37,13 @@ import type { Automation, AutomationRun, AutomationTrigger, Schedule, Step } fro
 import type { BillingInterval, Plan } from '../../shared/billing'
 import type { LinkAccess } from '../../shared/canvasRole'
 import type { CommentAnchorInput } from '../../shared/comments'
-import type { ComponentCode, ComponentDef, ComponentProp, PartOverride } from '../../shared/components'
+import type {
+  ComponentCode,
+  ComponentProp,
+  ComponentSnapshot,
+  PartOverride,
+  WireComponentDef,
+} from '../../shared/components'
 
 /** What the server says about a component beyond the definition itself. */
 export interface ComponentInfo {
@@ -47,29 +60,77 @@ export interface ComponentInfo {
   usage_by_frame: { id: string; name: string; instances: number; approved: boolean }[]
 }
 
-export interface ComponentCandidate {
-  suggested_name: string
-  occurrences: number
-  frames: number
-  elements_each: number
-  sample_text: string
-  example: { frame_id: string; frame_name: string; element: string }
-}
-
 export interface ComponentLibrary {
   id: string
   name: string
-  components: { id: string; name: string; signature: string; description?: string; instances: number }[]
+  /** a library the canvas's workspace has published, rather than a canvas to copy from */
+  library?: boolean
+  /** a canvas to copy from: when it was last edited, the frame Home shows for it,
+   *  and whether someone else owns it */
+  updatedAt?: number
+  previewFrameId?: string
+  shared?: boolean
+  components: {
+    id: string
+    name: string
+    signature: string
+    description?: string
+    instances: number
+    /** a published library's version of the component; absent on a canvas to copy from */
+    rev?: number
+  }[]
+}
+
+export interface LibraryChangeEntry {
+  id: string
+  name: string
+  change: import('../../shared/components').LibraryChange
+}
+
+/** A canvas and its workspace's library: may it have one, what it has published,
+ *  and which of its linked components have a newer published state. */
+export interface CanvasLibrary {
+  /** whether this server sells plans at all; off on a self-hosted one */
+  billing: boolean
+  entitled: boolean
+  blocked?: 'no_workspace' | 'plan_required'
+  workspaceId?: string
+  /** the workspace lets this viewer publish (it may keep that to its owner and admins) */
+  canPublish: boolean
+  library: boolean
+  changes: LibraryChangeEntry[]
+  published_at?: number
+  published_by?: string
+  updates: { id: string; name: string; instances: number }[]
+  /** as a library: the canvases using it that are on an older publication */
+  behind?: { id: string; name: string; components: string[] }[]
+}
+
+/** What "Update everywhere" did, canvas by canvas. */
+export interface LibraryUpdateReport {
+  canvases: {
+    canvas_id: string
+    canvas_name: string
+    updated: string[]
+    frames_changed: number
+    approvals_withdrawn: number
+  }[]
+  /** canvases left as they were: no edit access there, the pull was refused, or the update
+   *  stopped before it reached them */
+  skipped: {
+    canvas_id?: string
+    canvas_name?: string
+    reason: 'no_edit_access' | 'failed' | 'not_reached'
+    message: string
+  }[]
 }
 
 export interface ComponentImpact {
-  component: ComponentDef
-  dry_run: boolean
+  component: WireComponentDef
   impact: {
     instances: number
     frames: { id: string; name: string; instances: number; approved: boolean }[]
     approvals_affected: number
-    overrides_orphaned: { frame_id: string; instance_id: string; parts: string[] }[]
   }
 }
 
@@ -81,9 +142,25 @@ export interface InstanceChangeInput {
   detach?: boolean
 }
 import type { CustomFont } from '../../shared/fonts'
+import type {
+  BuiltInAgent,
+  BuiltInAgentPatch,
+  CustomAgent,
+  CustomAgentInput,
+  CustomAgentPatch,
+} from '../../shared/customAgents'
+import type { CanvasSkills, Skill, SkillInput, SkillPatch } from '../../shared/skills'
+import type { AgentRole } from '../../shared/agents'
 import type { DesignToken, DesignTokenInput, ThemeRename, TokenEdit, TokenResult } from '../../shared/designTokens'
 
 export type HomeActivity = ActivityItem & { canvasId: string; canvasName: string }
+
+/** someone a comment may @mention */
+export interface CanvasPerson {
+  id: string
+  name: string
+  image?: string
+}
 
 export interface CanvasMember {
   userId: string
@@ -175,6 +252,10 @@ export interface RepoManifest {
 export interface GithubImportResult {
   cards: string[]
   rejected: string[]
+  /** who carries the cards out (absent from a server before this) */
+  runner?: GithubImportRunner
+  /** cards that were waiting for their own agent, now the Doop Agent's */
+  handedOver?: number
 }
 
 export interface DiscoveredPage {
@@ -322,6 +403,10 @@ export interface IntegrationsStatus {
 }
 import { getIdentity } from './identity'
 
+function agentScope(workspaceId: string | undefined): string {
+  return workspaceId ? `?workspace=${encodeURIComponent(workspaceId)}` : ''
+}
+
 export interface WorkspacesResponse {
   workspaces: WorkspaceSummary[]
   billing: { enabled: boolean }
@@ -371,7 +456,8 @@ export function errorMessage(err: unknown, fallback: string): string {
 
 export async function req<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, {
-    headers: { 'Content-Type': 'application/json' },
+    /* this client composes frames itself, so answers carry their source */
+    headers: { 'Content-Type': 'application/json', [COMPOSES_HEADER]: '1' },
     ...init,
   })
   if (!res.ok) throw new ApiError(res.status, await res.text())
@@ -404,11 +490,50 @@ export const api = {
     }),
   removeAvatar: () => req<{ ok: boolean }>('/api/me/avatar', { method: 'DELETE' }),
   canvasFonts: (canvasId: string) => req<CustomFont[]>(`/api/canvases/${canvasId}/fonts`),
+  /** custom agents: a workspace's, or without one the signed-in person's own */
+  listCustomAgents: (workspaceId?: string) => req<CustomAgent[]>(`/api/agents${agentScope(workspaceId)}`),
+  createCustomAgent: (input: CustomAgentInput, workspaceId?: string) =>
+    req<CustomAgent>(`/api/agents${agentScope(workspaceId)}`, { method: 'POST', body: JSON.stringify(input) }),
+  updateCustomAgent: (handle: string, patch: CustomAgentPatch, workspaceId?: string) =>
+    req<CustomAgent>(`/api/agents/${encodeURIComponent(handle)}${agentScope(workspaceId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
+  deleteCustomAgent: (handle: string, workspaceId?: string) =>
+    req<{ ok: true }>(`/api/agents/${encodeURIComponent(handle)}${agentScope(workspaceId)}`, { method: 'DELETE' }),
+  /** skills: a workspace's, or without one the signed-in person's own */
+  listSkills: (workspaceId?: string) => req<Skill[]>(`/api/skills${agentScope(workspaceId)}`),
+  /** The skills a request on this canvas can name (handle and description
+   *  only), and the scope this viewer may add one to. */
+  canvasSkills: (canvasId: string) => req<CanvasSkills>(`/api/canvases/${encodeURIComponent(canvasId)}/skills`),
+  createSkill: (input: SkillInput, workspaceId?: string) =>
+    req<Skill>(`/api/skills${agentScope(workspaceId)}`, { method: 'POST', body: JSON.stringify(input) }),
+  updateSkill: (handle: string, patch: SkillPatch, workspaceId?: string) =>
+    req<Skill>(`/api/skills/${encodeURIComponent(handle)}${agentScope(workspaceId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
+  deleteSkill: (handle: string, workspaceId?: string) =>
+    req<{ ok: true }>(`/api/skills/${encodeURIComponent(handle)}${agentScope(workspaceId)}`, { method: 'DELETE' }),
+  /** a canvas's team (the built-in agents it has on, then its custom ones) */
+  canvasTeam: (canvasId: string) => req<AgentRole[]>(`/api/canvases/${canvasId}/agents`),
+  listBuiltInAgents: (workspaceId?: string) => req<BuiltInAgent[]>(`/api/agents/builtin${agentScope(workspaceId)}`),
+  updateBuiltInAgent: (id: string, patch: BuiltInAgentPatch, workspaceId?: string) =>
+    req<BuiltInAgent>(`/api/agents/builtin/${encodeURIComponent(id)}${agentScope(workspaceId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
+  resetBuiltInAgent: (id: string, workspaceId?: string) =>
+    req<BuiltInAgent>(`/api/agents/builtin/${encodeURIComponent(id)}${agentScope(workspaceId)}`, {
+      method: 'DELETE',
+    }),
   rotateWebhookSecret: (id: string) => req<{ secret: string }>(`/api/webhooks/${id}/rotate`, { method: 'POST' }),
   testWebhook: (id: string) => req<WebhookDeliveryResult>(`/api/webhooks/${id}/test`, { method: 'POST' }),
   notificationSettings: () => req<NotificationSettings>('/api/notifications'),
   setNotificationPrefs: (prefs: NotificationPrefs) =>
     req<NotificationSettings>('/api/notifications', { method: 'PUT', body: JSON.stringify(prefs) }),
+  sendProductFeedback: (feedback: ProductFeedbackInput) =>
+    req<{ ok: true }>('/api/product-feedback', { method: 'POST', body: JSON.stringify(feedback) }),
   imageDescriptions: () => req<ImageDescriptionPreference>('/api/image-descriptions'),
   setImageDescriptions: (mode: ImageDescriptionMode) =>
     req<ImageDescriptionPreference>('/api/image-descriptions', { method: 'PUT', body: JSON.stringify({ mode }) }),
@@ -427,15 +552,15 @@ export const api = {
     }),
   stopLocalAgent: () => req<{ ok: boolean }>('/api/local-agent/stop', { method: 'POST' }),
   listCanvases: () => req<CanvasMeta[]>('/api/canvases'),
-  getCanvas: (id: string) => req<Canvas>(`/api/canvases/${id}`),
+  getCanvas: (id: string) => req<ClientCanvas>(`/api/canvases/${id}`),
   deleteCanvas: (id: string) => req(`/api/canvases/${id}`, { method: 'DELETE' }),
   homeActivity: () => req<HomeActivity[]>('/api/home/activity'),
   createCanvas: (name: string, workspaceId?: string) =>
-    req<Canvas>('/api/canvases', { method: 'POST', body: JSON.stringify({ name, workspaceId }) }),
+    req<ClientCanvas>('/api/canvases', { method: 'POST', body: JSON.stringify({ name, workspaceId }) }),
   /* file a canvas in a workspace, or back in its owner's personal space (null) */
   moveCanvas: (id: string, workspaceId: string | null) =>
     req(`/api/canvases/${id}/workspace`, { method: 'PUT', body: JSON.stringify({ workspaceId }) }),
-  duplicateCanvas: (id: string) => req<Canvas>(`/api/canvases/${id}/duplicate`, { method: 'POST' }),
+  duplicateCanvas: (id: string) => req<ClientCanvas>(`/api/canvases/${id}/duplicate`, { method: 'POST' }),
   claimCanvas: (id: string) => req(`/api/canvases/${id}/claim`, { method: 'POST' }),
   renameCanvas: (id: string, name: string) =>
     req('/api/canvases/' + id, { method: 'PATCH', body: JSON.stringify({ name, actor: actor() }) }),
@@ -444,13 +569,13 @@ export const api = {
     req('/api/canvases/' + id, { method: 'PATCH', body: JSON.stringify({ linkAccess }) }),
   /* community gallery: owner-only listing, open browsing and copying */
   publishCanvas: (id: string, listing: { description: string; category: CommunityCategory }) =>
-    req<Pick<Canvas, 'publishedAt' | 'description' | 'category'>>(`/api/canvases/${id}/publish`, {
+    req<Pick<ClientCanvas, 'publishedAt' | 'description' | 'category'>>(`/api/canvases/${id}/publish`, {
       method: 'PUT',
       body: JSON.stringify(listing),
     }),
   unpublishCanvas: (id: string) => req(`/api/canvases/${id}/publish`, { method: 'DELETE' }),
   listCommunity: () => req<CommunityItem[]>('/api/community'),
-  copyCommunityCanvas: (id: string) => req<Canvas>(`/api/community/${id}/copy`, { method: 'POST' }),
+  copyCommunityCanvas: (id: string) => req<ClientCanvas>(`/api/community/${id}/copy`, { method: 'POST' }),
   /* collaborators: the owner plus invited members */
   listMembers: (canvasId: string) => req<CanvasMember[]>(`/api/canvases/${canvasId}/members`),
   inviteMember: (canvasId: string, email: string) =>
@@ -527,7 +652,7 @@ export const api = {
     req(`/api/canvases/${canvasId}/references/${refId}`, { method: 'DELETE' }),
   resolveProposal: (canvasId: string, proposalId: string, accept: boolean) =>
     req(`/api/canvases/${canvasId}/proposals/${proposalId}`, { method: 'POST', body: JSON.stringify({ accept }) }),
-  /* raw image bytes -> permanent /a/ URL (5 MB cap, type sniffed server-side) */
+  /* raw image bytes -> permanent /a/ URL (5 MB on Free, 100 MB on Pro; type sniffed server-side) */
   uploadAsset: async (canvasId: string, blob: Blob) => {
     const res = await fetch(`/api/canvases/${canvasId}/assets`, {
       method: 'POST',
@@ -535,7 +660,7 @@ export const api = {
       body: blob,
     })
     if (!res.ok) {
-      if (res.status === 413) throw new Error('image exceeds the 5 MB limit')
+      if (res.status === 413) throw new Error('image exceeds the 100 MB limit')
       const text = await res.text()
       let msg = `${res.status} ${text}`
       try {
@@ -586,15 +711,23 @@ export const api = {
         pageId:
           useStore.getState().canvas?.id === canvasId ? (useStore.getState().activePageId ?? undefined) : undefined,
         ...input,
+        ...(typeof input.html === 'string' ? { html: frameSource(input.html) } : {}),
         actor: actor(),
       }),
     }),
   updateFrame: async (frameId: string, patch: Partial<Frame>, expectedUpdatedAt?: number) => {
+    /* HTML made from a frame whose page this browser has not read (or holds
+       stale) would save a blank or old design over the real one */
+    if (patch.html !== undefined && !frameHtmlReady(useStore.getState(), frameId))
+      throw new Error('This page is still loading; try again in a moment.')
     const finish = ['html', 'width', 'height'].some((key) => key in patch) ? beginFrameSave(frameId) : () => {}
+    /* only ever a frame's source leaves this browser: on a canvas on an actor the edit
+       is stored as sent, with no server pass to take composed blocks out again */
+    const sent = patch.html === undefined ? patch : { ...patch, html: frameSource(patch.html) }
     try {
       return await req<Frame>('/api/frames/' + frameId, {
         method: 'PATCH',
-        body: JSON.stringify({ ...patch, expectedUpdatedAt, actor: actor() }),
+        body: JSON.stringify({ ...sent, expectedUpdatedAt, actor: actor() }),
       })
     } finally {
       finish()
@@ -605,17 +738,35 @@ export const api = {
     req<{ html: string; width: number; height: number; variants: number }>(
       `/api/canvases/${canvasId}/components/${componentId}/preview`,
     ),
-  componentCandidates: (canvasId: string) =>
-    req<ComponentCandidate[]>(`/api/canvases/${canvasId}/component-candidates`),
   componentLibraries: (canvasId: string) => req<ComponentLibrary[]>(`/api/canvases/${canvasId}/component-libraries`),
-  createComponent: (
-    canvasId: string,
-    body: { name: string; frameId: string; element: string; replaceMatching?: boolean; description?: string },
-  ) =>
-    req<{ component: ComponentDef; converted: { frameId: string; instances: number }[]; frames: Frame[] }>(
-      `/api/canvases/${canvasId}/components`,
-      { method: 'POST', body: JSON.stringify(body) },
+  canvasLibrary: (canvasId: string) => req<CanvasLibrary>(`/api/canvases/${canvasId}/library`),
+  publishLibrary: (canvasId: string, components?: string[]) =>
+    req<{ published: LibraryChangeEntry[]; removed: LibraryChangeEntry[] }>(
+      `/api/canvases/${canvasId}/library/publish`,
+      { method: 'POST', body: JSON.stringify(components ? { components } : {}) },
     ),
+  unpublishLibrary: (canvasId: string, components?: string[]) =>
+    req<{ unpublished: { id: string; name: string }[] }>(`/api/canvases/${canvasId}/library`, {
+      method: 'DELETE',
+      body: JSON.stringify(components ? { components } : {}),
+    }),
+  /** a published component as its library last published it, before this canvas uses it */
+  libraryPreview: (canvasId: string, libraryCanvasId: string, componentId: string) =>
+    req<{ html: string; width: number; height: number; variants: number }>(
+      `/api/canvases/${canvasId}/components/${componentId}/preview?library=${encodeURIComponent(libraryCanvasId)}`,
+    ),
+  /** pull the library's latest publication into every canvas of the workspace using it */
+  updateLibraryEverywhere: (canvasId: string) =>
+    req<LibraryUpdateReport>(`/api/canvases/${canvasId}/library/update-consumers`, { method: 'POST' }),
+  workspaceLibraries: (workspaceId: string) =>
+    req<{ id: string; name: string; components: number; publishedAt: number; usedBy: number; behind?: number }[]>(
+      `/api/workspaces/${workspaceId}/libraries`,
+    ),
+  createComponent: (canvasId: string, body: { name: string; frameId: string; element: string; description?: string }) =>
+    req<{ component: WireComponentDef; frames: Frame[] }>(`/api/canvases/${canvasId}/components`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
   updateComponent: (
     canvasId: string,
     componentId: string,
@@ -624,29 +775,41 @@ export const api = {
       description?: string
       props?: ComponentProp[]
       code?: ComponentCode | null
-      dryRun?: boolean
     },
   ) =>
     req<ComponentImpact>(`/api/canvases/${canvasId}/components/${componentId}`, {
       method: 'PATCH',
       body: JSON.stringify(body),
     }),
+  /** a soft delete: no frame changes, instances keep their markup, and it can be restored */
   deleteComponent: (canvasId: string, componentId: string) =>
-    req<{ deleted: string; instances_detached: number }>(`/api/canvases/${canvasId}/components/${componentId}`, {
-      method: 'DELETE',
-    }),
+    req<{ deleted: string; instances_kept: number; frames: number }>(
+      `/api/canvases/${canvasId}/components/${componentId}`,
+      { method: 'DELETE' },
+    ),
+  /** bring a deleted component back (`restoreComponent` below puts one back to an earlier revision) */
+  undeleteComponent: (canvasId: string, componentId: string) =>
+    req<{ component: WireComponentDef; main: 'kept' | 'written' | 'none' }>(
+      `/api/canvases/${canvasId}/components/${componentId}/undelete`,
+      { method: 'POST' },
+    ),
   restoreComponent: (canvasId: string, componentId: string, rev: number) =>
     req<ComponentImpact>(`/api/canvases/${canvasId}/components/${componentId}/restore`, {
       method: 'POST',
       body: JSON.stringify({ rev }),
     }),
   importComponent: (canvasId: string, sourceCanvasId: string, component: string) =>
-    req<ComponentDef>(`/api/canvases/${canvasId}/components/import`, {
+    req<WireComponentDef>(`/api/canvases/${canvasId}/components/import`, {
       method: 'POST',
       body: JSON.stringify({ sourceCanvasId, component }),
     }),
+  /** a component's kept earlier revisions, oldest first: not part of the canvas the room sends */
+  componentRevisions: (canvasId: string, componentId: string) =>
+    req<{ rev: number; revisions: ComponentSnapshot[] }>(
+      `/api/canvases/${canvasId}/components/${componentId}/revisions`,
+    ),
   syncComponent: (canvasId: string, componentId: string) =>
-    req<{ component: ComponentDef; updated: boolean }>(`/api/canvases/${canvasId}/components/${componentId}/sync`, {
+    req<{ component: WireComponentDef; updated: boolean }>(`/api/canvases/${canvasId}/components/${componentId}/sync`, {
       method: 'POST',
     }),
   insertInstance: (
@@ -794,6 +957,8 @@ export const api = {
       selector?: string
       elementId?: string
       snippet: string
+      /** the people picked from the @ list, for names several share */
+      mentions?: string[]
       text: string
       x: number
       y: number
@@ -807,11 +972,16 @@ export const api = {
       body: JSON.stringify({ selector, ...(snippet ? { snippet } : {}) }),
     }),
   /** a comment pinned to a point on the canvas (world coordinates on a page) rather than to an element */
-  addCanvasComment: (canvasId: string, input: { pageId: string; x: number; y: number; text: string }) =>
-    req(`/api/canvases/${canvasId}/comments`, { method: 'POST', body: JSON.stringify(input) }),
-  replyComment: (commentId: string, text: string) =>
-    req(`/api/comments/${commentId}/replies`, { method: 'POST', body: JSON.stringify({ text }) }),
+  addCanvasComment: (
+    canvasId: string,
+    input: { pageId: string; x: number; y: number; text: string; mentions?: string[] },
+  ) => req(`/api/canvases/${canvasId}/comments`, { method: 'POST', body: JSON.stringify(input) }),
+  /** `mentions`: the people picked from the @ list, for names several share */
+  replyComment: (commentId: string, text: string, mentions: string[] = []) =>
+    req(`/api/comments/${commentId}/replies`, { method: 'POST', body: JSON.stringify({ text, mentions }) }),
   resolveComment: (commentId: string) => req(`/api/comments/${commentId}/resolve`, { method: 'POST' }),
+  /** who a comment on this canvas may @mention: owner, members, workspace members */
+  canvasPeople: (canvasId: string) => req<CanvasPerson[]>(`/api/canvases/${canvasId}/people`),
   /** re-pin a thread (its root or any reply names it) where its pin was dropped */
   moveComment: (commentId: string, anchor: CommentAnchorInput) =>
     req<ElementComment>(`/api/comments/${commentId}/anchor`, { method: 'PATCH', body: JSON.stringify(anchor) }),
@@ -835,6 +1005,12 @@ export const api = {
   getWorkspace: (id: string) => req<WorkspaceDetail>(`/api/workspaces/${id}`),
   renameWorkspace: (id: string, name: string) =>
     req<WorkspaceSummary>(`/api/workspaces/${id}`, { method: 'PATCH', body: JSON.stringify({ name }) }),
+  setLibraryPublish: (id: string, libraryPublish: LibraryPublishPolicy) =>
+    req<WorkspaceSummary>(`/api/workspaces/${id}`, { method: 'PATCH', body: JSON.stringify({ libraryPublish }) }),
+  setLinkSharing: (id: string, linkSharing: LinkSharingPolicy) =>
+    req<WorkspaceSummary>(`/api/workspaces/${id}`, { method: 'PATCH', body: JSON.stringify({ linkSharing }) }),
+  setWorkspaceSeats: (id: string, seats: number) =>
+    req<WorkspaceSummary>(`/api/workspaces/${id}/billing/seats`, { method: 'PUT', body: JSON.stringify({ seats }) }),
   deleteWorkspace: (id: string) => req(`/api/workspaces/${id}`, { method: 'DELETE' }),
   inviteToWorkspace: (id: string, email: string, role: WorkspaceRole = 'member') =>
     req<WorkspaceInviteResult>(`/api/workspaces/${id}/members`, {
@@ -849,10 +1025,11 @@ export const api = {
     req(`/api/workspaces/${id}/invites/${inviteId}`, { method: 'DELETE' }),
   /* billing: the catalogue, and the hosted Stripe pages */
   billingPlans: () => req<PlansResponse>('/api/billing/plans'),
-  workspaceCheckout: (id: string, interval: BillingInterval) =>
+  /** `seats` is how many to pay for; the bill never counts fewer than the members */
+  workspaceCheckout: (id: string, interval: BillingInterval, seats?: number) =>
     req<{ url: string }>(`/api/workspaces/${id}/billing/checkout`, {
       method: 'POST',
-      body: JSON.stringify({ interval }),
+      body: JSON.stringify({ interval, seats }),
     }),
   workspacePortal: (id: string) => req<{ url: string }>(`/api/workspaces/${id}/billing/portal`, { method: 'POST' }),
   syncWorkspaceBilling: (id: string, sessionId?: string) =>
@@ -902,7 +1079,14 @@ export interface AdminStats {
 /** Admin → Sign-in: the policy, and what it depends on. */
 export interface AdminInstanceSettings {
   settings: InstanceSettings
-  providers: { enabled: boolean; displayName?: string; google: boolean; microsoft: boolean; apple: boolean }
+  providers: {
+    enabled: boolean
+    displayName?: string
+    google: boolean
+    microsoft: boolean
+    github: boolean
+    apple: boolean
+  }
   workspaces: { id: string; name: string; memberCount: number }[]
   /** has an admin signed in through SSO yet? (the auto-redirect guard) */
   ssoAdminSignedIn: boolean

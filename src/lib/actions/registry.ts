@@ -3,8 +3,11 @@
    command, its name and its chord are written once. The canvas page lends
    the registry what only it holds (its modals and panels) as the host. */
 
-import type { PlainMessageKey } from '../i18n'
+import { t, type PlainMessageKey } from '../i18n'
 import { useStore } from '../store'
+import { currentMe, offersUpgrade } from '../me'
+import { openUpgrade } from '../upgrade'
+import { offersFeedback, openFeedback } from '../feedback'
 import { currentPageCanvas } from '../pages'
 import { readingOrder } from '../../../shared/frameOrder'
 import { redo, undo } from '../history'
@@ -19,15 +22,22 @@ import {
   toggleLockSelection,
   toggleSelectionHidden,
 } from '../layerEdits'
-import { reorderSelection, selectAll } from '../selectionKeys'
+import { enterSelection, exitSelection, reorderSelection, selectAll } from '../selectionKeys'
+import { copyElementLink } from '../elementLink'
+import { copyElementPng, copyFramePng } from '../frameExport'
+import { getExportSettings } from '../exportSettings'
+import { trackPngCopy } from '../exportEvents'
+import { elementExportTarget } from '../layers'
 import type { Chord } from './chords'
-import { IS_MAC, matchesChord } from './chords'
+import { IS_MAC, matchesChord, type KeyInput } from './chords'
 import {
   addAutoLayout,
   align,
   arrangeCount,
   canEdit,
+  canGroup,
   canPickColor,
+  canUngroup,
   copyProperties,
   distributeEdgesOf,
   distributeSpacingOf,
@@ -129,6 +139,9 @@ export interface CanvasAction {
    *  the canvas page claims with rules of their own) */
   hintOnly?: boolean
   enabled?: () => boolean
+  /** left out of the canvas menu while it is not enabled, instead of greyed
+   *  (the palette always leaves out what is not enabled) */
+  hideWhenDisabled?: boolean
   /** a toggle's state, for the check a menu row wears */
   checked?: () => boolean
   /** false when there was nothing to act on: the key is left to the browser */
@@ -173,6 +186,42 @@ function duplicate(): boolean {
   const frames = selectedFrames()
   if (!frames.length) return false
   duplicateFrames(frames)
+  return true
+}
+
+/** ⌘L: a link to the picked layer, else to the one selected frame. */
+function copyLink(): boolean {
+  const p = pickedLayers()
+  const selector = p?.selectors[p.selectors.length - 1]
+  if (p && selector) {
+    void copyElementLink(p.frame, { selector })
+    return true
+  }
+  const frames = selectedFrames()
+  const frame = frames.length === 1 ? frames[0] : undefined
+  if (!frame) return false
+  navigator.clipboard
+    .writeText(`${location.origin}/c/${frame.canvasId}?frame=${frame.id}`)
+    .then(() => store().pushNotice(t('stage.linkCopied')))
+    .catch(console.error)
+  return true
+}
+
+/** ⇧⌘C: the picked layer, else the one selected frame, as a PNG. */
+function copyAsPng(): boolean {
+  const { scale } = getExportSettings()
+  const p = pickedLayers()
+  const selector = p?.selectors[p.selectors.length - 1]
+  if (p && selector) {
+    trackPngCopy('element', 'shortcut')
+    void copyElementPng(p.frame, elementExportTarget(p.frame, selector), scale)
+    return true
+  }
+  const frames = selectedFrames()
+  const frame = frames.length === 1 ? frames[0] : undefined
+  if (!frame) return false
+  trackPngCopy('frame', 'shortcut')
+  void copyFramePng(frame, scale)
   return true
 }
 
@@ -302,6 +351,24 @@ export const ACTIONS: readonly CanvasAction[] = [
     run: pasteReplace,
   },
   {
+    id: 'copy-link',
+    label: 'actions.copyLink',
+    menu: 'edit',
+    section: 1,
+    keys: [mod('l')],
+    enabled: () => !!pickedLayers() || selectedFrames().length === 1,
+    run: copyLink,
+  },
+  {
+    id: 'copy-as-png',
+    label: 'actions.copyAsPng',
+    menu: 'edit',
+    section: 1,
+    keys: [mod('c', { shift: true })],
+    enabled: () => !!pickedLayers() || selectedFrames().length === 1,
+    run: copyAsPng,
+  },
+  {
     id: 'duplicate',
     label: 'actions.duplicate',
     menu: 'edit',
@@ -383,6 +450,28 @@ export const ACTIONS: readonly CanvasAction[] = [
     run: () => {
       store().select(null)
     },
+  },
+  {
+    /* ↩ and ⇧↩ stay the canvas page's own (they leave buttons and the Layers
+       tree alone); listed here so menus show them */
+    id: 'select-children',
+    label: 'actions.selectChildren',
+    menu: 'edit',
+    section: 5,
+    keys: [{ key: 'Enter' }],
+    hintOnly: true,
+    enabled: hasSelection,
+    run: enterSelection,
+  },
+  {
+    id: 'select-parent',
+    label: 'actions.selectParent',
+    menu: 'edit',
+    section: 5,
+    keys: [{ key: 'Enter', shift: true }],
+    hintOnly: true,
+    enabled: () => !!pickedLayers(),
+    run: exitSelection,
   },
   {
     id: 'select-inverse',
@@ -607,7 +696,7 @@ export const ACTIONS: readonly CanvasAction[] = [
     section: 0,
     keys: [mod('g')],
     edit: true,
-    enabled: hasInnerPick,
+    enabled: canGroup,
     run: () => groupSelection('group'),
   },
   {
@@ -617,7 +706,7 @@ export const ACTIONS: readonly CanvasAction[] = [
     section: 0,
     keys: [mod('g', { shift: true }), mod('Backspace')],
     edit: true,
-    enabled: hasInnerPick,
+    enabled: canUngroup,
     run: ungroupSelection,
   },
   {
@@ -1063,7 +1152,36 @@ export const ACTIONS: readonly CanvasAction[] = [
     section: 1,
     run: () => h()?.contactSupport(),
   },
+  {
+    /* a short note to the Doop team, where the server has an inbox for it */
+    id: 'feedback',
+    label: 'actions.sendFeedback',
+    menu: 'help',
+    section: 1,
+    enabled: () => !h()?.guest && offersFeedback(currentMe()),
+    hideWhenDisabled: true,
+    run: () => openFeedback(),
+  },
+  {
+    /* the plans, from the editor's menu and the ⌘K palette */
+    id: 'upgrade',
+    label: 'actions.upgradeToPro',
+    menu: 'help',
+    section: 2,
+    /* only where an upgrade can be bought and is not already had */
+    enabled: () => !h()?.guest && offersUpgrade(currentMe()),
+    hideWhenDisabled: true,
+    run: () => openUpgrade({ source: 'canvas-menu' }),
+  },
 ]
+
+/** The action registered under `id`; throws for an id nobody registered,
+ *  so a menu naming a command that was renamed fails loudly. */
+export function actionById(id: string): CanvasAction {
+  const action = ACTIONS.find((a) => a.id === id)
+  if (!action) throw new Error(`No canvas action ${id}`)
+  return action
+}
 
 /** Whether the action can run now: the canvas is open and editable when it
  *  needs to be, and its own test passes. */
@@ -1085,6 +1203,13 @@ export function runAction(action: CanvasAction) {
 export function takesKey(action: CanvasAction, typing: boolean): boolean {
   if (!host || host.presenting || action.hintOnly) return false
   return !typing || !!action.keys?.some((chord) => chord.global)
+}
+
+/** The chord is one of the canvas's own, whether or not its action could
+ *  run now: an open menu still keeps such a chord from the browser (⌘D
+ *  bookmarking, ⌘K the search bar) while running nothing. */
+export function isCanvasChord(e: KeyInput, mac = IS_MAC): boolean {
+  return ACTIONS.some((action) => !action.hintOnly && action.keys?.some((chord) => matchesChord(e, chord, mac)))
 }
 
 type KeyEventLike = Pick<

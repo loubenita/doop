@@ -3,21 +3,33 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var app = AppModel()
+    @State private var pendingLink: CanvasLink?
     @State private var settings = false
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         Group {
             if app.loading {
                 VStack(spacing: 20) { DoopWordmark(); ProgressView("Opening your workspace…") }
             } else if app.user == nil {
-                SignInView(app: app, settings: $settings)
+                SignInView(app: app, settings: $settings).analyticsScreen("Sign in")
             } else {
-                LibraryView(app: app, settings: $settings)
+                LibraryView(app: app, settings: $settings, pendingLink: $pendingLink)
             }
         }
         .tint(.primary)
+        .onOpenURL { url in
+            guard let link = CanvasLink.parse(url), link.serverOrigin == app.client.server.origin.absoluteString else { return }
+            pendingLink = link
+            settings = false
+        }
         .task { await app.restore() }
-        .sheet(isPresented: $settings) { NativeSettings(app: app).tint(.primary) }
+        /* a setup that ran out of retries (offline at launch) tries again on each return */
+        .task(id: scenePhase) {
+            guard scenePhase == .active else { return }
+            Analytics.shared.start(server: app.client.server)
+        }
+        .sheet(isPresented: $settings) { NativeSettings(app: app).tint(.primary).analyticsScreen("Settings") }
     }
 }
 
@@ -177,6 +189,17 @@ private struct ProviderMark: View {
     }
 }
 
+/// Both the library list and the permission-checked canvas detail contain these fields.
+private struct CanvasDestination: Hashable, Decodable {
+    let id: String
+    let name: String
+
+    init(_ summary: CanvasSummary) {
+        id = summary.id
+        name = summary.name
+    }
+}
+
 private struct LibraryView: View {
     @ObservedObject var app: AppModel
     @Binding var settings: Bool
@@ -185,14 +208,14 @@ private struct LibraryView: View {
     @State private var showingAgents = false
     @FocusState private var searchFocused: Bool
     @State private var workspace = "all"
-    @State private var path: [CanvasSummary] = []
+    @Binding var pendingLink: CanvasLink?
+    @State private var path: [CanvasDestination] = []
+    @State private var linkError: String?
     @State private var creating = false
     @State private var title = ""
     @State private var deleting: CanvasSummary?
     @State private var renaming: CanvasSummary?
     @State private var busy = false
-    /// A Live Activity tapped before the library loaded; opened after the first reload.
-    @State private var pendingLink: (canvasID: String, serverOrigin: String)?
     #if DEBUG
     /// `.task` restarts every time the library reappears, so `-openCanvas` must fire only once.
     @State private var openedLaunchCanvas = false
@@ -210,7 +233,8 @@ private struct LibraryView: View {
         NavigationStack(path: $path) {
             Group {
                 if showingAgents {
-                    WorkingAgentsView(client: app.client) { canvas in path.append(canvas) }
+                    WorkingAgentsView(client: app.client) { canvas in path.append(CanvasDestination(canvas)) }
+                        .analyticsScreen("Agents")
                 } else {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
@@ -219,14 +243,12 @@ private struct LibraryView: View {
                             .font(.custom("HankenGrotesk-Regular_Light", size: 34, relativeTo: .largeTitle))
                         Text("Pick up an idea. Or start something new.").foregroundStyle(.secondary)
                     }.padding(.top, 12)
-                    // The count sits beside the scope it counts, not at the far edge.
                     HStack(spacing: 4) {
                         Picker("Workspace", selection: $workspace) {
                             Text("All canvases").tag("all")
                             Text("Personal").tag("personal")
                             ForEach(app.workspaces) { Text($0.name).tag($0.id) }
                         }.pickerStyle(.menu)
-                        Text("\(filtered.count) \(filtered.count == 1 ? "canvas" : "canvases")").font(.caption).foregroundStyle(.secondary)
                         Spacer(minLength: 0)
                     }
                     if let error = app.error { Text(error).foregroundStyle(.red).font(.callout) }
@@ -239,7 +261,7 @@ private struct LibraryView: View {
                     }
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 280), spacing: 20)], spacing: 20) {
                         ForEach(filtered) { canvas in
-                            NavigationLink(value: canvas) { CanvasCard(canvas: canvas, origin: app.client.server.origin) }
+                            NavigationLink(value: CanvasDestination(canvas)) { CanvasCard(canvas: canvas, origin: app.client.server.origin) }
                                 .buttonStyle(.plain)
                                 .contextMenu {
                                     Button("Rename") { title = canvas.name; renaming = canvas }
@@ -250,6 +272,8 @@ private struct LibraryView: View {
                     }
                 }.padding(24).frame(maxWidth: 1200).frame(maxWidth: .infinity)
             }
+            // on the library content, not LibraryView: switching back from Agents re-appears only this
+            .analyticsScreen("Library")
                 }
             }
             .background(Color(uiColor: .systemGroupedBackground))
@@ -274,20 +298,20 @@ private struct LibraryView: View {
             .refreshable { await app.reload() }
             .task {
                 await app.reload()
-                if let link = pendingLink { pendingLink = nil; open(link) }
                 #if DEBUG
                 // -openCanvas <id> jumps straight to a canvas (simulator automation).
                 if !openedLaunchCanvas, path.isEmpty, let id = UserDefaults.standard.string(forKey: "openCanvas"), let canvas = app.canvases.first(where: { $0.id == id }) {
                     openedLaunchCanvas = true
-                    path.append(canvas)
+                    path.append(CanvasDestination(canvas))
                 }
                 #endif
             }
 
-            .navigationDestination(for: CanvasSummary.self) { canvas in NativeCanvasView(summary: canvas, client: app.client, currentUser: app.user) }
-            .onOpenURL { url in
-                guard let link = CanvasLink.parse(url) else { return }
-                if app.canvases.isEmpty { pendingLink = link } else { open(link) }
+            // `.id` gives each canvas its own view: replacing the open canvas (a Live Activity tap)
+            // would otherwise reuse the destination and keep the old canvas's `@StateObject` model.
+            .navigationDestination(for: CanvasDestination.self) { canvas in
+                NativeCanvasView(id: canvas.id, name: canvas.name, client: app.client, currentUser: app.user).id(canvas.id)
+                    .analyticsScreen("Canvas", properties: ["canvas_id": canvas.id])
             }
             .alert("New canvas", isPresented: $creating) {
                 TextField("Canvas name", text: $title)
@@ -305,6 +329,12 @@ private struct LibraryView: View {
             .overlay { if busy { ProgressView().padding(24).background(.regularMaterial, in: RoundedRectangle(cornerRadius: 20)) } }
         }
     }
+    .task(id: pendingLink) {
+        if let pendingLink { await open(pendingLink) }
+    }
+    .alert("Couldn’t open canvas", isPresented: Binding(get: { linkError != nil }, set: { if !$0 { linkError = nil } })) {
+        Button("OK") { linkError = nil }
+    } message: { Text(linkError ?? "") }
     }
 
     private var librarySearchBar: some View {
@@ -336,12 +366,31 @@ private struct LibraryView: View {
             .frame(maxWidth: .infinity)
     }
 
-    /// Opens the canvas a Live Activity links to, if it lives on this app's server.
-    private func open(_ link: (canvasID: String, serverOrigin: String)) {
-        guard link.serverOrigin == app.client.server.origin.absoluteString,
-              let canvas = app.canvases.first(where: { $0.id == link.canvasID }) else { return }
-        showingAgents = false
-        path = [canvas]
+    @MainActor
+    private func open(_ link: CanvasLink) async {
+        let client = app.client
+        let userID = app.user?.id
+        guard link.serverOrigin == client.server.origin.absoluteString else {
+            pendingLink = nil
+            return
+        }
+        do {
+            let destination: CanvasDestination
+            if let listed = app.canvases.first(where: { $0.id == link.canvasID }) {
+                destination = CanvasDestination(listed)
+            } else {
+                // Link-only access is checked by the canvas endpoint and never adds it to the library.
+                destination = try await client.get("/api/canvases/\(link.canvasID)")
+            }
+            guard !Task.isCancelled, pendingLink == link, app.client === client, app.user?.id == userID else { return }
+            showingAgents = false
+            linkError = nil
+            path = [destination]
+        } catch {
+            guard !Task.isCancelled, pendingLink == link, app.client === client, app.user?.id == userID else { return }
+            linkError = error.localizedDescription
+        }
+        pendingLink = nil
     }
 
     private func create() {
@@ -350,7 +399,7 @@ private struct LibraryView: View {
             do {
                 let name = title.trimmingCharacters(in: .whitespacesAndNewlines)
                 let canvas = try await app.createCanvas(name: name.isEmpty ? "Untitled canvas" : name, workspaceId: workspace == "all" || workspace == "personal" ? nil : workspace)
-                path.append(canvas)
+                path.append(CanvasDestination(canvas))
             } catch { app.error = error.localizedDescription }
             busy = false
         }
@@ -387,8 +436,11 @@ private struct CanvasCard: View {
                 if let frameID = canvas.previewFrameId {
                     GeometryReader { geometry in
                         AsyncImage(url: origin.appendingPathComponent("i/\(frameID).jpg").appending(queryItems: [URLQueryItem(name: "preview", value: "")])) { image in
+                            // `clipped()` hides the overflow but does not shrink the hit area: a tall
+                            // page filled to the card's width reached over the cards above it.
                             image.resizable().scaledToFill()
                                 .frame(width: geometry.size.width, height: geometry.size.height).clipped()
+                                .allowsHitTesting(false)
                         } placeholder: {
                             placeholder.frame(width: geometry.size.width, height: geometry.size.height)
                         }
@@ -408,6 +460,8 @@ private struct CanvasCard: View {
         .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 20))
         .clipShape(RoundedRectangle(cornerRadius: 20))
         .overlay(RoundedRectangle(cornerRadius: 20).strokeBorder(.primary.opacity(0.06)))
+        // Taps and the long-press preview are the card as drawn, never anything spilling past it.
+        .contentShape([.interaction, .contextMenuPreview], RoundedRectangle(cornerRadius: 20))
     }
     private var placeholder: some View { Image(systemName: "square.stack.3d.up").font(.system(size: 42, weight: .ultraLight)).foregroundStyle(.tertiary) }
 }

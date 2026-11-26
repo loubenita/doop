@@ -1,10 +1,24 @@
 import type { Page } from 'puppeteer-core'
-import type { Frame } from '../shared/types'
+import type { WireComponentDef } from '../shared/components'
+import type { DesignToken } from '../shared/designTokens'
+import type { AgentTask, Canvas, CanvasPageInfo, Frame } from '../shared/types'
 import { fixtureUrl } from './browser'
 
 declare global {
   interface Window {
-    canvasPageHarness: { seed: (frames: Frame[]) => void }
+    canvasPageHarness: {
+      seed: (frames: Frame[], canvas?: Partial<Canvas>) => void
+      /** the page list as the room would send it after someone's edit */
+      setPages: (pages: CanvasPageInfo[]) => void
+      /** the canvas's tokens as the room's `tokens` message would set them */
+      setTokens: (tokens: DesignToken[], themes: string[]) => void
+      /** a component as the room's `component` message would set it */
+      setComponent: (component: WireComponentDef) => void
+      /** the agents' tasks as the room's init would carry them */
+      setTasks: (tasks: AgentTask[]) => void
+      /** the frame's HTML as the store holds it */
+      frameHtml: (id: string) => string
+    }
   }
 }
 
@@ -18,11 +32,17 @@ export function canvasFrame(frame: Pick<Frame, 'id' | 'name' | 'x' | 'y' | 'widt
  * whose subject is what the browser does with the page: the room's socket
  * never opens, the session is a signed-in person, and every other API call is
  * answered with an empty object. `search` is the page URL's query, as a deep
- * link carries it.
+ * link carries it. `canvas` is anything else the room's canvas would carry:
+ * its pages, or the `landingPageId` the server sends for a library canvas.
  */
-export async function openCanvasPage(page: Page, frames: Frame[], search = ''): Promise<void> {
+export async function openCanvasPage(
+  page: Page,
+  frames: Frame[],
+  search = '',
+  canvas: Partial<Canvas> = {},
+): Promise<void> {
   await prepareCanvasPage(page)
-  await showCanvasPage(page, frames, search)
+  await showCanvasPage(page, frames, search, canvas)
 }
 
 /** The stubs alone, for a test that has something to do before the page loads. */
@@ -51,9 +71,15 @@ export async function prepareCanvasPage(page: Page): Promise<void> {
 }
 
 /** Load the fixture, or load it again, on a prepared page. */
-export async function showCanvasPage(page: Page, frames: Frame[], search = ''): Promise<void> {
+export async function showCanvasPage(
+  page: Page,
+  frames: Frame[],
+  search = '',
+  canvas: Partial<Canvas> = {},
+): Promise<void> {
   await page.goto(fixtureUrl(`canvasPage.html${search}`))
   await page.waitForFunction(() => !!window.canvasPageHarness && !!document.querySelector('.stage'))
-  await page.evaluate((frames) => window.canvasPageHarness.seed(frames), frames)
-  await page.waitForSelector('[data-frame-title]')
+  await page.evaluate((frames, canvas) => window.canvasPageHarness.seed(frames, canvas), frames, canvas)
+  /* an empty canvas has no frame title to wait for: its Layers rail is what shows */
+  await page.waitForSelector(frames.length ? '[data-frame-title]' : '[data-slot="pages-panel"]')
 }

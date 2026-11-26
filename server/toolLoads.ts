@@ -1,5 +1,9 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+import { settleForRead } from './propagation.ts'
 import { store } from './store.ts'
+import { detached } from './journal.ts'
+import { runOperation } from './workBudget.ts'
+import { WriteRefusedError } from './writeRefusal.ts'
 
 /** The canvases a tool call names: `canvas_id`, and the canvases of
  *  `frame_id` / `frame_ids`. */
@@ -18,12 +22,18 @@ function argsCanvases(args: unknown): string[] {
 /** Load the canvases a tool call names and hold them while `run` works, so
  *  tools keep reading the store synchronously and a slow one (an import
  *  waiting on another service) keeps its canvas (store.load, store.hold). */
-export async function withArgsCanvases<T>(args: unknown, run: () => T | Promise<T>): Promise<T> {
+export async function withArgsCanvases<T>(args: unknown, run: () => T | Promise<T>, tool = ''): Promise<T> {
   const canvasIds = argsCanvases(args)
   await Promise.all(canvasIds.map((id) => store.load(id)))
   const releases = canvasIds.map((id) => store.hold(id))
   try {
-    return await run()
+    /* a check right after a component change sees it, not the frame as it was queued */
+    await settleForRead(tool, canvasIds)
+    /* one tool call is one operation: a work budget of its own (server/workBudget.ts) and a
+       write boundary of its own (server/journal.ts), committed when the tool returns.
+       Detached from the HTTP request that carries it, so the calls of one batch never
+       share a boundary and none waits on the response to be sent */
+    return await detached(() => runOperation(`mcp ${tool || 'tool'}`, canvasIds[0], run))
   } finally {
     for (const release of releases) release()
   }
@@ -39,6 +49,13 @@ export function loadToolTargets(server: McpServer): void {
   server.registerTool = ((name: string, config: Parameters<Register>[1], callback: Callback) =>
     register(name, config, (async (...params: unknown[]) => {
       const forward = () => (callback as (...forwarded: unknown[]) => unknown)(...params)
-      return params.length > 1 ? withArgsCanvases(params[0], forward) : forward()
+      try {
+        return await (params.length > 1 ? withArgsCanvases(params[0], forward, name) : forward())
+      } catch (error) {
+        /* thrown out of the operation, which undid the write: the agent hears why */
+        if (error instanceof WriteRefusedError)
+          return { content: [{ type: 'text' as const, text: `Error: ${error.message}` }], isError: true }
+        throw error
+      }
     }) as unknown as Callback)) as Register
 }

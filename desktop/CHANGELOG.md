@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.15.0](https://github.com/doop-design/doop/compare/desktop-v0.14.0...desktop-v0.15.0) (2026-11-25)
+
+
+### Features
+
+* **desktop:** draw the Windows title bar in the page ([#521](https://github.com/doop-design/doop/issues/521)) ([1687192](https://github.com/doop-design/doop/commit/1687192ac4a1e05b55737dd27bce428db190a2e9))
+
+
+### Bug Fixes
+
+* **agent:** show why a Doop Agent run failed, and stop calling capped runs crashes ([#693](https://github.com/doop-design/doop/issues/693)) ([ac943b0](https://github.com/doop-design/doop/commit/ac943b05b7168f7e65c6d01d4d6fec01f29e10ad))
+* **desktop:** find Claude Code installed with WinGet or npm on Windows ([#716](https://github.com/doop-design/doop/issues/716)) ([3c33e57](https://github.com/doop-design/doop/commit/3c33e572585bf05a5518abfecde211f05acb6989))
+
+## [0.14.0](https://github.com/kgoedecke/doop/compare/desktop-v0.13.0...desktop-v0.14.0) (2026-11-16)
+
+
+### Features
+
+* **canvas:** action registry with ⌘K palette, main menu and editor shortcuts ([#448](https://github.com/kgoedecke/doop/issues/448)) ([1970798](https://github.com/kgoedecke/doop/commit/1970798b4f13c65c90654116d1dcf0ae634856c0))
+* **desktop:** choose the Doop server from the sign-in screen ([#452](https://github.com/kgoedecke/doop/issues/452)) ([f98867a](https://github.com/kgoedecke/doop/commit/f98867a0917c36fcb2e1139b2f984a3ef9b4f0da))
+
+
+### Bug Fixes
+
+* **agent:** raise the resident step limit and finish runs whose work is done ([#517](https://github.com/kgoedecke/doop/issues/517)) ([e17dc2b](https://github.com/kgoedecke/doop/commit/e17dc2b940fb49e18a330cec96008112f2af5233))
+
 ## [0.13.0](https://github.com/kgoedecke/doop/compare/desktop-v0.12.0...desktop-v0.13.0) (2026-11-08)
 
 

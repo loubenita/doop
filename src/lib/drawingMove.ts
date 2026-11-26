@@ -6,6 +6,7 @@ import { recordCreate, recordDrawingTransfer, recordUpdates } from './history'
 import { currentPageCanvas } from './pages'
 import { useStore } from './store'
 import { elementPath, uniqueIdsIn } from './layers'
+import { bodyPlacementOrigin } from './frameBridge'
 import { carriedCss, newScope, renameInCss, SCOPE_ATTR, withCarriedCss } from './styleCarry'
 
 export interface DrawingRect extends Point {
@@ -68,17 +69,22 @@ export function drawingDropFrame(point: Point, sourceId?: string): Frame | null 
   return hit && !hit.locked ? hit : null
 }
 
+/** a placed layer sits on whole pixels */
+const round = (n: number) => Math.round(n)
+
 export function placeDrawing(
   el: HTMLElement | SVGSVGElement,
   rect: DrawingRect,
   frame?: Frame,
   geometry?: DrawingGeometry,
+  /** where the frame's body places absolute layers from (bodyPlacementOrigin) */
+  origin = { x: 0, y: 0 },
 ) {
   const style = el.style
   for (const [key, value] of Object.entries(geometry?.styles ?? {})) style.setProperty(key, value)
-  style.position = frame ? 'fixed' : 'absolute'
-  style.left = `${(frame ? rect.x - frame.x : 0) - (geometry?.offsetX ?? 0)}px`
-  style.top = `${(frame ? rect.y - frame.y : 0) - (geometry?.offsetY ?? 0)}px`
+  style.position = 'absolute'
+  style.left = `${round((frame ? rect.x - frame.x - origin.x : 0) - (geometry?.offsetX ?? 0))}px`
+  style.top = `${round((frame ? rect.y - frame.y - origin.y : 0) - (geometry?.offsetY ?? 0))}px`
   const fillsBox =
     !geometry ||
     (geometry.width === rect.width &&
@@ -113,12 +119,19 @@ export function drawingPreview(sourceHtml: string, path: string, el: Element): s
 export function moveDrawing(
   pressed: Frame,
   selector: string | undefined,
-  rect: DrawingRect,
+  dropped: DrawingRect,
   targetId?: string,
   hit?: DrawingHit,
 ): Promise<string | undefined> {
+  /* where it was let go, on whole pixels: the pointer at a fractional zoom
+     is never a place anyone means; its size is its own and stays */
+  const rect = { ...dropped, x: Math.round(dropped.x), y: Math.round(dropped.y) }
   let landed: string | undefined
   const save = async () => {
+    /* where the destination's body places absolute layers from, asked before
+       anything is read, so no edit lands in between */
+    const asked = targetId && targetId !== pressed.id ? bodyPlacementOrigin(targetId) : undefined
+    const destinationOrigin = asked instanceof Promise ? await asked : asked
     const s = useStore.getState()
     const canvas = s.canvas?.id === pressed.canvasId ? s.canvas : await api.getCanvas(pressed.canvasId)
     const source = canvas.frames.find((f) => f.id === pressed.id)
@@ -174,7 +187,7 @@ export function moveDrawing(
     }
     if (standalone && !target) {
       const position = hit
-        ? { x: rect.x - hit.rect.x, y: rect.y - hit.rect.y, width: source.width, height: source.height }
+        ? { x: round(rect.x - hit.rect.x), y: round(rect.y - hit.rect.y), width: source.width, height: source.height }
         : rect
       const saved = await conditional(source, api.updateFrame(source.id, position, source.updatedAt))
       updateLocal(saved)
@@ -191,7 +204,21 @@ export function moveDrawing(
       : sourceDoc.body.firstElementChild
     if (!original) return
     if (target?.id === source.id) {
-      placeDrawing(original as HTMLElement | SVGSVGElement, rect, source, hit?.geometry)
+      /* a move within its own frame changes where it sits, nothing else */
+      const style = (original as HTMLElement | SVGSVGElement).style
+      /* by the drag's travel from where it showed, so whatever its left and
+         top count from (the body's corner, a margin) stays counted */
+      const shift = (value: string, by: number) => (/^-?[\d.]+px$/.test(value) ? round(parseFloat(value) + by) : null)
+      const left = hit && shift(style.left, rect.x - source.x - hit.rect.x)
+      const top = hit && shift(style.top, rect.y - source.y - hit.rect.y)
+      if (left !== null && left !== undefined && top !== null && top !== undefined) {
+        style.left = `${left}px`
+        style.top = `${top}px`
+      } else {
+        const at = await Promise.resolve(bodyPlacementOrigin(source.id))
+        style.left = `${round(rect.x - source.x - at.x - (hit?.geometry.offsetX ?? 0))}px`
+        style.top = `${round(rect.y - source.y - at.y - (hit?.geometry.offsetY ?? 0))}px`
+      }
       const html = serialize(sourceDoc)
       const saved = await conditional(source, api.updateFrame(source.id, { html }, source.updatedAt))
       updateLocal(saved)
@@ -206,7 +233,7 @@ export function moveDrawing(
     original.remove()
     const sourceHtml = serialize(sourceDoc)
     el.setAttribute(SCOPE_ATTR, scope)
-    placeDrawing(el, rect, target, hit?.geometry)
+    placeDrawing(el, rect, target, hit?.geometry, destinationOrigin)
     const destinationDoc = target ? parse(target.html) : parse(drawingDocument({ tool: 'frame', ...rect }))
     if (!target) {
       destinationDoc.body.style.background = ''

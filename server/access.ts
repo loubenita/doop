@@ -1,6 +1,13 @@
 import type { Canvas, ClientMessage } from '../shared/types.ts'
 import { roleAllows, type CanvasRole } from '../shared/canvasRole.ts'
-import { getWorkspace, hasRole, isActive, isWorkspaceMember, type WorkspaceRecord } from './workspaces.ts'
+import {
+  getWorkspace,
+  hasRole,
+  isActive,
+  isWorkspaceMember,
+  linkSharingAllowed,
+  type WorkspaceRecord,
+} from './workspaces.ts'
 
 /**
  * Canvas access, Figma-style: private by default. The owner always has
@@ -34,6 +41,14 @@ export function canvasRole(userId: string | undefined, canvas: Canvas): CanvasRo
   if (!canvas.ownerId) return 'edit'
   if (!userId) return null
   if (hasDurableCanvasAccess(userId, canvas)) return 'edit'
+  return sharedLinkLevel(canvas)
+}
+
+/** The level the canvas's share link grants right now: what its owner set,
+ *  unless its workspace has switched link sharing off, which closes every
+ *  link in it whatever was stored. */
+export function sharedLinkLevel(canvas: Canvas): 'view' | 'comment' | 'edit' | null {
+  if (!linkSharingAllowed(canvas.workspaceId)) return null
   const link = canvas.linkAccess
   return link === 'view' || link === 'comment' || link === 'edit' ? link : null
 }
@@ -45,8 +60,7 @@ export function canvasRole(userId: string | undefined, canvas: Canvas): CanvasRo
  *  need a session. */
 export function guestCanvasRole(canvas: Canvas): 'view' | null {
   if (!canvas.ownerId) return null
-  const link = canvas.linkAccess
-  return link === 'view' || link === 'comment' || link === 'edit' ? 'view' : null
+  return sharedLinkLevel(canvas) ? 'view' : null
 }
 
 /** May this user read the canvas (open it, join its room, see its frames)? */
@@ -114,6 +128,7 @@ export function canvasMoveRefusal(
 export function roomMessageNeeds(msg: ClientMessage): CanvasRole {
   switch (msg.type) {
     case 'join':
+    case 'page:load':
     case 'cursor':
     case 'viewport':
       return 'view'

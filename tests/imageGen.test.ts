@@ -133,8 +133,43 @@ describe('who pays', () => {
   it('explains what to connect when nothing can pay', async () => {
     mockedGetAccounts.mockResolvedValue([])
     await expect(generateImage('u1', { prompt: 'x' })).rejects.toThrow(
-      /connect a ChatGPT subscription or OpenAI API key/,
+      /connect a ChatGPT subscription, an OpenAI API key or a Gemini API key in Settings → Doop Agent/,
     )
+  })
+
+  /* The agent reports: "GPT Image 2 is not available: connect a ChatGPT
+     subscription or OpenAI API key". The person never picked GPT Image 2; it
+     was the server default, and their only connection was a text provider. */
+  it('tells a person whose connections cannot draw what to connect, not why the default model failed', async () => {
+    mockedGetAccounts.mockResolvedValue([
+      { enabled: true, userId: 'u1', kind: 'anthropic-key', apiKey: 'sk-ant', connectedAt: 1 },
+    ])
+    stubEnv('OPENAI_API_KEY', 'sk-server')
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    const failure = generateImage('u1', { prompt: 'x' })
+    await expect(failure).rejects.toThrow(/Gemini API key/)
+    await expect(failure).rejects.toThrow(/Claude API connection cannot draw images/)
+    await expect(failure).rejects.not.toThrow(/GPT Image 2/)
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it('says which image account is switched off when that is all that stands in the way', async () => {
+    mockedGetAccounts.mockResolvedValue([
+      { enabled: false, userId: 'u1', kind: 'chatgpt', accessToken: 'tok', connectedAt: 1 },
+      { enabled: true, userId: 'u1', kind: 'anthropic-key', apiKey: 'sk-ant', connectedAt: 2 },
+    ])
+    await expect(generateImage('u1', { prompt: 'x' })).rejects.toThrow(
+      /ChatGPT connection is switched off\. Switch it on in Settings → Doop Agent/,
+    )
+  })
+
+  it('draws on a connected Gemini key when the server default needs an OpenAI account', async () => {
+    mockedGetAccounts.mockResolvedValue([
+      { enabled: true, userId: 'u1', kind: 'anthropic-key', apiKey: 'sk-ant', connectedAt: 1 },
+      { enabled: true, userId: 'u1', kind: 'gemini-key', apiKey: 'gm-user', connectedAt: 2 },
+    ])
+    const generator = await generatorFor('u1')
+    expect(generator.ok && generator.label).toBe('Gemini')
   })
 })
 
@@ -206,6 +241,88 @@ describe('the image-model registry', () => {
     stubEnv('GEMINI_API_KEY', 'gm-server')
     const generator = await generatorFor('u1')
     expect(generator.ok && generator.label).toBe('server')
+  })
+
+  async function imagesApiResponse(): Promise<Response> {
+    return new Response(JSON.stringify({ created: 1, data: [{ b64_json: await tinyPng() }] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+
+  it.each(['gpt-image-2.5-sunburst', 'gpt-image-2.6-flare', 'chatgpt-image-latest', 'gpt-image-1-mini'])(
+    'draws a %s pick through the Image API on the connected OpenAI key',
+    async (model) => {
+      mockedGetAccounts.mockResolvedValue([
+        { enabled: true, userId: 'u1', kind: 'openai-key', apiKey: 'sk-user', connectedAt: 1 },
+      ])
+      mockedGetImagePref.mockResolvedValue(model)
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(await imagesApiResponse())
+
+      const image = await generateImage('u1', { prompt: 'a red circle', aspect: 'portrait', quality: 'high' })
+
+      expect(image.billedTo).toBe('OpenAI')
+      expect(image.mime).toBe('image/webp')
+      const [url, init] = fetchSpy.mock.calls[0]!
+      expect(String(url)).toBe('https://api.openai.com/v1/images/generations')
+      expect((init!.headers as Record<string, string>).Authorization).toBe('Bearer sk-user')
+      expect(JSON.parse(String(init!.body))).toEqual({
+        model,
+        prompt: 'a red circle',
+        n: 1,
+        size: '1024x1536',
+        quality: 'high',
+        output_format: 'png',
+      })
+    },
+  )
+
+  it('runs an Image API pick on the server key for someone who connected nothing', async () => {
+    mockedGetAccounts.mockResolvedValue([])
+    mockedGetImagePref.mockResolvedValue('gpt-image-2.6-sunburst')
+    stubEnv('OPENAI_API_KEY', 'sk-server')
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(await imagesApiResponse())
+
+    const image = await generateImage('u1', { prompt: 'a red circle' })
+
+    expect(image.billedTo).toBe('server')
+    expect((fetchSpy.mock.calls[0]![1]!.headers as Record<string, string>).Authorization).toBe('Bearer sk-server')
+  })
+
+  it('reports an Image API refusal as OpenAI’s, never as an empty image', async () => {
+    mockedGetAccounts.mockResolvedValue([
+      { enabled: true, userId: 'u1', kind: 'openai-key', apiKey: 'sk-user', connectedAt: 1 },
+    ])
+    mockedGetImagePref.mockResolvedValue('gpt-image-2.5-flare')
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ error: { message: 'Your organization must be verified' } }), { status: 403 }),
+    )
+    await expect(generateImage('u1', { prompt: 'x' })).rejects.toThrow(/OpenAI rejected the credentials \(403\)/)
+  })
+
+  it('runs a GPT Image 2.5 pick on the OpenAI key even when a ChatGPT subscription is on too', async () => {
+    mockedGetAccounts.mockResolvedValue([
+      { enabled: true, userId: 'u1', kind: 'chatgpt', accessToken: 'tok', connectedAt: 1 },
+      { enabled: true, userId: 'u1', kind: 'openai-key', apiKey: 'sk-user', connectedAt: 2 },
+    ])
+    mockedGetImagePref.mockResolvedValue('gpt-image-2.5-flare')
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(await imagesApiResponse())
+
+    await generateImage('u1', { prompt: 'a red circle' })
+
+    expect(String(fetchSpy.mock.calls[0]![0])).toBe('https://api.openai.com/v1/images/generations')
+  })
+
+  it('refuses a GPT Image 2.5 pick on a ChatGPT subscription alone, since it cannot choose a model', async () => {
+    mockedGetAccounts.mockResolvedValue([
+      { enabled: true, userId: 'u1', kind: 'chatgpt', accessToken: 'tok', connectedAt: 1 },
+    ])
+    mockedGetImagePref.mockResolvedValue('gpt-image-2.5-sunburst')
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+    await expect(generateImage('u1', { prompt: 'x' })).rejects.toThrow(/needs an OpenAI API key/)
+    expect(fetchSpy).not.toHaveBeenCalled()
+    const available = (await imageModelAvailability('u1')).filter((m) => m.available).map((m) => m.id)
+    expect(available).toEqual(['gpt-image-2'])
   })
 
   it('never runs a connected user on the server keys for another provider', async () => {

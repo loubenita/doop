@@ -4,6 +4,7 @@ import {
   drag,
   drawingPage,
   flowBoxes,
+  holdReplies,
   layerFrame,
   page,
   patchRequests,
@@ -123,33 +124,20 @@ describe.skipIf(!findBrowserPath())('drawing on the canvas', { timeout: 30_000 }
     await page.mouse.click(first.x + 40, first.y + 40)
     await page.waitForFunction(() => window.drawingHarness.state().selectedElement?.selector === '#rect')
     await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 350)))
-    await page.evaluate(() => {
-      window.delayedLayerProbe = null
-      window.addEventListener(
-        'message',
-        function hold(event) {
-          if (event.data?.type !== 'doop:probe-result' || event.data.hit?.selector !== '#rect') return
-          window.removeEventListener('message', hold, true)
-          window.delayedLayerProbe = event
-          event.stopImmediatePropagation()
-        },
-        true,
-      )
-    })
+    await holdReplies('doop:probe-result')
     await page.mouse.click(first.x + 40, first.y + 40)
-    if (pending === 'reply') await page.waitForFunction(() => !!window.delayedLayerProbe)
+    if (pending === 'reply') await page.waitForFunction(() => !!window.heldReplies?.events.length)
     await page.mouse.move(second.x + 40, second.y + 40)
     await page.mouse.down()
     await page.mouse.move(second.x + 100, second.y + 60, { steps: 3 })
     await page.waitForFunction(() => window.drawingHarness.state().selectedElement?.selector === '#second')
     await page.evaluate(async () => {
       await new Promise((resolve) => setTimeout(resolve, 350))
-      const event = window.delayedLayerProbe
-      if (event) window.dispatchEvent(new MessageEvent('message', { data: event.data, source: event.source }))
+      window.releaseReplies()
       await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
     })
     expect(await page.evaluate(() => window.drawingHarness.state().selectedElement?.selector)).toBe('#second')
-    if (pending === 'timer') expect(await page.evaluate(() => !!window.delayedLayerProbe)).toBe(false)
+    if (pending === 'timer') expect(await page.evaluate(() => window.heldReplies!.delivered)).toBe(0)
     await page.mouse.up()
     await expect.poll(() => saved[0]?.html).not.toBe(source.html)
     await expect.poll(async () => (await visibleDrawing('Layers', '#second')).x).toBeCloseTo(second.x + 60, 0)
@@ -170,9 +158,9 @@ describe.skipIf(!findBrowserPath())('drawing on the canvas', { timeout: 30_000 }
     await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 350)))
     /* a loaded machine: the frame answers the next press only after the
        button is up and the pointer is on its way to another element */
-    await page.evaluate(() => (window.heldMoveHits = []))
+    await holdReplies('doop:move-hit-result')
     await page.mouse.click(first.x + 40, first.y + 40)
-    await page.waitForFunction(() => !!window.heldMoveHits?.length)
+    await page.waitForFunction(() => !!window.heldReplies?.events.length)
     /* the travel reaches the canvas while the frame is slow to route input;
        sent here directly, as the iframe would otherwise take it */
     await page.evaluate(
@@ -180,10 +168,7 @@ describe.skipIf(!findBrowserPath())('drawing on the canvas', { timeout: 30_000 }
         document.body.dispatchEvent(
           new PointerEvent('pointermove', { bubbles: true, pointerId: 1, isPrimary: true, clientX: x, clientY: y }),
         )
-        const held = window.heldMoveHits ?? []
-        window.heldMoveHits = null
-        for (const event of held)
-          window.dispatchEvent(new MessageEvent('message', { data: event.data, source: event.source }))
+        window.releaseReplies()
       },
       second.x + 40,
       second.y + 40,
@@ -211,7 +196,8 @@ describe.skipIf(!findBrowserPath())('drawing on the canvas', { timeout: 30_000 }
     await page.mouse.up()
     await expect.poll(() => patchRequests).toBe(1)
     const moved = await visibleDrawing('Layers', '#rect')
-    expect(moved.y).toBeCloseTo(before.y + 25, 0)
+    // a layer lands on whole design px: 25 screen px at zoom 2 is 12.5, saved as 13
+    expect(moved.y).toBeCloseTo(before.y + Math.round(25 / zoom) * zoom, 0)
     expect(saved[0]).toMatchObject({ x: source.x, y: source.y, width: source.width, height: source.height })
     expect(saved[0]!.html).toContain('<p id="sibling" style="margin:0">Keep me</p>')
     expect(await page.evaluate(() => window.drawingHarness.state().selectedElement?.selector)).toBe('#rect')
@@ -582,7 +568,9 @@ describe.skipIf(!findBrowserPath())('drawing on the canvas', { timeout: 30_000 }
     /* 60px down the screen is 60px along the turned document's x: the layer
        itself moved, not the frame, and only along that axis */
     expect(saved[0]).toMatchObject({ x: 70, y: 50 })
-    expect(saved[0]!.html).toMatch(/translate: 60px (0|[0-9.e-]+)px/)
+    /* an absolute layer moves by its own left and top, no translate added */
+    expect(saved[0]!.html).toMatch(/left: 110px; top: (60|[0-9.e-]+)px/)
+    expect(saved[0]!.html).not.toContain('translate')
     const moved = await iframe.$eval('#rect', (el) => el.getBoundingClientRect().toJSON() as DOMRect)
     expect(moved.x).toBeCloseTo(110, 0)
     expect(moved.y).toBeCloseTo(60, 0)

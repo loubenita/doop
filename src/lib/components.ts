@@ -7,15 +7,18 @@ import {
   PROPS_ATTR,
   SLOT_ATTR,
   parseBindings,
+  activeComponents,
+  isDeleted,
   toPropName,
-  type ComponentDef,
+  type WireComponentDef,
 } from '../../shared/components'
 import { ELEMENT_ID_ATTR, elementIdSelector } from '../../shared/elementId'
 import type { Frame } from '../../shared/types'
-import { api, type InstanceChangeInput } from './api'
+import { api, errorMessage, type InstanceChangeInput } from './api'
 import { endFrameEdit } from './frameBridge'
 import { recordCreate, recordUpdate, recordUpdates, savesLanded } from './history'
 import { t } from './i18n'
+import { navigate } from './navigate'
 import { elementPath } from './layers'
 import { isLayerLocked, replaceLayerHtml } from './layerEdits'
 import { useStore } from './store'
@@ -30,7 +33,7 @@ import { clientToWorld, frameAtPoint } from './commentMove'
 export type ComponentContext =
   | {
       kind: 'main'
-      def: ComponentDef
+      def: WireComponentDef
       /** the selection is the main's root, not an element inside it */
       isRoot: boolean
       selector: string
@@ -38,7 +41,7 @@ export type ComponentContext =
     }
   | {
       kind: 'instance'
-      def: ComponentDef
+      def: WireComponentDef
       isRoot: boolean
       selector: string
       rootSelector: string
@@ -61,7 +64,7 @@ function parseRecord(value: string | null): Record<string, unknown> {
 
 /** What the selected element is to the component system, if anything. An instance wins
  *  over the main around it: that is the thing whose edits go where the person expects. */
-export function componentContextOf(html: string, selector: string, defs: ComponentDef[]): ComponentContext | null {
+export function componentContextOf(html: string, selector: string, defs: WireComponentDef[]): ComponentContext | null {
   if (!defs.length || (!html.includes(INSTANCE_ATTR) && !html.includes(COMPONENT_ATTR))) return null
   let el: Element | null
   try {
@@ -92,17 +95,18 @@ export function componentContextOf(html: string, selector: string, defs: Compone
   }
   const main = el.closest(`[${COMPONENT_ATTR}]`)
   const def = main && defs.find((candidate) => candidate.id === main.getAttribute(COMPONENT_ATTR))
-  if (!main || !def) return null
+  /* the main of a deleted component is ordinary markup: editing it edits this frame only */
+  if (!main || !def || isDeleted(def)) return null
   return { kind: 'main', def, isRoot: main === el, selector, rootSelector: elementPath(main) }
 }
 
 /** The value a text-like prop shows when an instance has not set it: the template's own. */
-export function templateValue(def: ComponentDef, prop: string): string {
+export function templateValue(def: WireComponentDef, prop: string): string {
   const root = new DOMParser()
     .parseFromString(`<template>${def.template}</template>`, 'text/html')
     .querySelector('template')
   for (const el of root?.content.querySelectorAll(`[${BIND_ATTR}]`) ?? []) {
-    for (const binding of parseBindings(el.getAttribute(BIND_ATTR) ?? '')) {
+    for (const binding of parseBindings(el.getAttribute(BIND_ATTR) ?? '', el.tagName)) {
       if (binding.prop !== prop) continue
       if (binding.target === null) return el.textContent?.trim() ?? ''
       if (!binding.target.startsWith('style.') && !binding.target.startsWith('--'))
@@ -138,16 +142,15 @@ async function settleFrame(frame: Frame): Promise<Frame> {
   return useStore.getState().canvas?.frames.find((candidate) => candidate.id === frame.id) ?? frame
 }
 
-export async function makeComponent(frame: Frame, selector: string, name: string, replaceMatching = false) {
+export async function makeComponent(frame: Frame, selector: string, name: string) {
   if (refuseLocked(frame, selector)) return null
   await settleFrame(frame)
   const framesBefore = useStore.getState().canvas?.frames ?? []
   try {
-    const { component, converted, frames } = await api.createComponent(frame.canvasId, {
+    const { component, frames } = await api.createComponent(frame.canvasId, {
       name,
       frameId: frame.id,
       element: selector,
-      replaceMatching,
     })
     const items = frames.flatMap((after) => {
       const before = framesBefore.find((candidate) => candidate.id === after.id)
@@ -157,14 +160,7 @@ export async function makeComponent(frame: Frame, selector: string, name: string
         : []
     })
     if (items.length) recordUpdates(items)
-    const linked = converted.reduce((total, entry) => total + entry.instances, 0)
-    useStore
-      .getState()
-      .pushNotice(
-        linked
-          ? t('components.createdLinked', { name: component.name, count: linked })
-          : t('components.created', { name: component.name }),
-      )
+    useStore.getState().pushNotice(t('components.created', { name: component.name }))
     return component
   } catch (error) {
     notifyFailure(error, t('components.createFailed'))
@@ -185,7 +181,7 @@ function suggestedName(frame: Frame, selector: string): string {
     .filter(Boolean)
     .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
     .join(' ')
-  const taken = new Set((useStore.getState().canvas?.components ?? []).map((def) => def.name.toLowerCase()))
+  const taken = new Set(activeComponents(useStore.getState().canvas?.components).map((def) => def.name.toLowerCase()))
   let name = base
   for (let n = 2; taken.has(name.toLowerCase()); n++) name = `${base} ${n}`
   return name
@@ -210,7 +206,7 @@ export async function changeInstance(frame: Frame, change: InstanceChangeInput) 
 
 /** Into the selected element when there is one, else at the end of the selected frame,
  *  else onto the canvas in a frame of its own. */
-export async function placeComponent(def: ComponentDef) {
+export async function placeComponent(def: WireComponentDef) {
   const s = useStore.getState()
   const frame = s.selectedId ? s.canvas?.frames.find((candidate) => candidate.id === s.selectedId) : undefined
   try {
@@ -245,9 +241,63 @@ export async function placeComponent(def: ComponentDef) {
 /** The drag payload a component card carries; the canvas drop reads the component id from it. */
 export const COMPONENT_DRAG_TYPE = 'application/x-doop-component'
 
+/** The payload of a workspace library's card, for a component this canvas does not
+ *  use yet: nothing is imported until the card is let go over the canvas. */
+export const LIBRARY_COMPONENT_DRAG_TYPE = 'application/x-doop-library-component'
+
+export interface LibraryComponentDrag {
+  /** the library's canvas */
+  libraryCanvasId: string
+  componentId: string
+}
+
+export function libraryDragData(drag: LibraryComponentDrag): string {
+  return JSON.stringify(drag)
+}
+
+/** Reads a drag's library payload; anything else that came under the type is no drop. */
+export function parseLibraryDrag(data: string): LibraryComponentDrag | null {
+  try {
+    const parsed: unknown = JSON.parse(data)
+    if (!parsed || typeof parsed !== 'object') return null
+    const { libraryCanvasId, componentId } = parsed as Record<string, unknown>
+    if (typeof libraryCanvasId !== 'string' || typeof componentId !== 'string') return null
+    return libraryCanvasId && componentId ? { libraryCanvasId, componentId } : null
+  } catch {
+    return null
+  }
+}
+
+type ClientPoint = { x: number; y: number }
+
+/** A library card let go over the canvas: the component is taken up here first,
+ *  then lands where one of the canvas's own would. A drop a locked frame refuses
+ *  takes nothing up. */
+export async function dropLibraryComponent(drag: LibraryComponentDrag, client: ClientPoint) {
+  const s = useStore.getState()
+  if (!s.canvas) return
+  const canvasId = s.canvas.id
+  if (frameAtPoint(s.canvas, s.activePageId ?? null, clientToWorld(client.x, client.y))?.locked) {
+    s.pushNotice(t('components.locked'))
+    return
+  }
+  let def: WireComponentDef
+  try {
+    def = await api.importComponent(canvasId, drag.libraryCanvasId, drag.componentId)
+  } catch (error) {
+    s.pushNotice(errorMessage(error, t('components.importFailed')))
+    return
+  }
+  /* the person may have left for another canvas while the library answered */
+  if (useStore.getState().canvas?.id !== canvasId) return
+  /* the room's message may not have landed yet, and the drop reads the store */
+  useStore.getState().setComponentLocal(def.id, def)
+  await dropComponent(def.id, client)
+}
+
 /** A component card let go over the canvas: into the frame under the pointer,
  *  or as a new frame at that point when it lands on the paper. */
-export async function dropComponent(componentId: string, client: { x: number; y: number }) {
+export async function dropComponent(componentId: string, client: ClientPoint) {
   const s = useStore.getState()
   const def = s.canvas?.components?.find((candidate) => candidate.id === componentId)
   if (!s.canvas || !def) return
@@ -282,23 +332,52 @@ export async function dropComponent(componentId: string, client: { x: number; y:
   }
 }
 
-/** Delete a component: its instances stay as plain markup, its main as an element. Not undoable. */
-export async function removeComponent(def: ComponentDef) {
+/** Delete a component. Nothing on the canvas changes: its instances keep their markup and
+ *  stop following it, and it can be restored from any of them (restoreDeletedComponent). */
+export async function removeComponent(def: WireComponentDef) {
   const s = useStore.getState()
   if (!s.canvas) return
   try {
-    const { instances_detached } = await api.deleteComponent(s.canvas.id, def.id)
-    useStore.getState().pushNotice(t('components.deleted', { name: def.name, count: instances_detached }))
+    const { instances_kept } = await api.deleteComponent(s.canvas.id, def.id)
+    useStore
+      .getState()
+      .pushNotice(
+        instances_kept
+          ? t('components.deleted', { name: def.name, count: instances_kept })
+          : t('components.deletedUnused', { name: def.name }),
+      )
   } catch (error) {
     notifyFailure(error, t('components.deleteFailed'))
   }
+}
+
+/** Bring a deleted component back: its instances, never changed, follow it again. */
+export async function restoreDeletedComponent(def: WireComponentDef) {
+  const s = useStore.getState()
+  if (!s.canvas) return
+  try {
+    const { component } = await api.undeleteComponent(s.canvas.id, def.id)
+    if (useStore.getState().canvas?.id === s.canvas.id) useStore.getState().setComponentLocal(component.id, component)
+    useStore.getState().pushNotice(t('components.restored', { name: component.name }))
+  } catch (error) {
+    notifyFailure(error, t('components.restoreFailed'))
+  }
+}
+
+/** The part key of a component's root. Its instances' overrides of the root sit
+ *  under it, even on a nested instance, whose own part attribute names its
+ *  place in the outer component instead. */
+export function rootPartKey(def: WireComponentDef): string | undefined {
+  const holder = document.createElement('template')
+  holder.innerHTML = def.template
+  return holder.content.firstElementChild?.getAttribute(PART_ATTR) ?? undefined
 }
 
 /** Rename a component. Its instances are linked by id, so they keep working; the server
  *  refuses a name another component here has, and that reason is what the person sees.
  *  Not undoable, like its description. Resolves to the name the component now has (the
  *  server cleans what it is given), or null when it could not be saved. */
-export async function renameComponent(def: ComponentDef, value: string): Promise<string | null> {
+export async function renameComponent(def: WireComponentDef, value: string): Promise<string | null> {
   const name = value.trim()
   const s = useStore.getState()
   if (!s.canvas || !name) return null
@@ -313,8 +392,13 @@ export async function renameComponent(def: ComponentDef, value: string): Promise
   }
 }
 
-export function goToMain(def: ComponentDef) {
+export function goToMain(def: WireComponentDef) {
   const s = useStore.getState()
+  /* a library component's main lives on its library canvas */
+  if (def.source?.library) {
+    navigate(`/c/${def.source.canvasId}`)
+    return
+  }
   const frame = def.mainFrameId ? s.canvas?.frames.find((candidate) => candidate.id === def.mainFrameId) : undefined
   if (!frame) {
     s.pushNotice(t('components.mainGone', { name: def.name }))

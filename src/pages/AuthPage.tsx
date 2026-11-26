@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { Fragment, useEffect, useState } from 'react'
 import { authClient } from '../lib/auth'
 import { authErrorCode, authErrorMessage } from '../lib/authError'
 import { BrandMark } from '../components/ui/brand-mark'
@@ -7,6 +7,8 @@ import { beginBrowserSignIn, supportsBrowserSignIn } from '../lib/desktop'
 import type { DesktopSignInProvider, ProviderRedirects } from '../lib/desktopAuth'
 import { safeRelativeTarget } from '../lib/safeTarget'
 import { CODEX_SETUP_PATH } from '../lib/codexConnection'
+import { EDITOR_CONNECT_PATH } from '../../shared/editorConnect'
+import { CLI_CONNECT_PATH } from '../../shared/cliConnect'
 import { signupLanding } from '../../shared/firstCanvas'
 import { isDesktopShell } from '../lib/shell'
 import { posthog } from '../lib/posthog'
@@ -19,6 +21,7 @@ import { Field } from '../components/ui/field'
 import { Callout } from '../components/ui/callout'
 import { useT, type PlainMessageKey } from '../lib/i18n'
 import type { LoginPolicy } from '../../shared/instanceSettings'
+import { SIGN_IN_PATH, withoutSignInError } from '../../shared/signInPath'
 
 /* If login interrupted an MCP OAuth authorize redirect, send the browser
    back into the flow so the agent connection completes. */
@@ -45,7 +48,12 @@ async function accountExists(email: string): Promise<boolean> {
 }
 
 function interruptedTarget(): string | null {
-  if (location.pathname === '/oauth/consent' || location.pathname === CODEX_SETUP_PATH)
+  if (
+    location.pathname === '/oauth/consent' ||
+    location.pathname === CODEX_SETUP_PATH ||
+    location.pathname === EDITOR_CONNECT_PATH ||
+    location.pathname === CLI_CONNECT_PATH
+  )
     return location.pathname + location.search
   const params = new URLSearchParams(location.search)
   const target = safeRelativeTarget(params.get('redirect_to') || params.get('redirect_uri'))
@@ -86,6 +94,10 @@ interface ProviderStart extends ProviderRedirects {
 /* The providers' marks at the 18px their sign-in guidelines draw them, from the registry. */
 function MicrosoftMark() {
   return <BrandMark brand="microsoft" size={18} className="shrink-0" />
+}
+
+function GithubMark() {
+  return <BrandMark brand="github" size={18} className="shrink-0" />
 }
 
 function AppleMark() {
@@ -164,6 +176,7 @@ interface OidcClientConfig extends LoginPolicy {
   displayName?: string
   google: boolean
   microsoft: boolean
+  github: boolean
   /** the browser "Sign in with Apple" (the iOS app's native one is appleNative, not shown here) */
   apple: boolean
 }
@@ -172,6 +185,7 @@ const UNCONFIGURED: OidcClientConfig = {
   enabled: false,
   google: false,
   microsoft: false,
+  github: false,
   apple: false,
   emailPasswordSignup: true,
   ssoAutoRedirect: false,
@@ -214,7 +228,11 @@ let browserSignInNotice: string | null = null
 
 /** `initialMode` opens the form on sign-up or sign-in, for a guest on a
  *  shared canvas who pressed one of the two (src/components/AccessBanner.tsx). */
-export function AuthPage({ initialMode }: { initialMode?: 'signin' | 'signup' } = {}) {
+export function AuthPage({
+  initialMode,
+  inSheet = false,
+}: { initialMode?: 'signin' | 'signup'; inSheet?: boolean } = {}) {
+  const Screen = inSheet ? Fragment : AuthScreen
   const t = useT()
   const oidc = useOidcConfig()
   /* better-auth lands password-reset links on /auth/reset?token=… */
@@ -247,7 +265,7 @@ export function AuthPage({ initialMode }: { initialMode?: 'signin' | 'signup' } 
 
   /* the SSO error code has been shown; keep it out of the address bar */
   useEffect(() => {
-    if (ssoErrorFromUrl()) history.replaceState(null, '', location.pathname)
+    if (ssoErrorFromUrl()) history.replaceState(null, '', location.pathname + withoutSignInError(location.search))
   }, [])
 
   /* the provider round trip starts the moment the policy says so: once,
@@ -288,7 +306,10 @@ export function AuthPage({ initialMode }: { initialMode?: 'signin' | 'signup' } 
         setNotice(browserSignInNotice)
         return
       }
-      const res = await start({ ...ssoRedirects(provider), errorCallbackURL: '/auth' })
+      const res = await start({
+        ...ssoRedirects(provider),
+        errorCallbackURL: SIGN_IN_PATH + withoutSignInError(location.search),
+      })
       if (res.error) setError(authErrorMessage(res.error, startFailed, t('auth.unreachable')))
     } catch {
       setError(t(NETWORK_ERROR))
@@ -301,7 +322,7 @@ export function AuthPage({ initialMode }: { initialMode?: 'signin' | 'signup' } 
     return providerSignIn('oidc', (opts) => authClient.signIn.oauth2({ providerId: 'oidc', ...opts }))
   }
 
-  function socialSignIn(provider: 'google' | 'microsoft' | 'apple') {
+  function socialSignIn(provider: 'google' | 'microsoft' | 'github' | 'apple') {
     return providerSignIn(provider, (opts) => authClient.signIn.social({ provider, ...opts }))
   }
 
@@ -339,7 +360,7 @@ export function AuthPage({ initialMode }: { initialMode?: 'signin' | 'signup' } 
           /* a platform error must not be reported as an expired link */
           setError(authErrorMessage(res.error, t('auth.resetLinkInvalid'), t('auth.unreachable')))
         } else {
-          history.replaceState(null, '', '/auth')
+          history.replaceState(null, '', SIGN_IN_PATH)
           switchMode('signin')
           setNotice(t('auth.passwordUpdated'))
         }
@@ -400,8 +421,12 @@ export function AuthPage({ initialMode }: { initialMode?: 'signin' | 'signup' } 
 
   if (autoRedirect && !error) {
     return (
-      <AuthScreen>
-        <AuthCard title={t('auth.redirectingTo', { provider: oidc.displayName ?? '' })} align="center">
+      <Screen>
+        <AuthCard
+          inSheet={inSheet}
+          title={t('auth.redirectingTo', { provider: oidc.displayName ?? '' })}
+          align="center"
+        >
           <AuthCardText>{t('auth.taglineSignin')}</AuthCardText>
           <Button
             variant="link"
@@ -418,90 +443,107 @@ export function AuthPage({ initialMode }: { initialMode?: 'signin' | 'signup' } 
             {t('auth.signInAnotherWay')}
           </Button>
         </AuthCard>
-      </AuthScreen>
+      </Screen>
     )
   }
 
   return (
-    <AuthScreen>
-      <ServerSettings />
-      <AuthCard as="form" title={t(TITLES[mode])} onSubmit={submit}>
-        <AuthCardText className="mb-2">
-          {mode === 'forgot' ? (
-            t('auth.forgotBlurb')
-          ) : mode === 'reset' ? (
-            t('auth.resetBlurb')
-          ) : (
+    <Screen>
+      {!inSheet && <ServerSettings />}
+      <AuthCard inSheet={inSheet} as="form" title={t(TITLES[mode])} onSubmit={submit}>
+        {(!inSheet || mode === 'forgot' || mode === 'reset') && (
+          <AuthCardText className="mb-2">
+            {mode === 'forgot' ? (
+              t('auth.forgotBlurb')
+            ) : mode === 'reset' ? (
+              t('auth.resetBlurb')
+            ) : (
+              <>
+                {t('auth.taglineBefore')} <em className="not-italic text-brand">{t('auth.taglineEmphasis')}</em>
+                {t('auth.taglineAfter')} {mode === 'signin' ? t('auth.taglineSignin') : t('auth.taglineSignup')}
+              </>
+            )}
+          </AuthCardText>
+        )}
+        {(oidc.enabled || oidc.google || oidc.microsoft || oidc.github || oidc.apple) &&
+          (mode === 'signin' || mode === 'signup') && (
             <>
-              {t('auth.taglineBefore')} <em className="not-italic text-brand">{t('auth.taglineEmphasis')}</em>
-              {t('auth.taglineAfter')} {mode === 'signin' ? t('auth.taglineSignin') : t('auth.taglineSignup')}
+              {oidc.google && (
+                <Button
+                  variant="default"
+                  size="lg"
+                  block
+                  className="border-line"
+                  type="button"
+                  onClick={() => socialSignIn('google')}
+                  disabled={busy}
+                >
+                  <GoogleMark />
+                  {t(mode === 'signup' ? 'auth.signUpWith' : 'auth.signInWith', { provider: 'Google' })}
+                </Button>
+              )}
+              {oidc.microsoft && (
+                <Button
+                  variant="default"
+                  size="lg"
+                  block
+                  className="border-line"
+                  type="button"
+                  onClick={() => socialSignIn('microsoft')}
+                  disabled={busy}
+                >
+                  <MicrosoftMark />
+                  {t(mode === 'signup' ? 'auth.signUpWith' : 'auth.signInWith', { provider: 'Microsoft' })}
+                </Button>
+              )}
+              {oidc.github && (
+                <Button
+                  variant="default"
+                  size="lg"
+                  block
+                  className="border-line"
+                  type="button"
+                  onClick={() => socialSignIn('github')}
+                  disabled={busy}
+                >
+                  <GithubMark />
+                  {t(mode === 'signup' ? 'auth.signUpWith' : 'auth.signInWith', { provider: 'GitHub' })}
+                </Button>
+              )}
+              {oidc.apple && (
+                <Button
+                  variant="default"
+                  size="lg"
+                  block
+                  className="border-line"
+                  type="button"
+                  onClick={() => socialSignIn('apple')}
+                  disabled={busy}
+                >
+                  <AppleMark />
+                  {t(mode === 'signup' ? 'auth.signUpWith' : 'auth.signInWith', { provider: 'Apple' })}
+                </Button>
+              )}
+              {oidc.enabled && (
+                <Button
+                  variant="default"
+                  size="lg"
+                  block
+                  className="border-line"
+                  type="button"
+                  onClick={ssoSignIn}
+                  disabled={busy}
+                >
+                  {t(mode === 'signup' ? 'auth.signUpWith' : 'auth.signInWith', { provider: oidc.displayName ?? '' })}
+                </Button>
+              )}
+              <div className="flex items-center gap-3 text-[11px] uppercase tracking-wide text-ink-faint">
+                <span className="h-px flex-1 bg-line" />
+                {t('auth.or')}
+                <span className="h-px flex-1 bg-line" />
+              </div>
             </>
           )}
-        </AuthCardText>
-        {(oidc.enabled || oidc.google || oidc.microsoft || oidc.apple) && (mode === 'signin' || mode === 'signup') && (
-          <>
-            {oidc.google && (
-              <Button
-                variant="default"
-                size="lg"
-                block
-                className="border-line"
-                type="button"
-                onClick={() => socialSignIn('google')}
-                disabled={busy}
-              >
-                <GoogleMark />
-                {t(mode === 'signup' ? 'auth.signUpWith' : 'auth.signInWith', { provider: 'Google' })}
-              </Button>
-            )}
-            {oidc.microsoft && (
-              <Button
-                variant="default"
-                size="lg"
-                block
-                className="border-line"
-                type="button"
-                onClick={() => socialSignIn('microsoft')}
-                disabled={busy}
-              >
-                <MicrosoftMark />
-                {t(mode === 'signup' ? 'auth.signUpWith' : 'auth.signInWith', { provider: 'Microsoft' })}
-              </Button>
-            )}
-            {oidc.apple && (
-              <Button
-                variant="default"
-                size="lg"
-                block
-                className="border-line"
-                type="button"
-                onClick={() => socialSignIn('apple')}
-                disabled={busy}
-              >
-                <AppleMark />
-                {t(mode === 'signup' ? 'auth.signUpWith' : 'auth.signInWith', { provider: 'Apple' })}
-              </Button>
-            )}
-            {oidc.enabled && (
-              <Button
-                variant="default"
-                size="lg"
-                block
-                className="border-line"
-                type="button"
-                onClick={ssoSignIn}
-                disabled={busy}
-              >
-                {t(mode === 'signup' ? 'auth.signUpWith' : 'auth.signInWith', { provider: oidc.displayName ?? '' })}
-              </Button>
-            )}
-            <div className="flex items-center gap-3 text-[11px] uppercase tracking-wide text-ink-faint">
-              <span className="h-px flex-1 bg-line" />
-              {t('auth.or')}
-              <span className="h-px flex-1 bg-line" />
-            </div>
-          </>
-        )}
         {mode === 'signup' && (
           <Field label={t('auth.nameLabel')} labelVariant="form">
             <Input
@@ -601,6 +643,6 @@ export function AuthPage({ initialMode }: { initialMode?: 'signin' | 'signup' } 
           </Button>
         )}
       </AuthCard>
-    </AuthScreen>
+    </Screen>
   )
 }
