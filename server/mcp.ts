@@ -34,7 +34,7 @@ import {
 } from '../shared/designTokens.ts'
 import { webFontFamilies, webFontsBrief } from '../shared/webFonts.ts'
 import * as actions from './actions.ts'
-import { canvasRole } from './access.ts'
+import { canvasMoveRefusal, canvasRole } from './access.ts'
 import { roleAllows, type CanvasRole } from '../shared/canvasRole.ts'
 import { isAgentKeySecret, verifyAgentKey } from './agentKeys.ts'
 import * as workspaces from './workspaces.ts'
@@ -166,7 +166,7 @@ function textWithNudge(data: unknown, nudge: string) {
 const REVIEW_NUDGE =
   'You have not seen this design yet. Call get_frame_screenshot on it now, judge it against the review checkpoints (fit, spacing, hierarchy, contrast, alignment, realism), and fix any issues before moving on.'
 
-import type { Actor, Frame } from '../shared/types.ts'
+import type { Actor, Frame, WorkspaceRole, WorkspaceSummary } from '../shared/types.ts'
 import { loadToolTargets } from './toolLoads.ts'
 
 /** Reaches agents whose session predates set_status (or who skipped the guide). */
@@ -596,6 +596,139 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
          on every dashboard (and was once visible on all of them) */
       const canvas = store.createCanvas(name, ownerId, workspace_id)
       return text({ id: canvas.id, name: canvas.name, url: `/c/${canvas.id}` })
+    },
+  )
+
+  /* Workspaces: the same rules as the web app's /api/workspaces routes
+     (workspaceAccess), for the connected account. */
+  const workspaceRow = (summary: WorkspaceSummary) => ({
+    id: summary.id,
+    name: summary.name,
+    role: summary.role,
+    member_count: summary.memberCount,
+    canvas_count: summary.canvasCount,
+    active: summary.active,
+  })
+  const workspaceReply = (ws: workspaces.WorkspaceRecord) =>
+    text(workspaceRow(workspaces.summaryFor(ws, ownerId ?? '')))
+  const workspaceAs = (id: string, atLeast: WorkspaceRole) => {
+    const access = workspaces.workspaceAccess(id, ownerId, atLeast)
+    if (access.ok) return access
+    return { ...access, error: access.reason === 'not_found' ? `no workspace with id ${id}` : access.error }
+  }
+
+  server.registerTool(
+    'list_workspaces',
+    {
+      title: 'List workspaces',
+      description:
+        "List the shared workspaces the connected account belongs to: id, name, the account's role (owner, admin or member), member and canvas counts.",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      inputSchema: {},
+    },
+    /* '' matches no workspace: a session without a user sees none */
+    async () => text({ workspaces: workspaces.listFor(ownerId ?? '').map(workspaceRow) }),
+  )
+
+  server.registerTool(
+    'create_workspace',
+    {
+      title: 'Create a workspace',
+      description:
+        'Create a shared workspace owned by the connected account. Returns its id; put canvases in it with create_canvas (workspace_id) or move_canvas_to_workspace.',
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      inputSchema: { name: z.string().describe('Workspace name, up to 80 characters') },
+    },
+    async ({ name }) => {
+      if (!ownerId) return err('this connection is not signed in to a Doop account')
+      const clean = workspaces.workspaceName(name)
+      if (!clean) return err('a workspace name is required')
+      return workspaceReply(workspaces.createWorkspace(clean, ownerId))
+    },
+  )
+
+  server.registerTool(
+    'rename_workspace',
+    {
+      title: 'Rename a workspace',
+      description: 'Rename a workspace. Its owner and admins may; a plain member may not.',
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      inputSchema: {
+        workspace_id: z.string().describe('From list_workspaces'),
+        name: z.string().describe('The new name, up to 80 characters'),
+      },
+    },
+    async ({ workspace_id, name }) => {
+      const access = workspaceAs(workspace_id, 'admin')
+      if (!access.ok) return err(access.error)
+      const clean = workspaces.workspaceName(name)
+      if (!clean) return err('a workspace name is required')
+      return workspaceReply(workspaces.renameWorkspace(access.ws.id, clean)!)
+    },
+  )
+
+  server.registerTool(
+    'delete_workspace',
+    {
+      title: 'Delete a workspace',
+      description:
+        'Delete an empty workspace for good: its members lose it and its font library goes. Only its owner may, with confirm: true. A workspace that still holds canvases is refused: move each one out first with move_canvas_to_workspace.',
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+      inputSchema: {
+        workspace_id: z.string().describe('From list_workspaces'),
+        confirm: z.boolean().optional().describe('Must be true; anything else refuses the delete'),
+      },
+    },
+    async ({ workspace_id, confirm }) => {
+      const access = workspaceAs(workspace_id, 'owner')
+      if (!access.ok) return err(access.error)
+      const { ws } = access
+      if (confirm !== true) return err(`not deleted: pass confirm: true to delete workspace "${ws.name}"`)
+      const held = store.countWorkspaceCanvases(ws.id)
+      if (held > 0)
+        return err(
+          `not deleted: workspace "${ws.name}" still holds ${held} canvas${held === 1 ? '' : 'es'}; move each one out with move_canvas_to_workspace first`,
+        )
+      try {
+        await workspaces.deleteWorkspace(ws.id)
+      } catch (e) {
+        console.error('[mcp] delete_workspace failed', e)
+        return err('the workspace could not be deleted — try again')
+      }
+      return text({ deleted: ws.id, name: ws.name })
+    },
+  )
+
+  server.registerTool(
+    'move_canvas_to_workspace',
+    {
+      title: 'Move a canvas to a workspace',
+      description:
+        "Move a whole canvas, with every page and frame as it is, into a workspace (every member can then open it), or with workspace_id null back to its owner's personal space. Into a workspace: the canvas owner only, as a member of it. Out: the owner or an admin of its workspace. Frames are not changed.",
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      inputSchema: {
+        canvas_id: z.string(),
+        workspace_id: z
+          .string()
+          .nullable()
+          .describe("The workspace to move it into, or null for the owner's personal space"),
+      },
+    },
+    async ({ canvas_id, workspace_id }) => {
+      const canvas = canvasFor(canvas_id, 'edit')
+      if (!canvas) return noCanvas(canvas_id)
+      const refusal = canvasMoveRefusal(ownerId, canvas, workspace_id)
+      if (refusal?.reason === 'plan_required')
+        return err(`workspace "${refusal.ws.name}" needs a Team plan before canvases can be added`)
+      if (refusal) return err(refusal.reason === 'not_found' ? `no workspace with id ${workspace_id}` : refusal.error)
+      if (workspace_id !== canvas.workspaceId) store.setWorkspace(canvas.id, workspace_id ?? undefined)
+      return text({
+        canvas_id: canvas.id,
+        name: canvas.name,
+        workspace_id: canvas.workspaceId ?? null,
+        workspace_name: canvas.workspaceId ? workspaces.getWorkspace(canvas.workspaceId)?.name : null,
+        frame_count: canvas.frames.filter((f) => !f.demo).length,
+      })
     },
   )
 

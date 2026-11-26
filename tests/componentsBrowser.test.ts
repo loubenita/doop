@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import type { Page } from 'puppeteer-core'
+import type { ElementHandle, Frame as FrameDocument, Page } from 'puppeteer-core'
 import { findBrowserPath } from '../server/screenshot'
 import { openBrowser, serveBuilt, type BuiltServer, type TestBrowser } from './browser'
 import { freePort, startServer, type Server } from './harness'
@@ -520,5 +520,97 @@ describe.skipIf(!findBrowserPath())('components in the editor', { timeout: 60_00
     await until(async () => (await state()).frame === 'Shape', 'the frame to be renamed apart again')
     await renameRow('Pin b')
     await until(async () => (await state()).frame === 'Pin b', 'the frame to follow the unchanged name')
+  })
+
+  it('keeps the main and the typed text when ⌘⌥K is pressed during a text edit', async () => {
+    const cardId = await page.evaluate(async (id) => {
+      const res = await fetch(`/api/canvases/${id}/frames`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'Card',
+          x: 100,
+          y: 500,
+          width: 300,
+          height: 160,
+          html: '<!doctype html><html><head></head><body style="margin:20px"><p class="headline" style="font:24px sans-serif">Fresh copy</p></body></html>',
+        }),
+      })
+      if (!res.ok) throw new Error(await res.text())
+      return ((await res.json()) as { id: string }).id
+    }, canvasId)
+    const cardHtml = async () => (await canvas()).frames.find((frame) => frame.id === cardId)!.html
+    const before = new Set(((await canvas()).components ?? []).map((def) => def.id))
+
+    /* bring the card into view and find its document */
+    await switchTab('Layers')
+    await page.waitForSelector(`[data-row-key="${cardId}"]`)
+    await page.click(`[data-row-key="${cardId}"]`)
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur())
+    await page.keyboard.down('Shift')
+    await page.keyboard.press('Digit2')
+    await page.keyboard.up('Shift')
+    const found: { iframe?: ElementHandle; doc?: FrameDocument } = {}
+    await until(async () => {
+      for (const candidate of await page.$$('iframe[data-doop-frame]')) {
+        const content = await candidate.contentFrame()
+        if (content && (await content.$('p.headline').catch(() => null))) {
+          found.iframe = candidate
+          found.doc = content
+          return true
+        }
+      }
+      return false
+    }, 'the card to render')
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    const doc = found.doc!
+
+    /* the headline's centre on screen: the iframe's box scaled from the card's design px */
+    const box = (await found.iframe!.boundingBox())!
+    const inner = await doc.$eval('p.headline', (el) => {
+      const r = el.getBoundingClientRect()
+      return { x: r.x + r.width / 2, y: r.y + r.height / 2 }
+    })
+    const scale = box.width / 300
+    await page.mouse.click(box.x + inner.x * scale, box.y + inner.y * scale, { count: 2 })
+    await doc.waitForSelector('p.headline[contenteditable]')
+    await page.keyboard.type('Edited headline')
+
+    /* the card's saves arrive late, as on a slow network: the server must still see the typed
+       text before it stamps the main, or the late save wipes the stamp */
+    await page.setRequestInterception(true)
+    page.on('request', (request) => {
+      const save = request.method() === 'PATCH' && new URL(request.url()).pathname === `/api/frames/${cardId}`
+      if (!save) return void request.continue()
+      setTimeout(() => void request.continue(), 800)
+    })
+
+    /* make the edited text a component without leaving the edit, then leave it. Keys typed in the
+       frame stay there while it edits, so focus goes back to the page first, as a click on a panel
+       (the Design panel's parent arrow) takes it while the edit stays open */
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur())
+    await page.keyboard.down('Meta')
+    await page.keyboard.down('Alt')
+    await page.keyboard.press('KeyK')
+    await page.keyboard.up('Alt')
+    await page.keyboard.up('Meta')
+    await until(
+      async () => ((await canvas()).components ?? []).some((def) => !before.has(def.id)),
+      'the component from ⌘⌥K',
+    )
+    const made = (await canvas()).components!.find((def) => !before.has(def.id))!
+    await page.keyboard.press('Escape')
+
+    /* the edit's last save must keep both: what was typed and the main's marker */
+    await until(async () => (await cardHtml()).includes('Edited headline'), 'the typed text to save')
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+    const html = await cardHtml()
+    expect(html).toContain('Edited headline')
+    expect(html).toContain(`data-doop-component="${made.id}"`)
+
+    /* undo takes back the component and nothing typed before it */
+    await shortcut('z')
+    await until(async () => !(await cardHtml()).includes('data-doop-component='), 'undo of the create')
+    expect(await cardHtml()).toContain('Edited headline')
   })
 })

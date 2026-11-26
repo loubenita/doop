@@ -54,8 +54,9 @@ describe.skipIf(!findBrowserPath())('element design controls', () => {
     seedId = 0
     uploadStatus = 200
     uploadGate = null
+    /* each wait keeps the shared 15s bound from openBrowser: a 5s bound here
+       ran out on single steps of the font test on a loaded machine */
     page = await pages.open()
-    page.setDefaultTimeout(5_000)
     page.on('pageerror', (error) => errors.push(String(error)))
     await page.setViewport({ width: 1000, height: 900 })
     await page.setRequestInterception(true)

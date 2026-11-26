@@ -172,6 +172,12 @@ export function settleFrames() {
   return Promise.all([...windows.keys()].map((frameId) => requestFrame(frameId, 'doop:settle', {})))
 }
 
+/** Before the server writes to a frame: flush its pending edits and end a text edit open in it,
+ *  whose last save would otherwise overwrite the write. */
+export function endFrameEdit(frameId: string) {
+  return requestFrame(frameId, 'doop:settle', { endEdit: true })
+}
+
 export async function editElementGeometry(
   frameId: string,
   selector: string,

@@ -1,6 +1,6 @@
 import type { Canvas, ClientMessage } from '../shared/types.ts'
 import { roleAllows, type CanvasRole } from '../shared/canvasRole.ts'
-import { hasRole, isWorkspaceMember } from './workspaces.ts'
+import { getWorkspace, hasRole, isActive, isWorkspaceMember, type WorkspaceRecord } from './workspaces.ts'
 
 /**
  * Canvas access, Figma-style: private by default. The owner always has
@@ -82,6 +82,30 @@ export function canManageCanvas(userId: string | undefined, canvas: Canvas): boo
   if (!userId) return false
   if (canvas.ownerId === userId) return true
   return !!canvas.workspaceId && hasRole(canvas.workspaceId, userId, 'admin')
+}
+
+export type CanvasMoveRefusal =
+  { reason: 'forbidden' | 'not_found'; error: string } | { reason: 'plan_required'; ws: WorkspaceRecord }
+
+/** Why this user may not file this canvas in workspace `target`, or take it
+ *  back to its owner's personal space (null); null when they may. Out: its
+ *  owner or an admin of its workspace. In: its owner alone, as a member of a
+ *  workspace that may still grow; an admin's say over a workspace canvas ends
+ *  at moving it out. The caller has already checked edit access. */
+export function canvasMoveRefusal(
+  userId: string | undefined,
+  canvas: Canvas,
+  target: string | null,
+): CanvasMoveRefusal | null {
+  if (!canManageCanvas(userId, canvas))
+    return { reason: 'forbidden', error: 'only the canvas owner or a workspace admin can move it' }
+  if (target === null || target === canvas.workspaceId) return null
+  if (canvas.ownerId !== userId)
+    return { reason: 'forbidden', error: 'only the canvas owner can move it into a workspace' }
+  const ws = getWorkspace(target)
+  if (!ws || !isWorkspaceMember(ws.id, userId)) return { reason: 'not_found', error: 'workspace not found' }
+  if (!isActive(ws)) return { reason: 'plan_required', ws }
+  return null
 }
 
 /** The role an inbound room (WebSocket) message needs: cursors and viewports

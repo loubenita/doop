@@ -21,6 +21,10 @@ services:
       SMTP_USER: ${SMTP_USER:-}
       SMTP_PASS: ${SMTP_PASS:-}
       EMAIL_FROM: ${EMAIL_FROM:-}
+    # Uploaded pictures and fonts land in /app/data/assets unless BUCKET is set;
+    # without this volume every container recreate deletes them.
+    volumes:
+      - doop-data:/app/data
     depends_on:
       db:
         condition: service_healthy
@@ -43,3 +47,4 @@ services:
 
 volumes:
   doop-pg:
+  doop-data:

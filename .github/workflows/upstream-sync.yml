@@ -1,13 +1,15 @@
 name: Upstream sync
 
-# Every Monday: merge kgoedecke/doop's main into an upstream-sync/<date> branch cut from this
-# fork's main, run the tests on the merged tree, push the branch and open an issue with the
-# compare link and the result (scripts/upstreamSync.ts). A person opens the pull request from
-# the issue; nothing here merges into main or deploys. A conflict or a test failure goes in the
-# same issue. The token below can push branches and open issues, and nothing more.
+# Every day: merge kgoedecke/doop's main into an upstream-sync/<date> branch cut from this
+# fork's main, run the tests on the merged tree, push the branch and open a pull request into
+# main whose description is the report (scripts/upstreamSync.ts); a draft when the tests fail.
+# The same report goes to this run's summary every time, so a conflict (nothing pushed) or a
+# repository that does not let Actions open pull requests still leaves it on the run page. The
+# repository has issues turned off, so nothing here uses them. Nothing here merges into main or
+# deploys: a person merges the pull request. The token can push branches and open pull requests.
 on:
   schedule:
-    - cron: '0 5 * * 1'
+    - cron: '0 5 * * *'
   workflow_dispatch:
     inputs:
       base:
@@ -16,7 +18,7 @@ on:
 
 permissions:
   contents: write
-  issues: write
+  pull-requests: write
 
 concurrency:
   group: upstream-sync
@@ -46,7 +48,7 @@ jobs:
           "$path" --version
           echo "CHROME_PATH=$path" >> "$GITHUB_ENV"
           echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns >/dev/null
-      - name: Merge upstream, test, push the branch and open the issue
+      - name: Merge upstream, test, push the branch and open the pull request
         env:
           GH_TOKEN: ${{ github.token }}
           # Via env, never inlined into the script: a dispatch input is free text.

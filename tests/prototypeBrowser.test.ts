@@ -436,14 +436,17 @@ describe.skipIf(!findBrowserPath())('prototype player', { timeout: 30_000 }, () 
       expect(await current()).toBe('HOME')
     })
 
-    /* only the top screen takes input: the screen an overlay covers stays put */
+    /* only the top screen takes input: the screen an overlay covers stays put.
+       Home's delay has to come due after the overlay opens: on a loaded machine
+       opening it has taken more than 800ms, and home left before it opened. */
+    const HOME_DELAY_MS = 3000
     const COVERED: Canvas = {
       ...CANVAS,
       frames: [
         frame(
           'home',
           `<button id="help" data-doop-on="click" data-doop-action="overlay:menu">Help</button>
-           <div data-doop-on="delay:800" data-doop-action="navigate:detail"></div>
+           <div data-doop-on="delay:${HOME_DELAY_MS}" data-doop-action="navigate:detail"></div>
            <div data-doop-on="key:k" data-doop-action="navigate:detail"></div>`,
         ),
         frame('detail', `<button id="back" data-doop-on="click" data-doop-action="back">Back</button>`, 500),
@@ -485,6 +488,7 @@ describe.skipIf(!findBrowserPath())('prototype player', { timeout: 30_000 }, () 
 
     it('runs only the top screen’s delays and keys while an overlay is open', async () => {
       await page.evaluate((canvas) => (window as unknown as Fixture).seed(canvas), COVERED)
+      const played = Date.now()
       await page.evaluate(() => (window as unknown as Fixture).play('home'))
       const home = await screen('home')
       /* a real click focuses the screen that opens the overlay */
@@ -492,7 +496,7 @@ describe.skipIf(!findBrowserPath())('prototype player', { timeout: 30_000 }, () 
       await clickUntil(home, '#help', async () => !!(await page.$('[data-proto-overlay="menu"]')))
       await screen('menu')
       /* home's delay comes due under the overlay and does nothing */
-      await sleep(1000)
+      await sleep(Math.max(0, played + HOME_DELAY_MS + 500 - Date.now()))
       expect(await current()).toBe('HOME')
       expect(await page.$('[data-proto-overlay="menu"]')).not.toBeNull()
 

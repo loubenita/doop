@@ -572,7 +572,14 @@ with no per-canvas invites. Create one from the sidebar on the home screen, invi
 email (existing accounts join at once; anyone else joins the moment they sign up with that
 address), file canvases in it from the Share modal or the canvas menu ("Move to workspace…"),
 and manage people, roles (owner / admin / member) and billing at `/w/<id>`. Agents see workspace
-canvases in `list_canvases` and can create into one with `create_canvas`'s `workspace_id`.
+canvases in `list_canvases` and can create into one with `create_canvas`'s `workspace_id`. Agents
+can also manage workspaces, under the same roles as people:
+
+- `list_workspaces` and `create_workspace` work for any signed-in account.
+- `rename_workspace` needs the owner or an admin.
+- `delete_workspace` needs the owner and `confirm: true`. It refuses a workspace that still
+  holds canvases.
+- `move_canvas_to_workspace` moves a whole canvas in or out. Its frames stay as they are.
 
 Workspaces are the paid part of doop on a hosted deployment. Plans (see `shared/billing.ts`):
 
@@ -696,9 +703,13 @@ Any container host works; Railway/Fly are the least friction:
 2. Add a managed Postgres and set `DATABASE_URL`. **Don't skip this in real deployments** —
    the PGlite fallback is embedded/single-process and only suits a single instance with a
    persistent volume mounted at `/app/data`.
-3. Set `BETTER_AUTH_SECRET` (long random string) and `BETTER_AUTH_URL` (the public origin,
+3. Give uploads a lasting home. Either set the object storage variables (`BUCKET` and the rest,
+   listed below) or mount a persistent volume at `/app/data`. Without either, Doop keeps uploaded
+   pictures and fonts inside the container. A redeploy then deletes them while their database rows
+   stay, so their `/a/` addresses answer 404. `docker-compose.yml` mounts one, named `doop-data`.
+4. Set `BETTER_AUTH_SECRET` (long random string) and `BETTER_AUTH_URL` (the public origin,
    e.g. `https://doop.example.com`). Extra allowed origins: `TRUSTED_ORIGINS` (comma-separated).
-4. Health check: `GET /healthz`. The server trusts one proxy hop (`trust proxy`), so
+5. Health check: `GET /healthz`. The server trusts one proxy hop (`trust proxy`), so
    TLS termination at the platform edge works out of the box.
 
 Local sanity check of the exact production image:
@@ -883,60 +894,66 @@ tools; `tests/agentToolParity.test.ts` lists the MCP tools it does not have yet.
 registers ([`server/linear/extension.ts`](server/linear/extension.ts)). Every tool carries
 read-only / destructive / idempotent annotations; the server registers no MCP prompts.
 
-| Tool                     | What it does                                                                                                        |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------- |
-| `get_guide`              | The agent playbook — agents are instructed to load this first                                                       |
-| `set_status`             | Broadcast a one-line "what I'm working on" — shown live in the working-now strip, avatar tooltip, and activity feed |
-| `get_profile`            | The Doop account this connection is signed in as                                                                    |
-| **Canvases**             |                                                                                                                     |
-| `list_canvases`          | List the canvases you can open, including workspace canvases                                                        |
-| `create_canvas`          | Create a canvas (optionally in a workspace), returns its shareable id                                               |
-| `get_canvas`             | Canvas layout: every frame's position/size/meta                                                                     |
-| `set_canvas_pages`       | Create, rename, reorder or delete canvas pages                                                                      |
-| `set_page_background`    | Paint one page's canvas a colour of its own, or clear it back to the theme paper                                    |
-| **Frames**               |                                                                                                                     |
-| `create_frame`           | Add a frame with HTML (auto-placed if no x/y)                                                                       |
-| `get_frame`              | Read a frame including its HTML                                                                                     |
-| `append_frame_html`      | **Stream** a design in chunks (`start=true` first, `done=true` last) — viewers watch it build up                    |
-| `set_frame_html`         | Replace a frame's design in one shot — renders live for everyone                                                    |
-| `edit_frame_html`        | Targeted exact find/replace in a frame's HTML — morphs into the render in place                                     |
-| `update_frame`           | Rename / move / resize a frame                                                                                      |
-| `delete_frame`           | Remove a frame                                                                                                      |
-| `list_frame_versions`    | Earlier states of a frame, newest first, with author and time                                                       |
-| `restore_frame_version`  | Put a frame back to an earlier state; the replaced design is kept as a version                                      |
-| `get_frame_screenshot`   | Render the frame headlessly and return a PNG — lets agents _see_ and iterate on their design                        |
-| `export_frame`           | PNG/JPG URLs that re-render when the design changes, or a vector PDF                                                |
-| **Prototypes**           |                                                                                                                     |
-| `get_prototype`          | Each page's flow start and every interaction (trigger, action, target), flagging links to missing frames            |
-| `set_prototype_start`    | Choose the frame a page's clickable prototype starts on                                                             |
-| **Collaboration**        |                                                                                                                     |
-| `get_feedback`           | Fetch & claim open human feedback requests — for agents whose job is to poll the canvas periodically                |
-| `get_comments`           | Read element and canvas comments with their replies, optionally filtered by frame or resolution state, no claiming  |
-| `reply_to_comment`       | Reply inside an element-comment thread; `@mention` of a resident role is metered like a browser comment             |
-| `resolve_comment`        | Resolve an element-comment thread; resolving an `@mention` thread records the exchange in canvas Memory             |
-| `report_issue`           | Report a tool failure or missing capability to the instance admins                                                  |
-| `share_feedback`         | Share suggestions and feedback with the instance admins                                                             |
-| **Design memory**        |                                                                                                                     |
-| `list_guidelines`        | List a canvas's style guides (brand rules, style recipes) with one-line summaries                                   |
-| `get_guidelines`         | Read one style guide in full — the rules every frame on the canvas must follow                                      |
-| `set_guidelines`         | Write or revise a style guide (versioned, with history)                                                             |
-| `get_reference`          | Read a frame a human pinned as a "more like this" style reference                                                   |
-| `save_decision`          | Record a design decision so later agents don't re-litigate it; feeds the distiller                                  |
-| **Assets & inspiration** |                                                                                                                     |
-| `search_images`          | Stock photo search (Pexels) — returns thumbnails the agent picks from                                               |
-| `search_icons`           | 200,000+ open-source icons (Iconify) as hotlinkable SVGs                                                            |
-| `search_logos`           | Real company logos by brand name or domain (Brandfetch, vector marks)                                               |
-| `list_backgrounds`       | Curated hero/section/bento backgrounds (glows, grainy meshes, aurora, painterly) as thumbnails                      |
-| `search_inspiration`     | Curated live landing pages with style, colour, fonts and sections (One Page Love)                                   |
-| `generate_image`         | Generate an image with the model the user picked in Settings (GPT Image, Nano Banana or Seedream) → asset URL       |
-| `upload_asset`           | Store your own file — from a URL, a one-time local-file upload URL, or inline base64                                |
-| `add_font`               | Add a Google Fonts family (chosen weights, optional italics) to a workspace's font library, shown on its canvases   |
-| **Web**                  |                                                                                                                     |
-| `view_website`           | Inspect one public page read-only; returns a desktop screenshot and visible text without changing the canvas        |
-| `import_webpage`         | Import one public URL onto a canvas as an editable HTML snapshot/frame                                              |
-| **Linear**               |                                                                                                                     |
-| `list_linear_issues`     | List tickets through the user's Linear connection (open, most recently updated first)                               |
-| `get_linear_issue`       | Read a Linear ticket and its description by UUID or identifier                                                      |
+| Tool                       | What it does                                                                                                        |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `get_guide`                | The agent playbook — agents are instructed to load this first                                                       |
+| `set_status`               | Broadcast a one-line "what I'm working on" — shown live in the working-now strip, avatar tooltip, and activity feed |
+| `get_profile`              | The Doop account this connection is signed in as                                                                    |
+| **Canvases**               |                                                                                                                     |
+| `list_canvases`            | List the canvases you can open, including workspace canvases                                                        |
+| `create_canvas`            | Create a canvas (optionally in a workspace), returns its shareable id                                               |
+| **Workspaces**             |                                                                                                                     |
+| `list_workspaces`          | The workspaces you belong to, with your role and their member and canvas counts                                     |
+| `create_workspace`         | Create a workspace you own                                                                                          |
+| `rename_workspace`         | Rename a workspace (owner or admin)                                                                                 |
+| `delete_workspace`         | Delete an empty workspace (owner only; needs `confirm: true`, refused while it holds canvases)                      |
+| `move_canvas_to_workspace` | Move a whole canvas into a workspace, or back to its owner's personal space; frames untouched                       |
+| `get_canvas`               | Canvas layout: every frame's position/size/meta                                                                     |
+| `set_canvas_pages`         | Create, rename, reorder or delete canvas pages                                                                      |
+| `set_page_background`      | Paint one page's canvas a colour of its own, or clear it back to the theme paper                                    |
+| **Frames**                 |                                                                                                                     |
+| `create_frame`             | Add a frame with HTML (auto-placed if no x/y)                                                                       |
+| `get_frame`                | Read a frame including its HTML                                                                                     |
+| `append_frame_html`        | **Stream** a design in chunks (`start=true` first, `done=true` last) — viewers watch it build up                    |
+| `set_frame_html`           | Replace a frame's design in one shot — renders live for everyone                                                    |
+| `edit_frame_html`          | Targeted exact find/replace in a frame's HTML — morphs into the render in place                                     |
+| `update_frame`             | Rename / move / resize a frame                                                                                      |
+| `delete_frame`             | Remove a frame                                                                                                      |
+| `list_frame_versions`      | Earlier states of a frame, newest first, with author and time                                                       |
+| `restore_frame_version`    | Put a frame back to an earlier state; the replaced design is kept as a version                                      |
+| `get_frame_screenshot`     | Render the frame headlessly and return a PNG — lets agents _see_ and iterate on their design                        |
+| `export_frame`             | PNG/JPG URLs that re-render when the design changes, or a vector PDF                                                |
+| **Prototypes**             |                                                                                                                     |
+| `get_prototype`            | Each page's flow start and every interaction (trigger, action, target), flagging links to missing frames            |
+| `set_prototype_start`      | Choose the frame a page's clickable prototype starts on                                                             |
+| **Collaboration**          |                                                                                                                     |
+| `get_feedback`             | Fetch & claim open human feedback requests — for agents whose job is to poll the canvas periodically                |
+| `get_comments`             | Read element and canvas comments with their replies, optionally filtered by frame or resolution state, no claiming  |
+| `reply_to_comment`         | Reply inside an element-comment thread; `@mention` of a resident role is metered like a browser comment             |
+| `resolve_comment`          | Resolve an element-comment thread; resolving an `@mention` thread records the exchange in canvas Memory             |
+| `report_issue`             | Report a tool failure or missing capability to the instance admins                                                  |
+| `share_feedback`           | Share suggestions and feedback with the instance admins                                                             |
+| **Design memory**          |                                                                                                                     |
+| `list_guidelines`          | List a canvas's style guides (brand rules, style recipes) with one-line summaries                                   |
+| `get_guidelines`           | Read one style guide in full — the rules every frame on the canvas must follow                                      |
+| `set_guidelines`           | Write or revise a style guide (versioned, with history)                                                             |
+| `get_reference`            | Read a frame a human pinned as a "more like this" style reference                                                   |
+| `save_decision`            | Record a design decision so later agents don't re-litigate it; feeds the distiller                                  |
+| **Assets & inspiration**   |                                                                                                                     |
+| `search_images`            | Stock photo search (Pexels) — returns thumbnails the agent picks from                                               |
+| `search_icons`             | 200,000+ open-source icons (Iconify) as hotlinkable SVGs                                                            |
+| `search_logos`             | Real company logos by brand name or domain (Brandfetch, vector marks)                                               |
+| `list_backgrounds`         | Curated hero/section/bento backgrounds (glows, grainy meshes, aurora, painterly) as thumbnails                      |
+| `search_inspiration`       | Curated live landing pages with style, colour, fonts and sections (One Page Love)                                   |
+| `generate_image`           | Generate an image with the model the user picked in Settings (GPT Image, Nano Banana or Seedream) → asset URL       |
+| `upload_asset`             | Store your own file — from a URL, a one-time local-file upload URL, or inline base64                                |
+| `add_font`                 | Add a Google Fonts family (chosen weights, optional italics) to a workspace's font library, shown on its canvases   |
+| **Web**                    |                                                                                                                     |
+| `view_website`             | Inspect one public page read-only; returns a desktop screenshot and visible text without changing the canvas        |
+| `import_webpage`           | Import one public URL onto a canvas as an editable HTML snapshot/frame                                              |
+| **Linear**                 |                                                                                                                     |
+| `list_linear_issues`       | List tickets through the user's Linear connection (open, most recently updated first)                               |
+| `get_linear_issue`         | Read a Linear ticket and its description by UUID or identifier                                                      |
 
 Mutating tools accept `agent_name`; the agent then appears in the presence stack (pulsing square avatar),
 gets an "editing" ring + chip on the frame it touched, and its actions land in the activity feed. Agents

@@ -1766,6 +1766,13 @@ export const FRAME_BOOTSTRAP = `<!doctype html>
         styleTimer = null
         postEdited()
       }
+      /* a server write is about to change this document: the parent withholds
+         html while text is edited, so the edit's last save would serialize the
+         document without that change. End it now, saving what was typed first */
+      if (d.endEdit && editing) {
+        setEdit(false)
+        parent.postMessage({ type: 'doop:edit-esc' }, '*')
+      }
       parent.postMessage({ type: 'doop:settle-result', reqId: d.reqId }, '*')
     }
     if (d.type === 'doop:style' && d.styles && typeof d.styles === 'object') {

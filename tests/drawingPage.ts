@@ -38,6 +38,11 @@ declare global {
     }
     delayedLayerProbe: MessageEvent | null
     heldMoveHits: MessageEvent[] | null
+    /** set inside a frame once a test's held-back message has been passed on.
+     *  It lives on the frame's window, not its body: the save a drop makes is
+     *  merged into the frame's document, which puts back the saved body's
+     *  attributes, so a mark on the body can be gone before the test reads it. */
+    heldReplyPassed?: boolean
   }
 }
 
