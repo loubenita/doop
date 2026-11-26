@@ -4,6 +4,8 @@
    physical key by `code`, since macOS types another character for ⌥ chords
    and ⇧1 is '!' on most layouts. */
 
+import { pressedKey } from '../keys'
+
 export interface Chord {
   /** `KeyboardEvent.key`, compared case-insensitively */
   key?: string
@@ -21,7 +23,7 @@ export interface Chord {
   global?: boolean
 }
 
-type KeyInput = Pick<KeyboardEvent, 'key' | 'code' | 'metaKey' | 'ctrlKey' | 'altKey' | 'shiftKey'>
+export type KeyInput = Pick<KeyboardEvent, 'key' | 'code' | 'metaKey' | 'ctrlKey' | 'altKey' | 'shiftKey'>
 
 export const IS_MAC = typeof navigator !== 'undefined' && /mac/i.test(navigator.platform)
 
@@ -37,7 +39,7 @@ export function matchesChord(e: KeyInput, chord: Chord, mac = IS_MAC): boolean {
   }
   if (e.altKey !== !!chord.alt || e.shiftKey !== !!chord.shift) return false
   if (chord.code) return e.code === chord.code
-  return !!chord.key && e.key.toLowerCase() === chord.key.toLowerCase()
+  return !!chord.key && pressedKey(e) === chord.key.toLowerCase()
 }
 
 const KEY_GLYPHS: Record<string, string> = {

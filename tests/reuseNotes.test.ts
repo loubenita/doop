@@ -9,6 +9,7 @@ vi.mock('../server/db/persist.ts', () => ({
   saveDecision: () => {},
   saveProposal: () => {},
   saveCanvas: () => {},
+  refreshAssetRefs: () => {},
   saveFrame: () => {},
   saveToken: () => {},
   deleteToken: () => {},
@@ -20,6 +21,7 @@ vi.mock('../server/fonts.ts', () => ({ fontsForCanvas: () => [] }))
 
 const actions = await import('../server/actions.ts')
 const { store } = await import('../server/store.ts')
+const { renderedHtml } = await import('./rendered.ts')
 const { componentWriteNotes, runComponentTool, streamChunkNotes } = await import('../server/componentTools.ts')
 const { componentSystemPlan } = await import('../server/reuseNotes.ts')
 
@@ -66,7 +68,10 @@ describe('reuse notes on frame writes', () => {
     const reuse = notes.filter((note) => note.startsWith('REUSE:'))
     expect(reuse).toHaveLength(1)
     expect(reuse[0]).toContain('3 blocks in this frame share one structure')
-    expect(reuse[0]).toContain('replace_matching=true')
+    expect(reuse[0]).toContain('create_component with frame_id')
+    expect(reuse[0]).toContain('<doop-use component="')
+    expect(reuse[0]).toContain('edit_frame_html')
+    expect(reuse[0]).not.toContain('replace_matching')
   })
 
   it('leaves two copies alone, and says nothing on a small edit', () => {
@@ -89,7 +94,7 @@ describe('reuse notes on frame writes', () => {
     const canvasId = canvasWithTokens()
     /* the frame names the token; the managed block it gets holds the literal */
     expect(write(canvasId, page(`<h1 style="color:var(--color-ink)">Hi</h1>`))).toEqual([])
-    expect(store.getCanvas(canvasId)!.frames.at(-1)!.html).toContain('data-doop-tokens')
+    expect(renderedHtml(store.getCanvas(canvasId)!.frames.at(-1)!.id)).toContain('data-doop-tokens')
   })
 
   it('flags a palette declared on :root, and a token redefined there', () => {

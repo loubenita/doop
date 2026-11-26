@@ -312,6 +312,11 @@ public struct CanvasComment: Codable, Identifiable {
     public var pageId: String?
     public var x: Double?
     public var y: Double?
+    /// The `data-doop-id` of the element an element comment is pinned to.
+    public var elementId: String? = nil
+    /// The element's top-left when the comment was pinned; while it is still
+    /// there the pin sits at `x`/`y`, else at the element's new top-left.
+    public var elementOrigin: CanvasPoint? = nil
     public var from: String
     public var text: String
     public var at: Double
@@ -329,6 +334,8 @@ public struct CanvasPresence: Codable, Identifiable {
     public var viewport: CanvasViewport?
     /// The frame this collaborator has open; for an agent, the one it last worked on.
     public var activeFrameId: String? = nil
+    /// An agent's one-line "what I'm working on" (set_status); nil when idle.
+    public var status: String? = nil
     public var id: String { clientId }
 }
 
@@ -375,6 +382,8 @@ public struct CanvasEvent: Decodable {
     /// `frame:streaming`: whether the actor started or stopped streaming.
     public var active: Bool?
     public var actor: CanvasActor?
+    /// `status`: an agent's new status line, null when it went idle.
+    public var status: String?
 }
 
 /// Who caused a room event (a frame write, a stream).

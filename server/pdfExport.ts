@@ -1,10 +1,12 @@
 import { PDFDocument } from 'pdf-lib'
-import type { Frame as PageFrame } from 'puppeteer-core'
 import type { Canvas, Frame } from '../shared/types.ts'
 import { readingOrder } from '../shared/frameOrder.ts'
 import { canvasPages, pageFrames } from '../shared/pages.ts'
 import { MAX_PDF_FRAMES, PDF_RENDER_CONCURRENCY } from '../shared/pdfLimits.ts'
-import { loadFramePage, rendererAvailable } from './screenshot.ts'
+import { composedHtml, wholeDocument } from './frameCompose.ts'
+import { designPx } from './renderLimits.ts'
+import { settleFonts } from './renderFonts.ts'
+import { frameViewport, loadFramePage, rendererAvailable } from './screenshot.ts'
 
 /**
  * Vector PDF export: each frame prints through headless Chrome onto one page
@@ -21,8 +23,6 @@ const MAX_PAGE_PX = 19_200
 
 /** Chrome's own print-scale floor. */
 const MIN_PRINT_SCALE = 0.1
-
-const FONT_WAIT_MS = 3000
 
 export const PDF_UNAVAILABLE_MESSAGE =
   'PDF export is unavailable: this server has no Chrome or Chromium to render with (set CHROME_PATH)'
@@ -48,16 +48,10 @@ interface PageSize {
 /** The paper for a frame, in CSS px, and the print scale that lays the
  *  frame out at its own width on it. */
 export function pageSizeFor(frame: Pick<Frame, 'width' | 'height'>): PageSize {
-  const width = Math.max(1, Math.round(frame.width))
-  const height = Math.max(1, Math.round(frame.height))
+  const width = designPx(frame.width)
+  const height = designPx(frame.height)
   const scale = Math.max(MIN_PRINT_SCALE, Math.min(1, MAX_PAGE_PX / Math.max(width, height)))
   return { width: Math.round(width * scale), height: Math.round(height * scale), scale }
-}
-
-async function waitForFonts(frame: PageFrame): Promise<void> {
-  const timeout = new Promise<void>((resolve) => setTimeout(resolve, FONT_WAIT_MS))
-  const ready = frame.evaluate(() => document.fonts.ready.then(() => undefined)).catch(() => undefined)
-  await Promise.race([ready, timeout])
 }
 
 function escapeAttribute(value: string): string {
@@ -73,10 +67,11 @@ function escapeAttribute(value: string): string {
  * units at the frame's size. Relative URLs resolve against the shell's
  * `<base>`, which a srcdoc document inherits.
  */
-function printShell(frame: Pick<Frame, 'width' | 'height' | 'html'>): string {
-  const width = Math.max(1, Math.round(frame.width))
-  const height = Math.max(1, Math.round(frame.height))
-  const html = frame.html || '<!doctype html><html><body></body></html>'
+export function printShell(frame: Pick<Frame, 'width' | 'height' | 'html' | 'canvasId'>): string {
+  const width = designPx(frame.width)
+  const height = designPx(frame.height)
+  /* composed here: the shell is loaded as written, and the design is inside its iframe */
+  const html = frame.html ? composedHtml(frame.canvasId, frame.html) : '<!doctype html><html><body></body></html>'
   return (
     '<!doctype html><html><head><style>html,body{margin:0;overflow:hidden}' +
     `iframe{display:block;border:0;width:${width}px;height:${height}px}</style></head>` +
@@ -87,17 +82,13 @@ function printShell(frame: Pick<Frame, 'width' | 'height' | 'html'>): string {
 /** One frame as a single-page PDF. */
 export async function renderFramePdfPage(frame: Frame): Promise<Uint8Array> {
   if (!pdfRendererAvailable()) throw new PdfRendererUnavailableError()
-  const loaded = await loadFramePage({ ...frame, html: printShell(frame) })
+  const loaded = await loadFramePage(wholeDocument({ ...frame, html: printShell(frame) }))
   const { page } = loaded
   try {
     const size = pageSizeFor(frame)
-    await page.setViewport({
-      width: Math.max(1, Math.round(frame.width)),
-      height: Math.max(1, Math.round(frame.height)),
-      deviceScaleFactor: 1,
-    })
+    await page.setViewport(frameViewport(frame.width, frame.height))
     await page.emulateMediaType('screen')
-    await waitForFonts(page.mainFrame().childFrames()[0] ?? page.mainFrame())
+    await settleFonts(page.mainFrame().childFrames()[0] ?? page.mainFrame())
     return await page.pdf({
       width: `${size.width}px`,
       height: `${size.height}px`,

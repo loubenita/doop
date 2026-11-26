@@ -2,6 +2,7 @@ import { defineConfig } from 'vitest/config'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { fileURLToPath } from 'node:url'
+import { frameRuntime } from './src/frame-runtime/vitePlugin.ts'
 
 /* Dev ports. The defaults are the only ones anyone normally needs; the env
    overrides exist so a second worktree can run its own pair without fighting
@@ -18,13 +19,18 @@ const clipboardTests = [
 ]
 
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), frameRuntime()],
   test: {
     /* agent worktrees live under .claude/ inside the repo; their copies of the
        suite must not run as ours */
     exclude: ['**/node_modules/**', '**/.claude/**'],
     setupFiles: ['tests/setup.ts'],
     globalSetup: ['tests/globalSetup.ts'],
+    /* an expect.poll in a browser test reads the page through several round
+       trips (a frame's iframe, then its document); on a loaded runner one read
+       alone has outlasted vitest's 1s default, and the poll failed without
+       ever seeing an answer. 15s, the bound of every other page wait. */
+    expect: { poll: { timeout: 15_000 } },
     projects: [
       { test: { name: 'parallel', exclude: clipboardTests } },
       // Browser contexts share the system clipboard, so these files must run one at a time.
@@ -33,6 +39,13 @@ export default defineConfig({
     /* seven files drive a real Chromium; closing one under a full parallel
        run can outlast the 10s default */
     hookTimeout: 30_000,
+    /* a timeout is there to catch a test that hangs, not one that ran on a
+       busy machine: vitest's 5s default is sized for unit tests, and here
+       tests boot servers, migrate databases and drive Chromium on shared CI
+       cores, where a 300ms test can take 5s. Slow tests still show in the
+       report (slowTestThreshold) without failing the run. */
+    testTimeout: 30_000,
+    slowTestThreshold: 2_000,
   },
   /* Error tracking resolves minified stack frames through the .map next to
      each bundle. The source is public (AGPL), so the maps are too; browsers
@@ -69,6 +82,14 @@ export default defineConfig({
       '/a/': { target: api },
       '/u/': { target: api },
       '/ingest': { target: api },
+      /* the editor extension's server routes; /editor/connect is the app's page */
+      '/editor/exchange': { target: api },
+      '/editor/embed': { target: api },
+      '/editor/whoami': { target: api },
+      '/editor/sign-out': { target: api },
+      /* the doop CLI's sign-in exchange; /cli/connect is the app's page */
+      '/cli/exchange': { target: api },
+      '/cli/sign-out': { target: api },
       '/relay': { target: api },
       '/blog': { target: api },
       '/robots.txt': { target: api },

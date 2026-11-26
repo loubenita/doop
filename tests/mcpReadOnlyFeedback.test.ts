@@ -10,6 +10,7 @@ import type { Canvas, Frame, TaskFeedback } from '../shared/types.ts'
  * writes (deliveredAt, claimedBy, a broadcast), so reads only announce it and
  * the tools that change the canvas keep claiming. */
 vi.mock('../server/db/persist.ts', () => ({
+  refreshAssetRefs: () => {},
   saveFrame: () => {},
   saveCanvas: () => {},
   saveTask: () => {},
@@ -110,7 +111,10 @@ describe('human feedback on read-only MCP tools', () => {
         new_str: 'Hello',
         agent_name: 'Claude',
       })
-      expect(take).toHaveBeenCalledWith(CANVAS.id, 'Claude')
+      expect(take).toHaveBeenCalledWith(
+        CANVAS.id,
+        expect.objectContaining({ name: 'Claude', agentKey: expect.any(String) }),
+      )
       expect(raw).toContain(FEEDBACK.text)
     } finally {
       await close()
@@ -119,6 +123,7 @@ describe('human feedback on read-only MCP tools', () => {
 
   it.each([
     ['create_canvas_page', { canvas_id: CANVAS.id, name: 'Mobile', agent_name: 'Claude' }],
+    ['update_canvas', { canvas_id: CANVAS.id, name: 'Checkout', agent_name: 'Claude' }],
     [
       'set_canvas_pages',
       {
@@ -134,13 +139,17 @@ describe('human feedback on read-only MCP tools', () => {
     const page = { id: 'c1:page2', name: 'Mobile' }
     vi.spyOn(actions, 'createCanvasPage').mockReturnValue({ page, pages: [{ id: 'c1:page1', name: 'Page 1' }, page] })
     vi.spyOn(actions, 'setCanvasPages').mockImplementation((_id, pages) => pages)
+    vi.spyOn(actions, 'renameCanvas').mockReturnValue(CANVAS)
     vi.spyOn(actions, 'setPageBackground').mockReturnValue([{ id: 'c1:page1', name: 'Page 1' }])
     vi.spyOn(actions, 'setFlowStart').mockReturnValue([{ id: 'c1:page1', name: 'Page 1', startFrameId: FRAME.id }])
     const take = vi.spyOn(actions, 'takeFeedbackFor').mockReturnValue([FEEDBACK])
     const { client, close } = await connect()
     try {
       const raw = await callText(client, tool, args)
-      expect(take).toHaveBeenCalledWith(CANVAS.id, 'Claude')
+      expect(take).toHaveBeenCalledWith(
+        CANVAS.id,
+        expect.objectContaining({ name: 'Claude', agentKey: expect.any(String) }),
+      )
       expect(raw).toContain(FEEDBACK.text)
     } finally {
       await close()
@@ -160,10 +169,10 @@ describe('openFeedbackFor', () => {
       decisions: empty,
       proposals: empty,
     })
-    expect(actions.openFeedbackFor('c-open', 'Claude').map((f) => f.id)).toEqual(['fb-real'])
+    expect(actions.openFeedbackFor('c-open', { name: 'Claude' }).map((f) => f.id)).toEqual(['fb-real'])
     expect(entry.deliveredAt).toBeUndefined()
-    expect(actions.takeFeedbackFor('c-open', 'Claude').map((f) => f.id)).toEqual(['fb-real'])
+    expect(actions.takeFeedbackFor('c-open', { name: 'Claude' }).map((f) => f.id)).toEqual(['fb-real'])
     expect(entry.claimedBy).toBe('Claude')
-    expect(actions.openFeedbackFor('c-open', 'Claude')).toEqual([])
+    expect(actions.openFeedbackFor('c-open', { name: 'Claude' })).toEqual([])
   })
 })

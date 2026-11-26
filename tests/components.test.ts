@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('../server/db/persist.ts', () => ({
   saveCanvas: () => {},
+  refreshAssetRefs: () => {},
   saveFrame: () => {},
   saveActivity: () => {},
   saveFrameVersion: () => {},
@@ -15,8 +16,9 @@ import * as actions from '../server/actions.ts'
 import * as propagation from '../server/propagation.ts'
 import { blankComponent, contextFor } from '../server/components.ts'
 import { compactDocument } from '../server/componentEngine.ts'
-import { findComponentCandidates, lookalikesIn } from '../server/componentActions.ts'
+import { findComponentCandidates } from '../server/componentActions.ts'
 import { COMPONENT_ATTR, INSTANCE_ATTR } from '../shared/components.ts'
+import { renderedHtml } from './rendered.ts'
 import type { Actor } from '../shared/types.ts'
 
 const actor = { name: 'Tester', kind: 'user', color: '#000', clientId: 'x' } as unknown as Actor
@@ -56,7 +58,7 @@ function setup() {
 }
 
 const current = (canvasId: string, id: string) => store.getComponents(canvasId).find((d) => d.id === id)!
-const framed = (id: string) => store.getFrame(id)!.html
+const framed = renderedHtml
 
 describe('a main element', () => {
   it('becomes a template with keys, props and only the CSS it uses', () => {
@@ -400,8 +402,8 @@ describe('hostile markup', () => {
     const { canvas, def, page } = setup()
     const around = doc(deep(20_000, `<doop-use component="Button"></doop-use>`))
     expect(actions.updateFrame(page.id, { html: around }, actor)).toBeDefined()
-    expect(lookalikesIn(store.getFrame(page.id)!)).toEqual([])
-    expect(findComponentCandidates(store.getCanvas(canvas.id)!).length).toBeGreaterThanOrEqual(0)
+    /* reading such a frame for candidates does not throw */
+    expect(() => findComponentCandidates(store.getCanvas(canvas.id)!)).not.toThrow()
 
     const main = actions.createFrame(canvas.id, { name: 'Deep', html: '' }, actor)!
     const before = current(canvas.id, def.id).rev

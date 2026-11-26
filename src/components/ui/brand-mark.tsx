@@ -1,9 +1,10 @@
 import { useId, type JSX } from 'react'
 import { cn } from '@/lib/utils'
-import { ImageIcon, PdfIcon, PuzzleIcon, RadioTowerIcon, ServerIcon, VectorIcon, WebIcon } from './icons'
+import { CodeIcon, ImageIcon, PdfIcon, PuzzleIcon, RadioTowerIcon, ServerIcon, VectorIcon, WebIcon } from './icons'
 import canvaLogo from './brand/canva.svg'
 import linearLogo from './brand/linear.svg'
 import slackLogo from './brand/slack.svg'
+import storybookLogo from './brand/storybook.svg'
 
 /**
  * Every third-party logo the product wears, from one place. A mark is a
@@ -136,7 +137,7 @@ function path(d: string, defaultColor = 'currentColor') {
         height={size}
         viewBox="0 0 24 24"
         fill={color ?? defaultColor}
-        className={className}
+        className={cn('flex-none', className)}
         aria-hidden
       >
         <path d={d} />
@@ -359,10 +360,12 @@ export type AppIconBrand =
   | 'canva'
   | 'website'
   | 'live-app'
+  | 'storybook'
   | 'pdf'
   | 'png'
   | 'jpg'
   | 'svg'
+  | 'html'
 
 /* the tile's light: a hairline edge, a highlight along the top, a soft drop */
 const APP_TILE_SHADOW =
@@ -448,10 +451,15 @@ const APP_TILES: Record<AppIconBrand, AppTile> = {
   },
   website: { tile: '#0177d3', art: chromeGlyph(WebIcon) },
   'live-app': { tile: '#1f9d55', art: chromeGlyph(RadioTowerIcon) },
+  storybook: {
+    tile: '#fff',
+    art: (side) => <img src={storybookLogo} alt="" width={Math.round(side * 0.75)} height={Math.round(side * 0.75)} />,
+  },
   pdf: { tile: '#e5322d', art: chromeGlyph(PdfIcon) },
   png: { tile: '#6e56cf', art: chromeGlyph(ImageIcon) },
   jpg: { tile: '#0891b2', art: chromeGlyph(ImageIcon) },
   svg: { tile: '#d97706', art: chromeGlyph(VectorIcon) },
+  html: { tile: '#2563eb', art: chromeGlyph(CodeIcon) },
 }
 
 export const APP_ICON_BRANDS = Object.keys(APP_TILES) as AppIconBrand[]

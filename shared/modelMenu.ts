@@ -18,6 +18,44 @@ export interface ModelOption {
   recommended?: boolean
 }
 
+/* a GPT or o-series id: its family and version, then its words, then an
+   optional snapshot date (`gpt-6.2-sol-2026-11-01`) */
+const OPENAI_ID = /^(gpt-\d+(?:\.\d+)?|o\d+)((?:-[a-z0-9.]+)*?)(-\d{4}-\d{2}-\d{2})?$/
+
+/** An OpenAI id spelled the way the curated menu spells it:
+ *  `gpt-6.1-sol` → "GPT-6.1 Sol", `o4-mini` → "o4 Mini". An id of another
+ *  shape is returned as it is. */
+export function openaiModelName(id: string): string {
+  const match = OPENAI_ID.exec(id)
+  if (!match) return id
+  const [, family = '', words = '', date = ''] = match
+  return [
+    family.replace(/^gpt-/, 'GPT-'),
+    ...words
+      .split('-')
+      .filter(Boolean)
+      .map((word) => word.charAt(0).toUpperCase() + word.slice(1)),
+    ...(date ? [date.slice(1)] : []),
+  ].join(' ')
+}
+
+/** The name a catalog gives a model, unless it only re-spells the id
+ *  ("GPT-6.1-Sol", "gpt-6.1-sol"): then the id formatted like the curated
+ *  entries, so one menu never mixes two spellings of the same scheme. */
+export function openaiDisplayName(id: string, displayName: string | undefined): string {
+  const name = displayName?.trim()
+  if (name && name.toLowerCase().replace(/\s+/g, '-') !== id) return name
+  return openaiModelName(id)
+}
+
+/** How new an OpenAI model's generation is, for ordering a menu newest
+ *  first: GPT-6.2 is [6, 2], GPT-6 is [6, 0]. The o-series predates GPT-5,
+ *  and an id of no known shape sorts last with it. */
+export function openaiGeneration(id: string): [number, number] {
+  const match = /^gpt-(\d+)(?:\.(\d+))?/.exec(id)
+  return match ? [Number(match[1]), Number(match[2] ?? 0)] : [0, 0]
+}
+
 /**
  * The OpenRouter roster. Ids and image-input capability verified against
  * GET https://openrouter.ai/api/v1/models (input_modalities) — re-check both
@@ -26,15 +64,21 @@ export interface ModelOption {
  */
 export const OPENROUTER_MODELS: ModelOption[] = [
   {
+    id: 'moonshotai/kimi-k3.1-pro',
+    name: 'Kimi K3.1 Pro',
+    blurb: 'Moonshot’s flagship — strong agentic design work. A good default.',
+    vision: true,
+  },
+  {
     id: 'moonshotai/kimi-k3',
     name: 'Kimi K3',
-    blurb: 'Moonshot’s flagship — strong agentic design work.',
+    blurb: 'The previous flagship, still dependable.',
     vision: true,
   },
   {
     id: 'moonshotai/kimi-k2.6',
     name: 'Kimi K2.6',
-    blurb: 'Open-weight all-rounder with solid tool use. A good default.',
+    blurb: 'Older open-weight all-rounder; Moonshot retires it end of 2026.',
     vision: true,
   },
   {
@@ -51,9 +95,15 @@ export const OPENROUTER_MODELS: ModelOption[] = [
   },
   { id: 'qwen/qwen3.7-plus', name: 'Qwen3.7 Plus', blurb: 'Multimodal workhorse — fast and dependable.', vision: true },
   {
+    id: 'google/gemini-3.8-flash',
+    name: 'Gemini 3.8 Flash',
+    blurb: 'Google’s coding and agent workhorse.',
+    vision: true,
+  },
+  {
     id: 'google/gemini-3.7-flash',
     name: 'Gemini 3.7 Flash',
-    blurb: 'Google’s coding and agent workhorse.',
+    blurb: 'The previous Flash; Google retired it for 3.8.',
     vision: true,
   },
   { id: 'z-ai/glm-5.3-flash', name: 'GLM-5.3 Flash', blurb: 'Zhipu’s fast tier, with vision.', vision: true },
@@ -79,10 +129,16 @@ export const OPENROUTER_MODELS: ModelOption[] = [
   { id: 'xiaomi/mimo-v2.6-pro', name: 'MiMo V2.6 Pro', blurb: 'Xiaomi’s multimodal pro tier.', vision: true },
 ]
 
-export const DEFAULT_OPENROUTER_MODEL = 'moonshotai/kimi-k2.6'
+export const DEFAULT_OPENROUTER_MODEL = 'moonshotai/kimi-k3.1-pro'
 
 /** Gemini direct (Google AI Studio API key). */
 export const GEMINI_MODELS: ModelOption[] = [
+  {
+    id: 'gemini-4-hydrogen',
+    name: 'Gemini 4 Hydrogen',
+    blurb: 'Google’s everyday Gemini 4 model. A good default for design work.',
+    vision: true,
+  },
   {
     id: 'gemini-3.1-pro-preview',
     name: 'Gemini 3.1 Pro',
@@ -90,14 +146,14 @@ export const GEMINI_MODELS: ModelOption[] = [
     vision: true,
   },
   {
-    id: 'gemini-3.7-flash',
-    name: 'Gemini 3.7 Flash',
-    blurb: 'The everyday workhorse. A good default for design work.',
+    id: 'gemini-3.8-flash',
+    name: 'Gemini 3.8 Flash',
+    blurb: 'The previous Flash, cheaper per token.',
     vision: true,
   },
 ]
 
-export const DEFAULT_GEMINI_MODEL = 'gemini-3.7-flash'
+export const DEFAULT_GEMINI_MODEL = 'gemini-4-hydrogen'
 
 /**
  * DeepSeek direct (a platform.deepseek.com key). A curated roster like
@@ -272,6 +328,24 @@ export const ANTHROPIC_MODELS: ModelOption[] = [
     vision: true,
   },
   {
+    id: 'claude-opus-5-5',
+    name: 'Opus 5.5',
+    blurb: 'Anthropic’s recommended start — complex layouts and demanding work.',
+    vision: true,
+  },
+  {
+    id: 'claude-sonnet-5-5',
+    name: 'Sonnet 5.5',
+    blurb: 'Faster and cheaper, for everyday design work.',
+    vision: true,
+  },
+  {
+    id: 'claude-haiku-5-5',
+    name: 'Haiku 5.5',
+    blurb: 'For quick edits and straightforward tasks.',
+    vision: true,
+  },
+  {
     id: 'claude-opus-5',
     name: 'Opus 5',
     blurb: 'For complex layouts and demanding design or coding work.',
@@ -286,7 +360,7 @@ export const ANTHROPIC_MODELS: ModelOption[] = [
   },
 ]
 
-export const DEFAULT_ANTHROPIC_MODEL = 'claude-sonnet-5'
+export const DEFAULT_ANTHROPIC_MODEL = 'claude-opus-5-5'
 
 /**
  * The small, vision-capable tier an image description runs on, per account
@@ -297,13 +371,13 @@ export const DEFAULT_ANTHROPIC_MODEL = 'claude-sonnet-5'
  * drop to low reasoning effort instead.
  */
 export const DESCRIBER_MODELS: Readonly<Record<string, string>> = {
-  'anthropic-key': 'claude-haiku-4-5-20251001',
-  'gemini-key': 'gemini-3.7-flash',
-  'openrouter-key': 'google/gemini-3.7-flash',
+  'anthropic-key': 'claude-haiku-5-5',
+  'gemini-key': 'gemini-3.8-flash',
+  'openrouter-key': 'google/gemini-3.8-flash',
 }
 
 /** The server tier's describer when DOOP_AGENT_PROVIDER is anthropic. */
-export const DESCRIBER_ANTHROPIC_MODEL = 'claude-haiku-4-5-20251001'
+export const DESCRIBER_ANTHROPIC_MODEL = 'claude-haiku-5-5'
 
 /**
  * How hard an OpenAI model thinks per turn, on a ChatGPT subscription or an

@@ -12,6 +12,7 @@ import type { Canvas, ElementComment, Frame } from '../shared/types.ts'
  * action layer run and mock only persistence, so they can read the stored
  * comment/activity/decision logs back. */
 vi.mock('../server/db/persist.ts', () => ({
+  refreshAssetRefs: () => {},
   saveFrame: () => {},
   saveFrameNow: async () => {},
   saveCanvas: () => {},
@@ -169,8 +170,12 @@ describe('element-comment write MCP tools', () => {
       })
       expect(isError).toBeFalsy()
       expect(parsed).toEqual(reply)
-      /* the 4th arg is who pays, the 5th the actor kind: an agent reply must not log as a human */
-      expect(replySpy).toHaveBeenCalledWith('m1', '  Done  ', 'Claude', OWNER_ID, 'agent')
+      /* the 4th arg is who pays, the 5th the actor kind: an agent reply must not log as a human;
+         the 6th is the people the text @mentions (none here) */
+      expect(replySpy).toHaveBeenCalledWith('m1', '  Done  ', 'Claude', OWNER_ID, 'agent', {
+        ids: [],
+        roleText: 'Done',
+      })
       expect(heartbeat).toHaveBeenCalledTimes(1)
     } finally {
       await close()
@@ -195,7 +200,14 @@ describe('element-comment write MCP tools', () => {
         agent_name: 'Claude',
       })
       expect(isError).toBeFalsy()
-      expect(replySpy).toHaveBeenCalledWith('m1', '@Doop tighten this', 'Claude', 'mate-1', 'agent')
+      expect(replySpy).toHaveBeenCalledWith(
+        'm1',
+        '@Doop tighten this',
+        'Claude',
+        'mate-1',
+        'agent',
+        expect.objectContaining({ ids: [] }),
+      )
     } finally {
       await close()
     }

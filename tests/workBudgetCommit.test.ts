@@ -5,7 +5,11 @@ import type { ActivityItem, Actor, Canvas, Frame, FrameVersion, ServerMessage } 
 
 /* The database, as far as this file needs one: what each persist call would leave in its
    table. A refused operation must leave it exactly as it was, and after any operation it
-   must hold what memory holds. */
+   must hold what memory holds. A frame's row holds it at rest, its component instances as
+   references (server/frameRest.ts), as the real persist layer writes it: what the row
+   holds is what reading it back gives (`stored`), so a frame rendered again in memory
+   because its component changed, with no row written, is still what the database holds. */
+const rest = vi.hoisted(() => ({ of: (_canvasId: string, html: string) => html }))
 const db = vi.hoisted(() => ({
   frames: new Map<string, { canvasId: string; name: string; html: string }>(),
   components: new Map<string, { canvasId: string; id: string; row: string }>(),
@@ -19,7 +23,9 @@ const db = vi.hoisted(() => ({
 
 vi.mock('../server/db/persist.ts', () => ({
   saveCanvas: (c: Canvas) => void db.pages.set(c.id, JSON.stringify(c.pages ?? null)),
-  saveFrame: (f: Frame) => void db.frames.set(f.id, { canvasId: f.canvasId, name: f.name, html: f.html }),
+  refreshAssetRefs: () => {},
+  saveFrame: (f: Frame) =>
+    void db.frames.set(f.id, { canvasId: f.canvasId, name: f.name, html: rest.of(f.canvasId, f.html) }),
   deleteFrame: (id: string) => void db.frames.delete(id),
   saveActivity: (canvasId: string, item: ActivityItem) =>
     void db.activity.set(canvasId, [item.id, ...(db.activity.get(canvasId) ?? [])]),
@@ -78,6 +84,7 @@ vi.mock('parse5', async (original) => {
 
 import { store } from '../server/store.ts'
 import * as actions from '../server/actions.ts'
+import { settleIdleStreams } from '../server/canvasWrites.ts'
 import * as propagation from '../server/propagation.ts'
 import { blankComponent } from '../server/components.ts'
 import { publishedOn, publishLibrary } from '../server/componentLibrary.ts'
@@ -93,11 +100,35 @@ import {
   updateComponent,
 } from '../server/componentActions.ts'
 import { componentWriteNotes, runComponentTool, type ToolContext } from '../server/componentTools.ts'
-import { execTool } from '../server/resident.ts'
+import { execTool, newRunState } from '../server/resident.ts'
 import { parse, runOperation, WorkBudgetError } from '../server/workBudget.ts'
 import { COMPONENT_ATTR } from '../shared/components.ts'
 import { canvasPages } from '../shared/pages.ts'
 import { stubEnv, unstubAllEnvs } from './envStub.ts'
+import { restingHtml, wakingHtml } from '../server/frameRest.ts'
+
+/** The modelled database's own parsing (a row made compact, a row read back) is not part of
+ *  the operation under test: it is not counted, and never the parse that is made slow. */
+function uncounted<T>(run: () => T): T {
+  const { parses, at } = slow
+  slow.at = 0
+  try {
+    return run()
+  } finally {
+    slow.parses = parses
+    slow.at = at
+  }
+}
+
+/* as the real layer does: a row that cannot be made compact is stored rendered */
+rest.of = (canvasId, html) =>
+  uncounted(() => {
+    try {
+      return restingHtml(html, store.getComponents(canvasId))
+    } catch {
+      return html
+    }
+  })
 
 const actor = { name: 'Tester', kind: 'user', color: '#000', clientId: 'x' } as unknown as Actor
 const agent = actions.resolveActor({ name: 'Doop', kind: 'agent' })
@@ -212,7 +243,13 @@ function stored(canvas: Canvas) {
   const mine = <T extends { canvasId: string }>(rows: Map<string, T>) =>
     [...rows].filter(([, row]) => row.canvasId === canvas.id)
   return {
-    frames: sorted(mine(db.frames).map(([id, row]) => ({ id, name: row.name, html: row.html }))),
+    frames: sorted(
+      mine(db.frames).map(([id, row]) => ({
+        id,
+        name: row.name,
+        html: uncounted(() => wakingHtml(row.html, canvas.components ?? [], `frame ${id}`)),
+      })),
+    ),
     components: sorted(mine(db.components).map(([, row]) => row.row)),
     pages: db.pages.get(canvas.id),
     activity: [...(db.activity.get(canvas.id) ?? [])],
@@ -222,10 +259,20 @@ function stored(canvas: Canvas) {
   }
 }
 
-/** What the database should hold for the canvas, given what memory holds. */
+/** What the database should hold for the canvas, given what memory holds. A frame the queue
+ *  passed over for its budget keeps its instances on the older revision in memory, while its
+ *  row, which holds references, reads back at the current one: the two agree once the frame
+ *  in memory is brought up to its components, which is what `wakingHtml` does to instances
+ *  left behind (and nothing, to a frame that is up to date). */
 function storedFrom(canvas: Canvas): ReturnType<typeof stored> {
   return {
-    frames: sorted(canvas.frames.map((frame) => ({ id: frame.id, name: frame.name, html: frame.html }))),
+    frames: sorted(
+      canvas.frames.map((frame) => ({
+        id: frame.id,
+        name: frame.name,
+        html: uncounted(() => wakingHtml(frame.html, canvas.components ?? [], `frame ${frame.id}`)),
+      })),
+    ),
     components: sorted((canvas.components ?? []).map((def) => JSON.stringify(def))),
     pages: JSON.stringify(canvas.pages ?? null),
     activity: actions.getActivity(canvas.id).map((item) => item.id),
@@ -235,7 +282,8 @@ function storedFrom(canvas: Canvas): ReturnType<typeof stored> {
   }
 }
 
-const componentKey = (def: ComponentDef) => `${def.rev}:${def.status ?? 'active'}:${def.name}`
+const componentKey = (def: Pick<ComponentDef, 'rev' | 'status' | 'name'>) =>
+  `${def.rev}:${def.status ?? 'active'}:${def.name}`
 
 interface Viewed {
   frames: Record<string, string>
@@ -259,7 +307,7 @@ function replay(before: Viewed, messages: ServerMessage[]): Viewed {
   const view = structuredClone(before)
   for (const message of messages) {
     if (message.type === 'frame:created' || message.type === 'frame:updated')
-      view.frames[message.frame.id] = message.frame.html
+      view.frames[message.frame.id] = message.frame.html ?? ''
     else if (message.type === 'frame:deleted') delete view.frames[message.frameId]
     else if (message.type === 'component') {
       if (message.component) view.components[message.id] = componentKey(message.component)
@@ -286,26 +334,11 @@ async function tool(name: string, input: Record<string, unknown>, canvas: Canvas
   return outcome
 }
 
-const runState = () => ({
-  mutatedFrames: new Set<string>(),
-  sourceFrames: new Set<string>(),
-  verificationFrames: new Set<string>(),
-  verifiedFrames: new Set<string>(),
-  seenVerified: new Set<string>(),
-  rewriteDrafts: new Map<string, string>(),
-  vision: false,
-  imagesGenerated: 0,
-  repliedThreads: new Set<string>(),
-  awaitingThreads: new Set<string>(),
-  tokenWrites: 0,
-  arrangeWrites: 0,
-})
-
 /** A tool call as the resident agent's runner makes it (its own operation): a refusal comes
  *  back as an error result. */
 async function resident(name: string, input: Record<string, unknown>, canvas: Canvas) {
   const block: Anthropic.ToolUseBlockParam = { type: 'tool_use', id: 't1', name, input }
-  const result = await execTool(block, canvas.id, agent, runState() as never)
+  const result = await execTool(block, canvas.id, agent, newRunState())
   if (result.is_error) throw new Error(`refused: ${JSON.stringify(result.content)}`)
   return result
 }
@@ -421,7 +454,7 @@ const OPERATIONS: Record<string, Case> = {
         actor,
         { start: true },
       ),
-    run: () => actions.expireIdleStreams(Date.now() + 10 * 60_000),
+    run: () => settleIdleStreams(Date.now() + 10 * 60_000),
   },
   /* ---- components: the tools, as MCP and the resident agent share them ---- */
   'create_component (the tool) from markup': {
@@ -453,9 +486,8 @@ const OPERATIONS: Record<string, Case> = {
         canvas,
       ),
   },
-  'create_component (the tool) with replace_matching': {
-    run: ({ canvas, page }) =>
-      tool('create_component', { name: 'Tag', frame_id: page.id, element: 'tagone', replace_matching: true }, canvas),
+  'create_component (the tool) from an element': {
+    run: ({ canvas, page }) => tool('create_component', { name: 'Tag', frame_id: page.id, element: 'tagone' }, canvas),
   },
   'update_component (the tool)': {
     run: ({ canvas }) =>
@@ -568,14 +600,6 @@ const OPERATIONS: Record<string, Case> = {
   'create_component from an element': {
     run: ({ canvas, page }) =>
       createComponentFromElement(canvas.id, { name: 'Tag', frameId: page.id, element: 'tagone' }, actor),
-  },
-  'create_component with replace_matching': {
-    run: ({ canvas, page }) =>
-      createComponentFromElement(
-        canvas.id,
-        { name: 'Tag', frameId: page.id, element: 'tagone', replaceMatching: true },
-        actor,
-      ),
   },
   'import_component with what it is built from': {
     run: ({ canvas, source }) => importComponent(canvas.id, source.id, 'Panel', actor),
@@ -820,45 +844,6 @@ describe('a refusal while a main is being updated', () => {
 })
 
 describe('work that is optional once a change has landed', () => {
-  it('keeps a finished replace_matching partial, and says it stopped', async () => {
-    ownClock()
-    let stopped = 0
-    for (let at = 1; at <= 40; at++) {
-      const { canvas, page } = setup()
-      await propagation.whenIdle()
-      const view = viewing(canvas)
-      told.delete(canvas.id)
-      slow.parses = 0
-      slow.offset = 0
-      slow.at = at
-      let result: ReturnType<typeof createComponentFromElement> | undefined
-      try {
-        result = runOperation('create', canvas.id, () =>
-          createComponentFromElement(
-            canvas.id,
-            { name: 'Tag', frameId: page.id, element: 'tagone', replaceMatching: true },
-            actor,
-          ),
-        )
-      } catch (error) {
-        expect(error).toBeInstanceOf(WorkBudgetError)
-      }
-      slow.at = 0
-      await propagation.whenIdle()
-      if (!result?.matching_stopped) continue
-      stopped += 1
-      /* the component is there, and what it reports as linked is linked */
-      expect(result.component.rev).toBeGreaterThan(0)
-      for (const entry of result.converted)
-        expect(framed(entry.frameId)).toContain(`data-doop-instance="${result.component.id}"`)
-      expect(result.converted.length).toBeLessThan(2)
-      /* and stored and shown as such: each finished part was committed */
-      expect(stored(canvas)).toEqual(storedFrom(canvas))
-      expect(replay(view, told.get(canvas.id) ?? [])).toEqual(viewing(canvas))
-    }
-    expect(stopped).toBeGreaterThan(0)
-  })
-
   it('applies an instance change even when reading the instances back does not fit', async () => {
     ownClock()
     let applied = 0

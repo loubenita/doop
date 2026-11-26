@@ -18,6 +18,7 @@ declare global {
       selectFrame: () => void
       deselect: () => void
       panelOpen: () => boolean
+      openPanel: () => void
       picked: () => string[]
       pickAlso: (selector: string) => void
       nudge: (dx: number, dy: number) => boolean
@@ -129,6 +130,24 @@ describe.skipIf(!findBrowserPath())('element design controls', () => {
   afterAll(() => {
     if (imageDir) rmSync(imageDir, { recursive: true, force: true })
     expect(errors).toEqual([])
+  })
+
+  it('accepts an inspector edit after ignoring a public frame-save notification', async () => {
+    await page.evaluate(() => {
+      const source = document.querySelector('iframe')!.contentWindow
+      window.dispatchEvent(
+        new MessageEvent('message', { source, data: { type: 'doop:edited', html: '<p>Old protocol</p>' } }),
+      )
+    })
+    await page.click('[aria-label="Align center"]')
+    await expect.poll(() => saved.html).toContain('text-align: center')
+    expect(framePatches.filter((patch) => patch.html)).toHaveLength(1)
+    expect(saved.html).toContain('Typography controls should edit')
+    await page.reload()
+    await page.waitForFunction(() => !!window.elementPanelHarness)
+    await page.evaluate((frame) => window.elementPanelHarness.seed(frame), saved)
+    const iframe = (await (await page.waitForSelector('iframe'))!.contentFrame())!
+    await iframe.waitForFunction(() => document.querySelector<HTMLElement>('#text')?.style.textAlign === 'center')
   })
 
   it('edits fonts and alignment through the sandbox, persists them, and supports undo and RTL', async () => {
@@ -326,13 +345,13 @@ describe.skipIf(!findBrowserPath())('element design controls', () => {
     await page.waitForSelector('[aria-label="Image fill"]')
     await page.click('[aria-label="Image fill"]')
     const before = saved.html
-    await number('Image URL', 'javascript:alert(1)')
+    await pasteUrl('javascript:alert(1)')
     await page.waitForSelector('[role="alert"]')
     expect(saved.html).toBe(before)
-    await number('Image URL', 'data:image/png;base64,aGVsbG8=')
+    await pasteUrl('data:image/png;base64,aGVsbG8=')
     await page.waitForFunction(() => document.querySelector('[role="alert"]')?.textContent?.includes('Couldn’t load'))
     expect(saved.html).toBe(before)
-    await number('Image URL', replacementUrl)
+    await pasteUrl(replacementUrl)
     await expect.poll(() => saved.html).toContain(replacementUrl)
     await page.waitForFunction(() => !document.querySelector('[aria-busy]'))
     await page.select('[aria-label="Image sizing"]', 'contain')
@@ -529,7 +548,7 @@ describe.skipIf(!findBrowserPath())('element design controls', () => {
         {},
         replacementUrl,
       )
-      await number('Image URL', originalUrl)
+      await pasteUrl(originalUrl)
       await expect.poll(() => saved.html).not.toContain(replacementUrl)
       await frame.waitForFunction(
         (url) => document.querySelector<HTMLImageElement>('#photo')?.currentSrc === url,
@@ -562,6 +581,26 @@ describe.skipIf(!findBrowserPath())('element design controls', () => {
     expect(await frame.$eval('#photo', (el) => (el as HTMLImageElement).src)).toBe(originalUrl)
     expect(await frame.$eval('#photo', (el) => getComputedStyle(el).objectFit)).toBe('contain')
     await expect.poll(() => saved.html).toContain('rgba(18, 52, 86, 0.75)')
+  })
+
+  it('shows a full fill opacity and a two-digit stroke width without clipping them', async () => {
+    await seedPanel(
+      '<body><svg id="pen" data-doop-drawing="path" viewBox="0 0 120 80" style="display:block;width:120px;height:80px">' +
+        '<path d="M 10 10 L 110 10 L 60 70 Z" fill="#eceee9" stroke="#111" stroke-width="12" /></svg></body>',
+      '#pen',
+    )
+    await page.waitForFunction(
+      () =>
+        document.querySelector<HTMLInputElement>('[aria-label="Fill opacity"]')?.value === '100' &&
+        document.querySelector<HTMLInputElement>('[aria-label="Border width"]')?.value === '12',
+    )
+    const clipped = await page.evaluate(() =>
+      ['Fill opacity', 'Border width'].filter((label) => {
+        const input = document.querySelector<HTMLInputElement>(`[aria-label="${label}"]`)!
+        return input.scrollWidth > input.clientWidth
+      }),
+    )
+    expect(clipped).toEqual([])
   })
 
   it('keeps the old image after upload failure and allows retrying the same file', async () => {
@@ -610,6 +649,15 @@ describe.skipIf(!findBrowserPath())('element design controls', () => {
     await page.keyboard.press('Enter')
   }
 
+  /* A URL goes in the way a person enters one: pasted over the field's text
+     in one input event. Typed key by key, a data URL is nearly two hundred
+     round trips to a busy renderer, seconds of a test's budget on CI. */
+  async function pasteUrl(url: string) {
+    await page.click('input[aria-label="Image URL"]', { count: 3 })
+    await page.keyboard.sendCharacter(url)
+    await page.keyboard.press('Enter')
+  }
+
   it('edits flex direction, alignment, spacing and padding without overwriting the other axes; saves and undoes', async () => {
     const frame = await seedPanel(
       `<!doctype html><html><head><style>
@@ -628,7 +676,10 @@ describe.skipIf(!findBrowserPath())('element design controls', () => {
       () => getComputedStyle(document.querySelector('#flex')!).justifyContent === 'space-between',
     )
     await page.click('[aria-label="Align children bottom right"]')
-    await frame.waitForFunction(() => getComputedStyle(document.querySelector('#flex')!).alignItems === 'flex-end')
+    /* Chrome 158 computes flex-end as flow-end */
+    await frame.waitForFunction(() =>
+      /^fl(ex|ow)-end$/.test(getComputedStyle(document.querySelector('#flex')!).alignItems),
+    )
     expect(await frame.$eval('#flex', (el) => getComputedStyle(el).justifyContent)).toBe('space-between')
     await number('Gap', 14)
     expect(await frame.$eval('#flex', (el) => getComputedStyle(el).rowGap)).toBe('7px')
@@ -1103,6 +1154,10 @@ describe.skipIf(!findBrowserPath())('element design controls', () => {
     await page.keyboard.press('Escape')
     await page.mouse.up()
     await frame.waitForFunction(() => (document.querySelector('#scrub') as HTMLElement).style.width === '120px')
+    /* the frame is put back before the panel hears so: until the cancel's
+       reply lands, the field holds the drag's last value (the min-width's
+       24), and a drag starts from what the field holds */
+    await page.waitForFunction(() => document.querySelector<HTMLInputElement>('[aria-label="Width"]')?.value === '120')
     await startScrub('Width')
     await page.mouse.move(x + 24, y, { steps: 6 })
     await frame.waitForFunction(() => (document.querySelector('#scrub') as HTMLElement).style.width === '144px')
@@ -1596,8 +1651,11 @@ describe.skipIf(!findBrowserPath())('element design controls', () => {
     await page.waitForSelector('[aria-label="Width"]', { hidden: true })
     expect(await page.evaluate(() => window.elementPanelHarness.panelOpen())).toBe(false)
     expect(await page.evaluate(() => window.elementPanelHarness.picked())).toEqual(['#box'])
-    /* picking it again reopens the panel */
+    /* a closed panel stays closed: picking again only moves the selection */
     await page.evaluate(() => window.elementPanelHarness.select('#box'))
+    expect(await page.evaluate(() => window.elementPanelHarness.panelOpen())).toBe(false)
+    /* until the person opens it again */
+    await page.evaluate(() => window.elementPanelHarness.openPanel())
     await page.waitForSelector('[aria-label="Width"]')
   })
 

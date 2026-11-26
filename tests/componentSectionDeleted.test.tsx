@@ -17,7 +17,12 @@ vi.mock('../src/lib/api', () => ({
   api: { undeleteComponent: mocks.undeleteComponent, changeInstances: mocks.changeInstances },
   errorMessage: (_error: unknown, fallback: string) => fallback,
 }))
-vi.mock('../src/lib/history', () => ({ recordCreate: () => {}, recordUpdate: () => {}, recordUpdates: () => {} }))
+vi.mock('../src/lib/history', () => ({
+  recordCreate: () => {},
+  recordUpdate: () => {},
+  recordUpdates: () => {},
+  savesLanded: () => Promise.resolve(),
+}))
 vi.mock('../src/lib/store', () => {
   const state = {
     get canvas() {

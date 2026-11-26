@@ -2,22 +2,25 @@ import type { TextFormatCommand } from './richText'
 import type { Frame } from '../../shared/types'
 import { ELEMENT_ID_ATTR } from '../../shared/elementId'
 import type { ReorderMove } from './keys'
-import { restack, roomAt, stackOf, type StackWrite } from '../../shared/frameStack'
+import { restackMany, roomAt, stackOf, type StackWrite } from '../../shared/frameStack'
 import { canEditOpenCanvas, pickedSelectors, useStore } from './store'
 import { t } from './i18n'
 import { api, ApiError, errorMessage } from './api'
 import { formatElementText, inspectElement, nudgeElements, requestFrame } from './frameBridge'
 import { isCanvasElement } from './drawing'
-import { duplicateFrames } from './frameClipboard'
+import { copyFrames, duplicateFrames } from './frameClipboard'
+import { writeCanvasClipboard } from './canvasClipboard'
 import { carriedCss, newScope, renameInCss, scopeMarkup, SCOPE_ATTR, withCarriedCss } from './styleCarry'
 import {
   deleteFramesTracked,
   dropEntry,
+  dropTransferSource,
   historyEpoch,
   keepTransferDestination,
   recordCreate,
   recordDrawingTransfer,
   recordLayerName,
+  recordLayersTransfer,
   recordStack,
   recordUpdate,
   recordUpdates,
@@ -38,6 +41,8 @@ import {
   isElementHidden,
   isElementLocked,
   moveElement,
+  moveElements,
+  outermostSelectors,
   placeElement,
   removeElements,
   replaceElement,
@@ -259,10 +264,34 @@ export function deleteSelection(): boolean {
     else s.pickElement(null)
     return true
   }
-  const selected = frames.filter((f) => s.selectedIds.includes(f.id) && !f.locked)
+  /* a shape locked on its own layer is as locked as a locked frame */
+  const selected = frames.filter((f) => s.selectedIds.includes(f.id) && !isStackLocked(f))
   if (!selected.length) return false
   deleteFramesTracked(selected)
   return true
+}
+
+/** Cut copies the frames, then removes what Delete would once the clipboard took
+ *  them. The clipboard is written asynchronously, so the frames are read again by
+ *  id when it lands, and that one read is both what is copied and what is deleted:
+ *  an edit made meanwhile rides along in the copy, a frame deleted meanwhile is not
+ *  deleted twice, and a locked frame or a shape locked on its own layer stays, as on ⌫. */
+export function cutFrames(frames: Frame[]) {
+  const ids = new Set(frames.map((f) => f.id))
+  if (!ids.size) return
+  let live: Frame[] = []
+  writeCanvasClipboard(
+    () => {
+      live = (useStore.getState().canvas?.frames ?? []).filter((f) => ids.has(f.id))
+      if (!live.length) return false
+      copyFrames(live)
+    },
+    undefined,
+    () => {
+      const cut = live.filter((f) => !isStackLocked(f))
+      if (cut.length) deleteFramesTracked(cut)
+    },
+  )
 }
 
 export function nudgeSelection(dx: number, dy: number): boolean {
@@ -316,14 +345,26 @@ export function isStackLocked(frame: Frame): boolean {
  *  be renumbered to make room; a refused save puts every frame back. A
  *  locked frame or shape stays where it is. */
 export function restackFrame(frames: Frame[], frameId: string, index: number) {
-  const frame = frames.find((f) => f.id === frameId)
-  if (!frame || isStackLocked(frame)) return
-  const after = restack(frames, frameId, index)
+  restackFrames(frames, [frameId], index)
+}
+
+/** Move `ids` — a group drag's frames — to `index` of the back-to-front
+ *  order without them, landing as one run in their current stack order.
+ *  The same undo step and request as one frame's move; locked members stay
+ *  where they are while the rest go. */
+export function restackFrames(frames: Frame[], ids: readonly string[], index: number) {
+  const movable = ids.filter((id) => {
+    const frame = frames.find((f) => f.id === id)
+    return !!frame && !isStackLocked(frame)
+  })
+  if (!movable.length) return
+  const after = restackMany(frames, movable, index)
   if (!after.length) return
+  const canvasId = frames.find((f) => f.id === movable[0])!.canvasId
   const before = after.map(({ id }) => ({ id, z: stackOf(frames.find((f) => f.id === id)!) }))
-  recordStack(frame.canvasId, before, after)
+  recordStack(canvasId, before, after)
   trackSave(
-    saveStack(frame.canvasId, before, after).catch((err: unknown) => {
+    saveStack(canvasId, before, after).catch((err: unknown) => {
       useStore.getState().pushNotice(errorMessage(err, 'Couldn’t change the layer order'))
     }),
   )
@@ -491,6 +532,30 @@ export function dropLayer(pressed: Frame, selector: string, target: DropTarget, 
   const frame = useStore.getState().canvas?.frames.find((f) => f.id === pressed.id)
   if (!frame || frame.html !== pressed.html) return false
   return moveLayer(frame, selector, target, flow)
+}
+
+/** Finish a group drag that began on `pressed`: the picked elements move
+ *  together, as one run in document order, the pick following them with
+ *  its primary (the last of `selectors`, as pickedSelectors gives them)
+ *  last. The same changed-frame guard as dropLayer, and — as reorderLayers
+ *  refuses — a locked member drops the whole move. False when nothing
+ *  moved. */
+export function dropLayers(
+  pressed: Frame,
+  selectors: string[],
+  target: DropTarget,
+  flows?: ReadonlyMap<string, FlowPlacement | undefined>,
+): boolean {
+  const frame = useStore.getState().canvas?.frames.find((f) => f.id === pressed.id)
+  if (!frame || frame.html !== pressed.html) return false
+  if (selectors.some((selector) => isLayerLocked(frame, selector))) return false
+  const moved = moveElements(frame.html, selectors, target, flows)
+  if (!moved) return false
+  saveFrameHtml(frame, moved.html)
+  const store = useStore.getState()
+  store.select(frame.id)
+  store.pickElements(frame.id, moved.selectors)
+  return true
 }
 
 /** Finish an ⌥⇧ drag that began on `pressed`: a copy of the element lands
@@ -784,6 +849,128 @@ function changedDuringMove(source: Frame): string {
   return `“${source.name}” changed while the layer moved; check it for a second copy`
 }
 
+/** Move several elements — a frame's picked set, or whole standalone
+ *  shells — next to, or into, a layer of `dest`: one undo step over every
+ *  frame. As transferLayer does for one element, the destination is saved
+ *  first and the sources emptied only once that landed, so a failed save
+ *  can leave an element where it was but never nowhere; a source write
+ *  another save won leaves the destination's copy standing — a copy too
+ *  many can be deleted, an element rolled back into nothing cannot.
+ *  `selectors` are placed in the order given, as one contiguous run.
+ *  False when a frame changed during the gesture, the destination is one
+ *  of the sources or refuses layers (`takesLayers`), a member is locked,
+ *  or the markup cannot take the run. */
+export function transferLayers(
+  sources: { pressed: Frame; selectors: string[] }[],
+  over: Frame,
+  target: DropTarget,
+): boolean {
+  const frames = useStore.getState().canvas?.frames ?? []
+  const dest = frames.find((f) => f.id === over.id)
+  if (!dest || dest.html !== over.html || !takesLayers(dest, buildLayerTree(dest.html).length > 0)) return false
+  const srcs: { before: Frame; members: string[]; shell: boolean; emptied: string | null }[] = []
+  for (const { pressed, selectors } of sources) {
+    const source = frames.find((f) => f.id === pressed.id)
+    if (!source || source.id === dest.id || source.html !== pressed.html) return false
+    /* a picked element inside another picked one goes with it, not on its own */
+    const members = outermostSelectors(source.html, selectors)
+    if (!members?.length || members.some((sel) => isLayerLocked(source, sel))) return false
+    const shell = members.length === 1 && members[0] === standaloneSelector(source)
+    const emptied = shell ? null : removeElements(source.html, members)
+    if (!shell && emptied === null) return false
+    srcs.push({ before: source, members, shell, emptied })
+  }
+  if (!srcs.length) return false
+  /* each member lands in order as one contiguous run: the first at the
+     target, each next right after the last, carrying the CSS it relies on */
+  let html = dest.html
+  const placedSelectors: string[] = []
+  for (const src of srcs) {
+    for (const sel of src.members) {
+      const scope = newScope()
+      const raw = elementHtml(src.before.html, sel)
+      /* a standalone's shape fills its shell (100% of it); in a frame those
+         percentages would mean the frame, so it takes the shell's size along */
+      const markup = raw === null ? null : scopeMarkup(src.shell ? sizedToShell(raw, src.before) : raw, scope)
+      const at = placedSelectors.length
+        ? { selector: placedSelectors[placedSelectors.length - 1]!, place: 'after' as const }
+        : target
+      const placed = markup === null ? null : placeElement(html, at, markup)
+      if (!placed) return false
+      html = withCarriedCss(placed.html, renameInCss(carriedCss(src.before.html, sel, scope), placed.renamed), scope)
+      placedSelectors.push(placed.selector)
+    }
+  }
+  const destAfter = { ...dest, html }
+  const store = useStore.getState()
+  store.patchFrameLocal(dest.id, { html })
+  for (const src of srcs) {
+    if (src.shell) store.removeFrame(src.before.id)
+    else store.patchFrameLocal(src.before.id, { html: src.emptied! })
+  }
+  store.select(dest.id)
+  store.pickElements(dest.id, placedSelectors)
+  /* the entry goes in now, in its place among the edits around it; a move
+     that is rolled back takes it out again, so there is nothing to undo */
+  const entry = recordLayersTransfer(
+    { before: dest, after: destAfter },
+    srcs.map((src) => ({ before: src.before, after: src.shell ? null : { ...src.before, html: src.emptied! } })),
+  )
+  /* the destination is saved first; every write is conditional on the
+     version this move started from, so a collaborator's edit in the
+     meantime wins and the screen shows it */
+  trackSave(
+    api.updateFrame(dest.id, { html }, dest.updatedAt).then(
+      () =>
+        Promise.allSettled(
+          srcs.map(async (src) => {
+            try {
+              if (src.shell) await api.deleteFrame(src.before.id, src.before.updatedAt)
+              else await api.updateFrame(src.before.id, { html: src.emptied! }, src.before.updatedAt)
+            } catch (err) {
+              const s = useStore.getState()
+              const remote =
+                err instanceof ApiError && err.status === 409 ? (err.body.frame as Frame | undefined) : undefined
+              /* a source saved again while the destination write was out may
+                 already carry the elements' removal: then the move stands for
+                 it, and the step no longer writes that source back */
+              if (remote?.id === src.before.id) {
+                const fates = src.members.map((sel) => elementFate(src.before.html, remote.html, sel))
+                if (fates.every((fate) => fate !== 'kept')) {
+                  s.upsertFrame(remote)
+                  dropTransferSource(entry, src.before.id)
+                  if (fates.includes('unsure'))
+                    s.pushNotice(`“${src.before.name}” changed while the layers moved; check it for a second copy`)
+                  return
+                }
+              }
+              /* otherwise the destination holds a copy too many, which can be
+                 deleted — put the source back as it was, its newer save first */
+              dropTransferSource(entry, src.before.id)
+              if (remote?.id === src.before.id) s.upsertFrame(remote)
+              else if (src.shell) s.upsertFrame(src.before)
+              else s.patchFrameLocal(src.before.id, { html: src.before.html })
+              s.pushNotice(`“${src.before.name}” changed while the layers moved; check it for a second copy`)
+            }
+          }),
+        ),
+      (err: unknown) => {
+        const s = useStore.getState()
+        const remote = err instanceof ApiError && err.status === 409 ? (err.body.frame as Frame | undefined) : undefined
+        dropEntry(entry)
+        s.patchFrameLocal(dest.id, { html: dest.html })
+        for (const src of srcs) {
+          if (src.shell) s.upsertFrame(src.before)
+          else s.patchFrameLocal(src.before.id, { html: src.before.html })
+        }
+        if (remote) s.upsertFrame(remote)
+        s.pushNotice(errorMessage(err, `Couldn’t move the layers to “${dest.name}”`))
+      },
+    ),
+  )
+  return true
+}
+
 /* the standalone's root with its shell-relative size made absolute */
 function sizedToShell(outerHtml: string, shell: Frame): string {
   const tpl = document.createElement('template')
@@ -909,9 +1096,12 @@ function dropCreated(created: Frame): Promise<void> {
   )
 }
 
-/* a transparent document the size of its one element: the markup fills the
-   frame, so resizing the frame resizes the element as it does a drawing */
-function standaloneDocument(markup: string): string {
+/** A transparent document the size of its one element: the markup fills the
+ *  frame, so resizing the frame resizes the element as it does a drawing.
+ *  `measured`: the frame is the element's rendered box, transforms included,
+ *  so its own transform is switched off; otherwise the frame is its layout
+ *  box and the transform stays. */
+export function standaloneDocument(markup: string, { measured = true }: { measured?: boolean } = {}): string {
   const doc = new DOMParser().parseFromString('<!doctype html><html><head></head><body></body></html>', 'text/html')
   doc.documentElement.style.cssText = 'width:100%;height:100%;margin:0;'
   doc.body.style.cssText = 'width:100%;height:100%;margin:0;'
@@ -922,7 +1112,8 @@ function standaloneDocument(markup: string): string {
   /* the element is measured as rendered, transforms included, and that box
      becomes the frame: a transform, inline or from a carried rule, would
      apply a second time on top */
-  for (const name of ['transform', 'translate', 'scale', 'rotate']) el.style.setProperty(name, 'none', 'important')
+  if (measured)
+    for (const name of ['transform', 'translate', 'scale', 'rotate']) el.style.setProperty(name, 'none', 'important')
   for (const [name, value] of [
     ['position', 'absolute'],
     ['left', '0'],

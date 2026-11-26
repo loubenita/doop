@@ -1,9 +1,18 @@
 import { pdfRenderBudgetMs } from '../../shared/pdfLimits'
-import { DEFAULT_EXPORT_SCALE, exportScaleSuffix, fitExportScale, formatExportScale } from '../../shared/exportScale'
+import {
+  DEFAULT_EXPORT_SCALE,
+  exportScaleSuffix,
+  fitExportScale,
+  formatExportScale,
+  fullFrameRenderScale,
+} from '../../shared/exportScale'
+import { MAX_LAYER_SELECTOR_CHARS } from '../../shared/elementId'
 import type { Frame } from '../../shared/types'
 import { isDesktopShell } from './shell'
 import { inspectElement } from './frameBridge'
+import { composeFrame } from './frameCompose'
 import { clipToFrame, cropRaster, frameSvg, rasterizeFrame, type ClipRect } from './frameRaster'
+import { useSyncExternalStore } from 'react'
 import { useStore } from './store'
 import { t } from './i18n'
 
@@ -86,6 +95,48 @@ const RASTER_TIMEOUT_MS = 20_000
    spinner while another export is still rendering. */
 let inFlight = 0
 
+/* The frames with a download rendering, so a control can say so wherever it
+   is mounted (the Inspector remounts on every selection) and whichever
+   surface started it. A count per frame, since one frame may export twice. */
+const exportingFrames = new Map<string, number>()
+const exportListeners = new Set<() => void>()
+
+function markExporting(frameIds: readonly string[], delta: 1 | -1) {
+  for (const id of frameIds) {
+    const next = (exportingFrames.get(id) ?? 0) + delta
+    if (next > 0) exportingFrames.set(id, next)
+    else exportingFrames.delete(id)
+  }
+  for (const listener of exportListeners) listener()
+}
+
+function subscribeExporting(listener: () => void) {
+  exportListeners.add(listener)
+  return () => exportListeners.delete(listener)
+}
+
+export function isFrameExporting(frameId: string): boolean {
+  return exportingFrames.has(frameId)
+}
+
+/** Whether a download of this frame is rendering right now. */
+export function useFrameExporting(frameId: string): boolean {
+  return useSyncExternalStore(subscribeExporting, () => isFrameExporting(frameId))
+}
+
+/** Run one export with its frames marked busy and counted in the shared
+ *  toast, both undone however the export ends. */
+async function tracked<T>(frameIds: readonly string[], run: () => Promise<T>): Promise<T> {
+  inFlight += 1
+  markExporting(frameIds, 1)
+  try {
+    return await run()
+  } finally {
+    inFlight -= 1
+    markExporting(frameIds, -1)
+  }
+}
+
 /** `outcome` null: nothing to say — the desktop shell's save panel is the
  *  feedback, and it may yet be cancelled, so "ready" would be a claim. */
 function report(outcome: string | null) {
@@ -136,25 +187,32 @@ async function measureElement(frame: Frame, selector: string): Promise<ClipRect 
   return info ? clipToFrame(info.rect, frame) : null
 }
 
-/** The server's render of the whole frame, cut down to `clip` here. */
-async function fetchClipped(frame: Frame, format: RasterFormat, scale: number, clip: ClipRect, fileName: string) {
-  const label = FORMAT_LABEL[format]
-  const whole = await fetchFile(frameExportUrl(frame, format, scale), label, fileName)
-  if (!whole.ok) return whole
-  try {
-    const blob = await cropRaster(whole.blob, clip, {
-      scale,
-      type: rasterType(format),
-      quality: JPG_QUALITY,
-    })
-    return { ok: true as const, blob, fileName }
-  } catch {
-    return { ok: false as const, message: t('panels.exportFailed', { label }) }
+/** If a full screenshot would shrink a small selection, let Chromium capture
+ *  the layer directly at its original density. Otherwise keep the live
+ *  document's measured crop, including selectors too long for a public URL. */
+function serverRasterTarget(
+  frame: Frame,
+  format: RasterFormat,
+  scale: number,
+  clip?: ClipRect,
+  element?: ElementTarget,
+) {
+  const url = frameExportUrl(frame, format, scale)
+  const fullScale = fullFrameRenderScale(frame, scale)
+  if (
+    fullScale < scale &&
+    clip &&
+    element &&
+    element.selector.length <= MAX_LAYER_SELECTOR_CHARS &&
+    fullFrameRenderScale(clip, scale) === scale
+  ) {
+    return { url: `${url}&selector=${encodeURIComponent(element.selector)}`, scale }
   }
+  return { url, scale: fullScale, clip }
 }
 
-/** Render here first; the server's Chromium is the fallback. A scale the
- *  frame is too big for comes down to the largest it allows, and says so. */
+/** Render here first; the server's Chromium is the fallback. Use the scale
+ *  of the renderer that produced the file for its name and download notice. */
 async function fetchExport(
   frame: Frame,
   format: FrameExportFormat,
@@ -164,24 +222,30 @@ async function fetchExport(
   const clip = element ? await measureElement(frame, element.selector) : undefined
   if (clip === null) return { ok: false, message: t('panels.exportElementMissing') }
   if (format === 'svg') return svgExport(frame, element, clip)
-  const scale = fitExportScale(frame, wanted)
-  const fileName = `${exportName(frame, element)}${exportScaleSuffix(scale)}.${format}`
-  const fetched = await rasterFetch(frame, format, scale, clip, fileName)
-  if (!fetched.ok || scale === wanted) return fetched
-  return { ...fetched, note: t('panels.exportScaledDown', { scale: formatExportScale(scale) }) }
-}
-
-async function rasterFetch(
-  frame: Frame,
-  format: RasterFormat,
-  scale: number,
-  clip: ClipRect | undefined,
-  fileName: string,
-): Promise<Fetched> {
-  const local = await rasterExport(frame, format, scale, clip)
-  if (local) return { ok: true, blob: local, fileName }
-  if (clip) return fetchClipped(frame, format, scale, clip, fileName)
-  return fetchFile(frameExportUrl(frame, format, scale), FORMAT_LABEL[format], fileName)
+  let scale = fitExportScale(frame, wanted)
+  let blob = await rasterExport(frame, format, scale, clip)
+  let fileName = ''
+  if (!blob) {
+    const target = serverRasterTarget(frame, format, scale, clip, element)
+    scale = target.scale
+    const fetched = await fetchFile(target.url, FORMAT_LABEL[format], '')
+    if (!fetched.ok) return fetched
+    fileName = element ? '' : fetched.fileName
+    blob = fetched.blob
+    if (target.clip) {
+      try {
+        blob = await cropRaster(blob, target.clip, { scale, type: rasterType(format), quality: JPG_QUALITY })
+      } catch {
+        return { ok: false, message: t('panels.exportFailed', { label: FORMAT_LABEL[format] }) }
+      }
+    }
+  }
+  return {
+    ok: true,
+    blob,
+    fileName: fileName || `${exportName(frame, element)}${exportScaleSuffix(scale)}.${format}`,
+    note: scale === wanted ? undefined : t('panels.exportScaledDown', { scale: formatExportScale(scale) }),
+  }
 }
 
 /** An SVG has no server fallback: the server's Chromium paints pixels, and
@@ -242,7 +306,8 @@ async function exportOutcome(fetched: Promise<Fetched>): Promise<string | null> 
  *  shows, so a draft in progress exports as typed. Nothing to fetch, so it
  *  cannot fail the way the rendered exports can. */
 export function downloadFrameHtml(frame: Frame, html = frame.html): void {
-  saveBlob(new Blob([html], { type: 'text/html;charset=utf-8' }), `${frame.name || 'frame'}.html`)
+  /* a file opened by itself: the canvas's token values and component styles go with it */
+  saveBlob(new Blob([composeFrame(html)], { type: 'text/html;charset=utf-8' }), `${frame.name || 'frame'}.html`)
 }
 
 /** Render and download a frame export, reporting through the canvas toast:
@@ -276,10 +341,10 @@ async function downloadExport(
   scale: number,
   element?: ElementTarget,
 ): Promise<void> {
-  inFlight += 1
-  useStore.getState().pushNotice(t('panels.exportingFormat', { label: FORMAT_LABEL[format] }), { busy: true })
-  const outcome = await exportOutcome(fetchExport(frame, format, scale, element))
-  inFlight -= 1
+  const outcome = await tracked([frame.id], () => {
+    useStore.getState().pushNotice(t('panels.exportingFormat', { label: FORMAT_LABEL[format] }), { busy: true })
+    return exportOutcome(fetchExport(frame, format, scale, element))
+  })
   report(outcome)
 }
 
@@ -290,17 +355,20 @@ async function downloadExport(
 export async function downloadFramesPdf(canvasId: string, frames: readonly Frame[]): Promise<void> {
   const [first] = frames
   if (!first) return
-  inFlight += 1
-  useStore
-    .getState()
-    .pushNotice(
-      frames.length === 1 ? t('panels.exportingPdf') : t('panels.exportingPdfFrames', { count: frames.length }),
-      { busy: true },
-    )
-  const fallback = `${(frames.length === 1 && first.name) || 'frames'}.pdf`
-  const timeoutMs = Math.max(EXPORT_TIMEOUT_MS, pdfRenderBudgetMs(frames.length))
-  const outcome = await exportOutcome(fetchFile(framesPdfUrl(canvasId, frames), 'PDF', fallback, timeoutMs))
-  inFlight -= 1
+  const outcome = await tracked(
+    frames.map((frame) => frame.id),
+    () => {
+      useStore
+        .getState()
+        .pushNotice(
+          frames.length === 1 ? t('panels.exportingPdf') : t('panels.exportingPdfFrames', { count: frames.length }),
+          { busy: true },
+        )
+      const fallback = `${(frames.length === 1 && first.name) || 'frames'}.pdf`
+      const timeoutMs = Math.max(EXPORT_TIMEOUT_MS, pdfRenderBudgetMs(frames.length))
+      return exportOutcome(fetchFile(framesPdfUrl(canvasId, frames), 'PDF', fallback, timeoutMs))
+    },
+  )
   report(outcome)
 }
 
@@ -346,10 +414,11 @@ async function copyPng(frame: Frame, wanted: number, element?: ElementTarget): P
     const local = await rasterExport(frame, 'png', scale, clip)
     if (local) return local
     try {
-      const res = await fetch(frameExportUrl(frame, 'png', scale), { signal: AbortSignal.timeout(EXPORT_TIMEOUT_MS) })
+      const target = serverRasterTarget(frame, 'png', scale, clip, element)
+      const res = await fetch(target.url, { signal: AbortSignal.timeout(EXPORT_TIMEOUT_MS) })
       if (res.ok) {
         const whole = await res.blob()
-        return clip ? await cropRaster(whole, clip, { scale, type: 'png' }) : whole
+        return target.clip ? await cropRaster(whole, target.clip, { scale: target.scale, type: 'png' }) : whole
       }
       failure = await failureOf(res, 'png')
     } catch (err) {

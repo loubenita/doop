@@ -3,6 +3,9 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { describe, expect, it, vi } from 'vitest'
 import { buildMcpServer } from '../server/mcp.ts'
 import { FRAME_PREVIEW_URI } from '../server/chatgptApp.ts'
+import { IMAGE_PROVIDER_NOTE } from '../server/imageGen.ts'
+import { RESIDENT_TOOLS } from '../server/resident.ts'
+import { MAX_DECISION_CHARS } from '../shared/designDecisions.ts'
 import packageJson from '../package.json' with { type: 'json' }
 
 vi.mock('../server/db/persist.ts', () => ({ saveCanvas: () => {}, saveFrame: () => {}, saveActivity: () => {} }))
@@ -133,6 +136,8 @@ describe('MCP generate_image tool contract', () => {
       )
       expect(new Set(schema.required)).toEqual(new Set(['prompt', 'canvas_id', 'agent_name']))
       expect(client.getInstructions()).toContain('generate_image')
+      /* an agent learns up front that the call needs an image provider */
+      expect(generate!.description).toContain(IMAGE_PROVIDER_NOTE)
 
       /* an unknown canvas must be refused before anything is spent */
       const result = await client.callTool({
@@ -144,6 +149,42 @@ describe('MCP generate_image tool contract', () => {
       await client.close()
       await server.close()
     }
+  })
+})
+
+describe('save_decision length limit', () => {
+  /* agents reported "save_decision rejects decision >500 characters but its
+     schema omits maxLength": the schema has to carry the limit the server enforces */
+  it('states the server limit in the MCP schema', async () => {
+    const server = buildMcpServer('Test Owner', 'test-owner-id')
+    const client = new Client({ name: 'doop-tool-contract-test', version: '1.0.0' })
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    await server.connect(serverTransport)
+    await client.connect(clientTransport)
+    try {
+      const tool = (await client.listTools()).tools.find((entry) => entry.name === 'save_decision')!
+      const decision = (tool.inputSchema.properties as Record<string, { maxLength?: number; description?: string }>)
+        .decision!
+      expect(decision.maxLength).toBe(MAX_DECISION_CHARS)
+      expect(decision.description).toContain(`at most ${MAX_DECISION_CHARS} characters`)
+      expect(tool.description).toContain(`at most ${MAX_DECISION_CHARS} characters`)
+    } finally {
+      await client.close()
+      await server.close()
+    }
+  })
+
+  it('states the server limit in the resident agent schema', () => {
+    const tool = RESIDENT_TOOLS.find((entry) => entry.name === 'save_decision')!
+    const decision = (tool.input_schema.properties as Record<string, { maxLength?: number; description?: string }>)
+      .decision!
+    expect(decision.maxLength).toBe(MAX_DECISION_CHARS)
+    expect(decision.description).toContain(`at most ${MAX_DECISION_CHARS} characters`)
+  })
+
+  it('tells the resident agent its generate_image needs an image provider', () => {
+    const tool = RESIDENT_TOOLS.find((entry) => entry.name === 'generate_image')!
+    expect(tool.description).toContain(IMAGE_PROVIDER_NOTE)
   })
 })
 
@@ -189,10 +230,13 @@ it('requires the original page list and rejects stale agent replacements', async
   }
 })
 
-async function pagesClient(canvas: { id: string; ownerId: string; name: string; pages?: unknown; frames: unknown[] }) {
+async function pagesClient(
+  canvas: { id: string; ownerId: string; name: string; pages?: unknown; frames: unknown[] },
+  clientName?: string,
+) {
   const { store } = await import('../server/store.ts')
   store.canvases.set(canvas.id, { createdAt: 0, updatedAt: 0, ...canvas } as never)
-  const server = buildMcpServer('Test Owner', 'test-owner-id')
+  const server = buildMcpServer('Test Owner', 'test-owner-id', clientName)
   const client = new Client({ name: 'pages-test', version: '1.0.0' })
   const [a, b] = InMemoryTransport.createLinkedPair()
   await server.connect(b)
@@ -227,6 +271,53 @@ it('create_canvas_page adds a named page with a fresh id and keeps the rest', as
     expect(page.name).toBe('Mobile')
     expect(page.id).toMatch(/^[\w-]{10}$/)
     expect(pages).toEqual([{ id: 'first', name: 'Main', startFrameId: 'f1' }, page])
+  } finally {
+    await close()
+  }
+})
+
+it('update_canvas renames the canvas, tells the room and logs it once', async () => {
+  const actions = await import('../server/actions.ts')
+  const { store } = await import('../server/store.ts')
+  const { MAX_CANVAS_NAME } = await import('../shared/pages.ts')
+  const broadcast = vi.fn()
+  actions.wire(broadcast, () => {})
+  const canvas = { id: 'mcp-rename', ownerId: 'test-owner-id', name: 'Draft', frames: [] }
+  const { client, close, body } = await pagesClient(canvas)
+  const stored = () => store.getCanvas(canvas.id)!.name
+  const rename = (name: string) =>
+    client.callTool({ name: 'update_canvas', arguments: { canvas_id: canvas.id, name, agent_name: 'Agent' } })
+  try {
+    const result = await rename('  Checkout flow ')
+    expect(result.isError).toBeFalsy()
+    expect(body(result)).toMatchObject({ ok: true, id: canvas.id, name: 'Checkout flow' })
+    expect(stored()).toBe('Checkout flow')
+    const renames = () => broadcast.mock.calls.filter(([, message]) => message.type === 'canvas:renamed')
+    expect(renames()).toEqual([[canvas.id, expect.objectContaining({ name: 'Checkout flow' })]])
+
+    expect((await rename('Checkout flow')).isError).toBeFalsy()
+    expect(renames()).toHaveLength(1)
+    expect(actions.getActivity(canvas.id).filter((a) => a.message.includes('renamed the canvas'))).toHaveLength(1)
+
+    expect((await rename('   ')).isError).toBe(true)
+    expect((await rename('x'.repeat(MAX_CANVAS_NAME + 1))).isError).toBe(true)
+    expect(stored()).toBe('Checkout flow')
+  } finally {
+    await close()
+  }
+})
+
+it('update_canvas refuses a canvas the agent can only view', async () => {
+  const canvas = { id: 'mcp-rename-view', ownerId: 'someone-else', name: 'Theirs', linkAccess: 'view', frames: [] }
+  const { store } = await import('../server/store.ts')
+  const { client, close } = await pagesClient(canvas)
+  try {
+    const result = await client.callTool({
+      name: 'update_canvas',
+      arguments: { canvas_id: canvas.id, name: 'Mine now', agent_name: 'Agent' },
+    })
+    expect(result.isError).toBe(true)
+    expect(store.getCanvas(canvas.id)!.name).toBe('Theirs')
   } finally {
     await close()
   }
@@ -302,12 +393,42 @@ it('get_canvas lists the pages and narrows the frames to page_id', async () => {
   }
 })
 
+/* A client that reads structuredContent in place of content (Claude Code did)
+   saw only the preview card's frames: no pages, positions or notes (#526) */
+it.each([
+  ['claude-code', false],
+  ['opencode', false],
+  ['openai-mcp', true],
+])('get_canvas sends %s structuredContent: %s', async (clientName, card) => {
+  const { client, close, body } = await pagesClient(
+    {
+      id: `mcp-structured-${clientName}`,
+      ownerId: 'test-owner-id',
+      name: 'Structured',
+      pages: [{ id: 'first', name: 'Main' }],
+      frames: [],
+    },
+    clientName,
+  )
+  try {
+    const result = await client.callTool({
+      name: 'get_canvas',
+      arguments: { canvas_id: `mcp-structured-${clientName}` },
+    })
+    expect(body(result).pages).toEqual([{ id: 'first', name: 'Main' }])
+    if (card) expect(result.structuredContent).toMatchObject({ frames: [] })
+    else expect(result.structuredContent).toBeUndefined()
+  } finally {
+    await close()
+  }
+})
+
 /* What ChatGPT's app review checks on every tool (developers.openai.com/apps-sdk):
    the three safety hints set explicitly, a title, and — for the tools that
    render a preview card — the component wiring (server/chatgptApp.ts). */
 describe('MCP ChatGPT app contract', () => {
-  async function connected() {
-    const server = buildMcpServer('Test Owner', 'test-owner-id')
+  async function connected(clientName?: string) {
+    const server = buildMcpServer('Test Owner', 'test-owner-id', clientName)
     const client = new Client({ name: 'doop-chatgpt-contract-test', version: '1.0.0' })
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
     await server.connect(serverTransport)
@@ -351,8 +472,46 @@ describe('MCP ChatGPT app contract', () => {
     }
   })
 
+  /* A client with nowhere to embed a card opens each one as a browser tab (Pi
+     did), so only the hosts known to embed it are told about it */
+  it.each([
+    undefined,
+    'pi',
+    'pi-mcp-doop',
+    'codex-mcp-client',
+    'openai-mcp (Codex)',
+    'claude-code',
+    'Claude Code (doop)',
+  ])('offers %s no preview card', async (clientName) => {
+    const { client, close } = await connected(clientName)
+    try {
+      const { tools } = await client.listTools()
+      expect(tools.length).toBeGreaterThan(30)
+      for (const tool of tools) {
+        expect(tool._meta?.ui, tool.name).toBeUndefined()
+        expect(tool._meta?.['openai/outputTemplate'], tool.name).toBeUndefined()
+      }
+    } finally {
+      await close()
+    }
+  })
+
+  it.each(['openai-mcp', 'ChatGPT', 'Anthropic/ClaudeAI', 'Claude', 'claude-ai (via mcp-remote 0.15.1)'])(
+    'offers %s the preview card',
+    async (clientName) => {
+      const { client, close } = await connected(clientName)
+      try {
+        const { tools } = await client.listTools()
+        const meta = tools.find((t) => t.name === 'get_frame_screenshot')!._meta as Record<string, unknown>
+        expect(meta['openai/outputTemplate']).toBe(FRAME_PREVIEW_URI)
+      } finally {
+        await close()
+      }
+    },
+  )
+
   it('links the frame tools to the preview component and serves it as an MCP Apps resource', async () => {
-    const { client, close } = await connected()
+    const { client, close } = await connected('openai-mcp')
     try {
       const { tools } = await client.listTools()
       const byName = Object.fromEntries(tools.map((t) => [t.name, t]))
@@ -393,7 +552,11 @@ describe('MCP ChatGPT app contract', () => {
       expect(html.text).toContain('Design in progress')
       /* retired URIs stay served for chats that still hold them */
       expect(resources.map((r) => r.uri)).toEqual(
-        expect.arrayContaining(['ui://doop/frame-preview-1.html', 'ui://doop/frame-preview-2.html']),
+        expect.arrayContaining([
+          'ui://doop/frame-preview-1.html',
+          'ui://doop/frame-preview-2.html',
+          'ui://doop/frame-preview-3.html',
+        ]),
       )
       expect(html.text).toContain('class="retry"')
       const meta = html._meta as Record<string, unknown>

@@ -7,7 +7,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-111110" alt="License: AGPL-3.0"></a>
   <a href="https://doop.design"><img src="https://img.shields.io/badge/cloud-doop.design-2743EE" alt="Doop Cloud"></a>
   <a href="CONTRIBUTING.md"><img src="https://img.shields.io/badge/PRs-welcome-111110" alt="PRs welcome"></a>
-  <a href="https://discord.com/invite/3AUfXjgVe"><img src="https://img.shields.io/badge/chat-Discord-5865F2" alt="Discord"></a>
+  <a href="https://discord.gg/EMvwFq6QAC"><img src="https://img.shields.io/badge/chat-Discord-5865F2" alt="Discord"></a>
 </p>
 
 **[Doop](https://doop.design/?utm_source=github) is the open-source alternative to [Paper.design](https://paper.design) — a multiplayer
@@ -34,7 +34,8 @@ runs on **GPT, Claude, Gemini, DeepSeek, Kimi or Qwen** models
   free tasks as `RESIDENT_TASK_LIMIT` grants (none by default) ([setup](#the-doop-agent)); the
   first-canvas welcome performance is scripted and runs without any of it.
 - **Pages within a canvas** — organize frames into named pages from the Layers panel. Add, rename,
-  drag to reorder, double-click to rename, or right-click to rename and delete empty pages.
+  drag to reorder, or double-click to rename. Right-click for page actions, including copying
+  a link, without switching away from the open page.
   Page edits support Undo/Redo; selected frames can move between pages. Agents can list pages
   with `get_canvas`, manage them with `set_canvas_pages` (passing the original list as
   `expectedPages` to protect collaborators), and target frames with `pageId`. Each page can wear
@@ -77,6 +78,7 @@ tasks. **Connect AI** in the top bar walks you through each one.
 | Cursor                                       | **Add to Cursor** in Connect AI                                                 |
 | OpenCode, VS Code Copilot, OpenClaw and more | Any MCP client, over OAuth or with an agent key ([setup](#connect-an-ai-agent)) |
 | Headless agents (n8n, Mastra, CI)            | An agent key as a bearer header ([setup](#headless-agents-agent-keys))          |
+| Any agent with a shell (the `doop` CLI)      | An agent key; frames as local files ([setup](#from-a-shell-the-doop-cli))       |
 
 No agent of your own? The built-in [Doop Agent](#the-doop-agent) runs on the model account you
 connect: a ChatGPT subscription, or an OpenAI, Claude, Gemini, DeepSeek, Kimi or OpenRouter key.
@@ -170,7 +172,9 @@ layers of that frame, so agents read and edit them like any other markup.
 - **Zoom** — 8% to 1600%. Wheel pans, ⌘/Ctrl + wheel or a pinch zooms; a 1px pixel grid fades in from
   300%. The zoom menu has 50/100/200% presets and the rulers toggle.
 - **Panels** — the right side panel has **Agents**, **Comments**, **Activity** and **Memory** tabs;
-  Layers and the side panel can be resized, and ⌘. hides all UI.
+  Layers and the side panel can be resized. Drag the divider between Pages and Layers to change
+  their split; arrow keys move it, Home and End reach its limits, and Doop remembers it per canvas.
+  Pages starts compact until you resize it. ⌘. hides all UI.
 - **Themes** — Light, Dark or System under Settings → Appearance.
 - **Phones** — the canvas works on a phone: one-finger pan, pinch zoom, tap to comment, and bottom
   sheets for canvas actions, Layers and the Inspector.
@@ -444,8 +448,9 @@ catalog, asked with that account's credential when the picker opens (`server/mod
 `GET /api/model-account/models`): the Codex backend's catalog for a ChatGPT subscription (the
 same list the Codex CLI reads, asked as `CHATGPT_CODEX_CLIENT_VERSION`), OpenAI's and
 Anthropic's `/v1/models`, Gemini's `/v1beta/models`. A newly released model is on the menu
-without an upgrade; the curated entries above sit on top as recommendations, a curated tier the
-account cannot run is left off, and the curated menu alone is served if the provider cannot be
+without an upgrade; the newest generation leads, the curated entries above it within each
+generation as recommendations, every id is spelled the way the curated ones are, a curated tier
+the account cannot run is left off, and the curated menu alone is served if the provider cannot be
 reached. OpenRouter, DeepSeek, Kimi and Kimi Code stay on their curated rosters, whose hand-checked vision
 flags are what the run relies on. DeepSeek and Kimi return their reasoning as `reasoning_content`
 and refuse a tool-calling conversation that leaves it out, so the transport keeps it in the run's
@@ -456,9 +461,9 @@ endpoints are fixed constants: a user-supplied endpoint would be a URL the serve
 context — an SSRF vector — so custom endpoints stay server-level configuration only.
 
 Either way the user picks their **model tier** in Settings from that provider's curated menu — on
-OpenAI, `gpt-6-astra` (the newest flagship; on a ChatGPT subscription it needs Plus or better and
-OpenAI is still rolling it out per account), `gpt-5.6-sol` (flagship), `gpt-5.6-terra` (the default
-workhorse) or `gpt-5.6-luna` (cheap and fast). They are paying for it, so the choice is theirs;
+OpenAI, `gpt-6.2-astra` (the flagship, priciest; on a ChatGPT subscription it runs on supported
+plans, and Enterprise and Edu admins switch it on), `gpt-6.2-sol` (the default workhorse),
+`gpt-6.1-terra` (fast and efficient) or `gpt-6-luna` (cheapest and fastest). They are paying for it, so the choice is theirs;
 `DOOP_AGENT_OPENAI_MODEL`, `DOOP_AGENT_OPENROUTER_MODEL`, `DOOP_AGENT_GEMINI_MODEL`,
 `DOOP_AGENT_DEEPSEEK_MODEL`, `DOOP_AGENT_KIMI_MODEL` and `DOOP_AGENT_KIMI_CODE_MODEL` only set the default they start on. Note that
 `gpt-5.4` and `gpt-5.4-mini` retire from ChatGPT-authenticated Codex on **31 August 2026**, so
@@ -498,26 +503,26 @@ authenticate over OAuth and drive the canvas from outside, on your own subscript
 Three paths, same canvas: the Doop Agent on our key (free tier), the Doop Agent on your key, or your
 own agent over MCP.
 
-| Variable                        | Default                     | What it does                                                                         |
-| ------------------------------- | --------------------------- | ------------------------------------------------------------------------------------ |
-| `DOOP_AGENT_PROVIDER`           | `anthropic`                 | What the free tier runs on: `anthropic` \| `azure`                                   |
-| `ANTHROPIC_API_KEY`             | _unset_                     | Pays for the free Doop Agent tier (default provider) and the distiller               |
-| `AZURE_OPENAI_ENDPOINT`         | _unset_                     | The free tier's Azure OpenAI resource, when `DOOP_AGENT_PROVIDER=azure`              |
-| `AZURE_OPENAI_API_KEY`          | _unset_                     | A key of that resource                                                               |
-| `AZURE_OPENAI_DEPLOYMENT`       | _unset_                     | The deployment the free tier runs on                                                 |
-| `AZURE_OPENAI_API_VERSION`      | _unset_                     | Pins an `api-version` query parameter; the v1 surface needs none                     |
-| `AZURE_OPENAI_REASONING_EFFORT` | _unset_                     | Reasoning effort on Azure runs; unset sends none (non-reasoning-safe)                |
-| `RESIDENT_TASK_LIMIT`           | `0`                         | Free Doop Agent tasks per account; `0` means a connected account from the first task |
-| `DOOP_AGENT_MODEL`              | `claude-opus-5`             | Model for the Doop Agent on the server's Anthropic key                               |
-| `DOOP_AGENT_OPENAI_MODEL`       | `gpt-5.6-terra`             | Default tier on a user's account; each user can pick another in Settings             |
-| `DOOP_AGENT_OPENAI_EFFORT`      | `medium`                    | Default reasoning effort on a user's OpenAI account; each user can pick low–xhigh    |
-| `DOOP_AGENT_OPENROUTER_MODEL`   | `moonshotai/kimi-k2.6`      | Default model on a connected OpenRouter key                                          |
-| `DOOP_AGENT_GEMINI_MODEL`       | `gemini-3.7-flash`          | Default model on a connected Gemini key                                              |
-| `DOOP_AGENT_DEEPSEEK_MODEL`     | `deepseek-flash`            | Default model on a connected DeepSeek key                                            |
-| `DOOP_AGENT_KIMI_MODEL`         | `kimi-k3.1-pro`             | Default model on a connected Kimi key                                                |
-| `DOOP_AGENT_KIMI_CODE_MODEL`    | `k3.1-pro`                  | Default model on a connected Kimi Code plan                                          |
-| `CHATGPT_CONNECT_DISABLED`      | _unset_                     | `1` hides the ChatGPT flow, leaving the API-key path                                 |
-| `DOOP_DISTILL_MODEL`            | `claude-haiku-4-5-20251001` | Model for the guideline distiller                                                    |
+| Variable                        | Default                    | What it does                                                                         |
+| ------------------------------- | -------------------------- | ------------------------------------------------------------------------------------ |
+| `DOOP_AGENT_PROVIDER`           | `anthropic`                | What the free tier runs on: `anthropic` \| `azure`                                   |
+| `ANTHROPIC_API_KEY`             | _unset_                    | Pays for the free Doop Agent tier (default provider) and the distiller               |
+| `AZURE_OPENAI_ENDPOINT`         | _unset_                    | The free tier's Azure OpenAI resource, when `DOOP_AGENT_PROVIDER=azure`              |
+| `AZURE_OPENAI_API_KEY`          | _unset_                    | A key of that resource                                                               |
+| `AZURE_OPENAI_DEPLOYMENT`       | _unset_                    | The deployment the free tier runs on                                                 |
+| `AZURE_OPENAI_API_VERSION`      | _unset_                    | Pins an `api-version` query parameter; the v1 surface needs none                     |
+| `AZURE_OPENAI_REASONING_EFFORT` | _unset_                    | Reasoning effort on Azure runs; unset sends none (non-reasoning-safe)                |
+| `RESIDENT_TASK_LIMIT`           | `0`                        | Free Doop Agent tasks per account; `0` means a connected account from the first task |
+| `DOOP_AGENT_MODEL`              | `claude-opus-5-5`          | Model for the Doop Agent on the server's Anthropic key                               |
+| `DOOP_AGENT_OPENAI_MODEL`       | `gpt-6.2-sol`              | Default tier on a user's account; each user can pick another in Settings             |
+| `DOOP_AGENT_OPENAI_EFFORT`      | `medium`                   | Default reasoning effort on a user's OpenAI account; each user can pick low–xhigh    |
+| `DOOP_AGENT_OPENROUTER_MODEL`   | `moonshotai/kimi-k3.1-pro` | Default model on a connected OpenRouter key                                          |
+| `DOOP_AGENT_GEMINI_MODEL`       | `gemini-4-hydrogen`        | Default model on a connected Gemini key                                              |
+| `DOOP_AGENT_DEEPSEEK_MODEL`     | `deepseek-flash`           | Default model on a connected DeepSeek key                                            |
+| `DOOP_AGENT_KIMI_MODEL`         | `kimi-k3.1-pro`            | Default model on a connected Kimi key                                                |
+| `DOOP_AGENT_KIMI_CODE_MODEL`    | `k3.1-pro`                 | Default model on a connected Kimi Code plan                                          |
+| `CHATGPT_CONNECT_DISABLED`      | _unset_                    | `1` hides the ChatGPT flow, leaving the API-key path                                 |
+| `DOOP_DISTILL_MODEL`            | `claude-haiku-5-5`         | Model for the guideline distiller                                                    |
 
 `RESIDENT_TASK_LIMIT` is the free-tier meter. By default it is `0`: the Doop Agent only runs once
 the user connects a model account (any of the kinds above) — a connected
@@ -659,6 +664,17 @@ org-only door. Microsoft does not assert email ownership unless the app registra
 ID token includes the `email` and `verified_primary_email` optional claims; without them a
 Microsoft sign-in still works but only links to an existing account that is already
 verified. Everything else (allowlist, admin promotion) follows the SSO rules above.
+
+### Sign in with GitHub
+
+Same shape as Google. Register an OAuth app under
+[GitHub developer settings](https://github.com/settings/developers) with
+`<BETTER_AUTH_URL>/api/auth/callback/github` as the authorization callback URL, generate a
+client secret, and set `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` together. It is a
+separate app from the `GITHUB_APP_*` GitHub App that imports repositories. Doop takes the
+account's primary GitHub address (the `user:email` scope), not the one shown on the public
+profile, and links to an existing account when GitHub has verified that address. Everything
+else (allowlist, admin promotion) follows the SSO rules above.
 
 ### Sign in with Apple
 
@@ -831,6 +847,30 @@ For website viewing/imports, setting `CONTEXT_DEV_API_KEY` makes Context.dev acq
 HTML while Doop still sanitizes it and renders the preview locally; without the key, Doop navigates
 to the public page directly in Chromium.
 
+### From a shell: the doop CLI
+
+An agent that has a shell (Claude Code, Codex, Cursor) or a CI job can work on a canvas without MCP,
+through the `doop` CLI: frames and components are local files it edits with its own tools, and
+screenshots and exports are written to disk. It is one dependency-free file, on npm as
+`@doop-design/cli`. It signs in through the browser, or with an agent key in CI.
+
+```bash
+npm install -g @doop-design/cli        # or bun add -g, pnpm add -g; npx @doop-design/cli runs it uninstalled
+export DOOP_SERVER=http://localhost:4300
+doop login                             # approve in the browser; in CI set DOOP_API_KEY to an agent key
+
+doop link --create "Onboarding v2"     # or an existing canvas: its id, name or URL
+doop pull                              # frames -> designs/*.html
+doop push                              # changed files -> the canvas, live
+doop screenshot designs/hero.html      # prints the path of a PNG
+doop wait                              # blocks until a person leaves feedback
+```
+
+A server also serves the CLI it was built with at `/cli/doop.mjs`, for when no registry is reachable.
+
+`doop init` tells the coding agents in a repository about it. Commands, conflicts, components, CI
+use and the HTTP endpoints underneath are in [docs/cli.md](docs/cli.md).
+
 ### Design sync: push an app's live screens onto a canvas
 
 Server-side import can't reach apps behind SSO or a VPN. The **doop-sync snippet** flips the capture
@@ -909,6 +949,7 @@ read-only / destructive / idempotent annotations; the server registers no MCP pr
 | `delete_workspace`         | Delete an empty workspace (owner only; needs `confirm: true`, refused while it holds canvases)                      |
 | `move_canvas_to_workspace` | Move a whole canvas into a workspace, or back to its owner's personal space; frames untouched                       |
 | `get_canvas`               | Canvas layout: every frame's position/size/meta                                                                     |
+| `update_canvas`            | Rename a canvas                                                                                                     |
 | `set_canvas_pages`         | Create, rename, reorder or delete canvas pages                                                                      |
 | `set_page_background`      | Paint one page's canvas a colour of its own, or clear it back to the theme paper                                    |
 | **Frames**                 |                                                                                                                     |
@@ -1044,7 +1085,7 @@ edit the brief to choose dimensions, languages and deliverables. Generated desig
 Schedules are checked every minute; approvals and ongoing work every five seconds. One run
 per automation is active at a time. Up to ten approvals are grouped into each run, with each
 approval processed once, including after a restart or run-history cleanup. Enabling a workflow
-watches future approvals; **Run now** also picks up existing, unprocessed approvals.
+watches future approvals; **Run now** (⌘⌥↩, Ctrl+Alt+↩ elsewhere) also picks up existing, unprocessed approvals.
 Changing an approved source to draft or needs review stops its remaining workflow steps.
 Agent work times out after one hour. Sizes, languages, and asset briefs are editable presets.
 
@@ -1103,7 +1144,7 @@ The realtime protocol is plain JSON over `/ws`, one room per canvas; its message
 The main entry points (the server has about 70 modules in all):
 
 ```
-server/            Node (tsx) — one process on :4400
+server/            Node 26 (runs the TypeScript directly) — one process on :4400
   index.ts         Express REST API + ws rooms + presence + static serving (prod)
   store.ts         In-memory canvas/frame state (hot path), write-through to the DB
   db/              Drizzle schema + PGlite/Postgres connection + migrations
@@ -1142,7 +1183,7 @@ change them together.
 
 Frame HTML renders in `<iframe sandbox="allow-scripts">` — scripts run, but no same-origin access and
 no reach into the app. Each iframe loads a small bootstrap once; new HTML is `postMessage`d in and
-**DOM-morphed in place** (`src/lib/frameRuntime.ts`), so updates and streaming ticks never white-flash
+**DOM-morphed in place** (`src/frame-runtime/morph.ts`), so updates and streaming ticks never white-flash
 the frame with a full document reload. Changed `<script>`s re-execute; unchanged styles/fonts are
 untouched. The realtime layer is plain JSON over a per-canvas WebSocket room;
 REST/MCP mutations are broadcast to the room by the shared actions layer, so human and agent edits go

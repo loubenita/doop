@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 /* Approval writes persist and broadcast like any frame change; these tests only care
    about the approval the tool leaves behind, so both are stubbed, and so is the name lookup. */
 vi.mock('../server/db/persist.ts', () => ({
+  refreshAssetRefs: () => {},
   saveFrame: () => {},
   saveFrameNow: async () => {},
   saveCanvas: () => {},
@@ -20,25 +21,10 @@ vi.mock('../server/auth.ts', async (importOriginal) => ({
 
 const actions = await import('../server/actions.ts')
 const { store } = await import('../server/store.ts')
-const { deliveredWork, execTool } = await import('../server/resident.ts')
+const { deliveredWork, execTool, newRunState } = await import('../server/resident.ts')
 const { DEFAULT_ROLE_ID, roleName } = await import('../shared/agents.ts')
 
 const actor = () => actions.resolveActor({ name: roleName(DEFAULT_ROLE_ID), kind: 'agent' })
-const run = (extra: { requesterId?: string; automated?: boolean } = {}) => ({
-  mutatedFrames: new Set<string>(),
-  sourceFrames: new Set<string>(),
-  verificationFrames: new Set<string>(),
-  verifiedFrames: new Set<string>(),
-  seenVerified: new Set<string>(),
-  rewriteDrafts: new Map<string, string>(),
-  vision: false,
-  imagesGenerated: 0,
-  repliedThreads: new Set<string>(),
-  awaitingThreads: new Set<string>(),
-  tokenWrites: 0,
-  arrangeWrites: 0,
-  ...extra,
-})
 const call = (input: unknown) => ({ type: 'tool_use' as const, id: 't1', name: 'set_frame_approval', input })
 const html = '<!doctype html><html><body>hi</body></html>'
 
@@ -62,7 +48,7 @@ describe('the resident agent sets approval', () => {
       call({ frame_id: frameId, status: 'ready_for_dev' }),
       canvasId,
       actor(),
-      run({ requesterId: 'kevin' }),
+      newRunState({ requesterId: 'kevin' }),
     )
     expect(ready.is_error).toBeUndefined()
     expect(store.getFrame(frameId)!.approval).toMatchObject({
@@ -75,21 +61,25 @@ describe('the resident agent sets approval', () => {
       call({ frame_id: frameId, status: 'draft' }),
       canvasId,
       actor(),
-      run({ requesterId: 'kevin' }),
+      newRunState({ requesterId: 'kevin' }),
     )
     expect(draft.is_error).toBeUndefined()
     expect(store.getFrame(frameId)!.approval).toBeNull()
   })
 
   it('counts an approval as the delivered work of a card that asked only for it', async () => {
-    const state = run({ requesterId: 'kevin' })
+    const state = newRunState({ requesterId: 'kevin' })
     expect(deliveredWork(state)).toBe(false)
     await execTool(call({ frame_id: frameId, status: 'ready_for_dev' }), canvasId, actor(), state)
     expect(deliveredWork(state)).toBe(true)
   })
 
   it('refuses without a person who can edit the canvas, and inside automation runs', async () => {
-    for (const state of [run(), run({ requesterId: 'stranger' }), run({ requesterId: 'kevin', automated: true })]) {
+    for (const state of [
+      newRunState(),
+      newRunState({ requesterId: 'stranger' }),
+      newRunState({ requesterId: 'kevin', automated: true }),
+    ]) {
       const result = await execTool(call({ frame_id: frameId, status: 'ready_for_dev' }), canvasId, actor(), state)
       expect(result.is_error).toBe(true)
     }

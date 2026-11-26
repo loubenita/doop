@@ -8,11 +8,17 @@ declare global {
   interface Window {
     delayContextMessage?: 'doop:html' | 'doop:context-hit'
     releaseContextMessage?: () => void
+    heldFrameMessage?: unknown
     contextMenuHarness: {
       seed: (frames: Frame[], zoom?: number) => void
       selection: () => { frameId: string; selector: string } | null
       updateHtml: (html: string) => void
       selectMany: (ids: string[]) => void
+      pick: (selectors: string[]) => void
+      picked: () => string[]
+      selectedIds: () => string[]
+      openPanel: () => void
+      panelOpen: () => boolean
       undo: () => Promise<void>
       redo: () => Promise<void>
     }
@@ -31,11 +37,27 @@ describe.skipIf(!findBrowserPath())('frame and element context menus', () => {
   let page: Page
   let saved: Frame
   let deletedFrames = 0
+  /* every frame a DELETE named, for menus that remove more than frame f */
+  let deletedIds: string[] = []
   let stamped: string[] = []
   const errors: string[] = []
 
   async function frameDoc() {
     return (await page.$('iframe[data-doop-frame]'))!.contentFrame()
+  }
+
+  async function releaseFrameMessage() {
+    const doc = (await frameDoc())!
+    const held = await doc.evaluate(() => {
+      const data = window.heldFrameMessage
+      window.heldFrameMessage = undefined
+      return data
+    })
+    await page.$eval(
+      'iframe[data-doop-frame]',
+      (el, data) => (el as HTMLIFrameElement).contentWindow!.postMessage(data, '*'),
+      held,
+    )
   }
 
   async function rightClick(selector: string, wait = true) {
@@ -70,22 +92,50 @@ describe.skipIf(!findBrowserPath())('frame and element context menus', () => {
     await page.waitForFunction(() => !document.querySelector('[role="menu"]'))
   }
 
+  /** Open a submenu by its row, then choose one of its items. */
+  async function chooseIn(submenu: string, label: string) {
+    const trigger = await page.waitForFunction(
+      (text) =>
+        [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find(
+          (el) => el.firstChild?.textContent === text,
+        ),
+      {},
+      submenu,
+    )
+    const row = await trigger.asElement()?.toElement('div')
+    if (!row) throw new Error(`Missing submenu: ${submenu}`)
+    await row.hover()
+    await page.keyboard.press('ArrowRight')
+    await choose(label)
+  }
+
   beforeEach(async () => {
     deletedFrames = 0
+    deletedIds = []
     stamped = []
     page = await pages.open()
-    // Install before the iframe bootstrap registers its listener. A handler
-    // added later cannot stop a message the runtime has already processed.
+    // Install before the iframe bootstrap registers its listener, and in the capture
+    // phase as the runtime's is: a handler that runs after it cannot hold a message back.
     await page.evaluateOnNewDocument(() => {
-      window.addEventListener('message', (event) => {
-        if (!window.delayContextMessage || event.data?.type !== window.delayContextMessage) return
-        window.delayContextMessage = undefined
-        event.stopImmediatePropagation()
-        window.releaseContextMessage = () => {
-          window.releaseContextMessage = undefined
-          window.dispatchEvent(new MessageEvent('message', { data: event.data, source: event.source }))
-        }
-      })
+      window.addEventListener(
+        'message',
+        (event) => {
+          if (!window.delayContextMessage || event.data?.type !== window.delayContextMessage) return
+          window.delayContextMessage = undefined
+          event.stopImmediatePropagation()
+          /* the frame runtime ignores a synthetic event, so a message held in the frame
+             is posted again by the editor page (releaseFrameMessage) */
+          if (window !== window.parent) {
+            window.heldFrameMessage = event.data
+            return
+          }
+          window.releaseContextMessage = () => {
+            window.releaseContextMessage = undefined
+            window.dispatchEvent(new MessageEvent('message', { data: event.data, source: event.source }))
+          }
+        },
+        true,
+      )
     })
     page.setDefaultTimeout(5_000)
     page.on('pageerror', (err) => errors.push(String(err)))
@@ -93,6 +143,7 @@ describe.skipIf(!findBrowserPath())('frame and element context menus', () => {
     await page.setRequestInterception(true)
     page.on('request', async (request) => {
       const pathname = new URL(request.url()).pathname
+      if (request.method() === 'DELETE' && pathname.startsWith('/api/frames/')) deletedIds.push(pathname.slice(12))
       if (pathname === '/api/frames/f') {
         if (request.method() === 'PATCH') saved = { ...saved, ...JSON.parse(request.postData()!) }
         if (request.method() === 'DELETE') deletedFrames++
@@ -105,6 +156,8 @@ describe.skipIf(!findBrowserPath())('frame and element context menus', () => {
           contentType: 'application/json',
           body: JSON.stringify({ elementId: 'text00' }),
         })
+      } else if (request.method() === 'DELETE' && pathname.startsWith('/api/frames/')) {
+        await request.respond({ status: 200, contentType: 'application/json', body: '{}' })
       } else await request.continue()
     })
     await page.goto(fixtureUrl('elementContextMenu.html'))
@@ -155,12 +208,11 @@ describe.skipIf(!findBrowserPath())('frame and element context menus', () => {
     )
     await expect.poll(() => saved.name).toBe('Double-click name')
 
-    await page.click(row, { button: 'right' })
-    await choose('Rename')
+    await page.click(`${row} > span:nth-of-type(3)`, { count: 2 })
     await page.waitForFunction((selector) => document.activeElement === document.querySelector(selector), {}, editor)
-    await page.keyboard.type('Menu name')
+    await page.keyboard.type('Second name')
     await page.keyboard.press('Tab')
-    await expect.poll(() => saved.name).toBe('Menu name')
+    await expect.poll(() => saved.name).toBe('Second name')
     await page.evaluate(() => window.contextMenuHarness.undo())
     await page.waitForFunction(
       (row) => document.querySelector(row)?.textContent?.includes('Double-click name'),
@@ -191,8 +243,7 @@ describe.skipIf(!findBrowserPath())('frame and element context menus', () => {
       expect(await doc.$eval('#text', (el) => el.textContent)).toBe('Second element')
       expect(await doc.$eval('#photo', (el) => el.getAttribute('alt'))).toBe('Original alt')
 
-      await page.click(row, { button: 'right' })
-      await choose('Rename')
+      await page.click(`${row} > span:nth-of-type(3)`, { count: 2 })
       await page.waitForFunction((selector) => document.activeElement === document.querySelector(selector), {}, editor)
       await page.keyboard.type('Saved label')
       await page.keyboard.press('Enter')
@@ -213,18 +264,24 @@ describe.skipIf(!findBrowserPath())('frame and element context menus', () => {
     await rightClick('#text')
     expect(await items()).toEqual([
       'Copy',
+      'Cut',
+      'Copy/Paste as',
       'Paste',
+      'Paste to replace',
       'Duplicate',
-      'Hide',
+      'Group selection',
+      'Ungroup selection',
+      'Add flex layout',
       'Create component',
-      'Copy HTML',
-      'Copy selector',
-      'Copy link to element',
-      'Export…',
-      'Copy as PNG',
-      'Move up',
-      'Move down',
+      'Bring to front',
+      'Bring forward',
+      'Send backward',
+      'Send to back',
+      'Flip horizontal',
+      'Flip vertical',
+      'Hide',
       'Lock',
+      'Export…',
       'Delete element',
     ])
     expect(await page.evaluate(() => window.contextMenuHarness.selection())).toEqual({
@@ -237,8 +294,19 @@ describe.skipIf(!findBrowserPath())('frame and element context menus', () => {
       return menu && getComputedStyle(menu).opacity === '1'
     })
     await page.screenshot({ path: '/tmp/doop-element-context-menu.png' })
-    await choose('Copy HTML')
+    await chooseIn('Copy/Paste as', 'Copy HTML')
     expect(await page.evaluate(() => navigator.clipboard.readText())).toContain('id="text"')
+  })
+
+  it('offers no Rename on the canvas: a layer or frame is renamed from its Layers row', async () => {
+    const labels = () => page.$$eval('[role="menuitem"]', (items) => items.map((el) => el.firstChild?.textContent))
+    await rightClick('#text')
+    expect(await labels()).not.toContain('Rename')
+    await page.keyboard.press('Escape')
+    await page.waitForSelector('[role="menu"]', { hidden: true })
+    await page.click('[data-frame-title]', { button: 'right' })
+    await page.waitForSelector('[role="menuitem"]')
+    expect(await labels()).not.toContain('Rename')
   })
 
   it('shares hide, unlock, and link actions with the layer panel', async () => {
@@ -257,7 +325,7 @@ describe.skipIf(!findBrowserPath())('frame and element context menus', () => {
     await choose('Show')
     await expect.poll(() => saved.html).not.toContain('data-doop-hidden')
     await rightClick('#text')
-    await choose('Copy link to element')
+    await chooseIn('Copy/Paste as', 'Copy link to element')
     /* the copy waits for the stamp, so the clipboard is read once it has landed */
     await expect
       .poll(async () => new URL(await page.evaluate(() => navigator.clipboard.readText())).searchParams.get('element'))
@@ -267,10 +335,71 @@ describe.skipIf(!findBrowserPath())('frame and element context menus', () => {
     expect(link.searchParams.has('selector')).toBe(false)
   })
 
+  it('keeps a multi-pick when the right-click lands on a layer inside one of the picked', async () => {
+    saved = { ...saved, html: saved.html.replace('>First</div>', '><span id="inner">First</span></div>') }
+    await page.evaluate((frame) => window.contextMenuHarness.seed([frame]), saved)
+    await (await frameDoc())!.waitForSelector('#inner')
+    await page.evaluate(() => window.contextMenuHarness.pick(['#text', '#box']))
+    await rightClick('#inner')
+    expect(await page.evaluate(() => window.contextMenuHarness.picked())).toEqual(['#text', '#box'])
+    expect(await page.evaluate(() => window.contextMenuHarness.selection())).toEqual({ frameId: 'f', selector: '#box' })
+  })
+
+  it('keeps two selected canvas shapes selected when one is right-clicked', async () => {
+    const shape =
+      '<body data-doop-canvas-element="true"><div data-doop-drawing="rect" style="width:100px;height:100px;background:red"></div></body>'
+    saved = { ...saved, width: 100, height: 100, html: shape }
+    const other = { ...saved, id: 'g', name: 'Other', x: 300 }
+    await page.evaluate((frames) => window.contextMenuHarness.seed(frames), [saved, other])
+    await page.evaluate(() => window.contextMenuHarness.selectMany(['g', 'f']))
+    await rightClick('[data-doop-drawing]')
+    expect(await page.evaluate(() => window.contextMenuHarness.selectedIds())).toEqual(['g', 'f'])
+  })
+
+  it('keeps a multi-pick when the right-click lands on a picked layer inside a group', async () => {
+    const group =
+      '<div id="group" data-doop-drawing="group" style="display:flex;gap:10px">' +
+      '<div id="a" style="width:60px;height:60px;background:#ddd"></div>' +
+      '<div id="b" style="width:60px;height:60px;background:#bbb"></div></div>'
+    saved = { ...saved, html: saved.html.replace('<div id="box"', group + '<div id="box"') }
+    await page.evaluate((frame) => window.contextMenuHarness.seed([frame]), saved)
+    await (await frameDoc())!.waitForSelector('#b')
+    await page.evaluate(() => window.contextMenuHarness.pick(['#a', '#b']))
+    await rightClick('#a')
+    expect(await page.evaluate(() => window.contextMenuHarness.picked())).toEqual(['#b', '#a'])
+  })
+
+  it('narrows several selected frames to a group shape when a layer inside it is right-clicked', async () => {
+    const shape =
+      '<body data-doop-canvas-element="true"><div data-doop-drawing="group" style="width:100px;height:100px">' +
+      '<div id="part" data-doop-drawing="rect" style="width:50px;height:50px;background:red"></div>' +
+      '<div data-doop-drawing="rect" style="width:50px;height:50px;background:blue"></div></div></body>'
+    saved = { ...saved, width: 100, height: 100, html: shape }
+    const other = { ...saved, id: 'g', name: 'Other', x: 300 }
+    await page.evaluate((frames) => window.contextMenuHarness.seed(frames), [saved, other])
+    await page.evaluate(() => window.contextMenuHarness.selectMany(['g', 'f']))
+    await rightClick('#part')
+    expect(await page.evaluate(() => window.contextMenuHarness.selectedIds())).toEqual(['f'])
+    const picked = await page.evaluate(() => window.contextMenuHarness.selection())
+    expect(picked?.frameId).toBe('f')
+    expect(await (await frameDoc())!.$eval(picked!.selector, (el) => el.id)).toBe('part')
+  })
+
+  it('closes the element panel when a right-click finds no layer', async () => {
+    await page.evaluate(() => {
+      window.contextMenuHarness.pick(['#box'])
+      window.contextMenuHarness.openPanel()
+    })
+    await page.mouse.click(500, 440, { button: 'right' })
+    await page.waitForFunction(() => document.querySelector('[role="menuitem"]')?.textContent?.startsWith('Copy'))
+    expect(await page.evaluate(() => window.contextMenuHarness.selection())).toBeNull()
+    expect(await page.evaluate(() => window.contextMenuHarness.panelOpen())).toBe(false)
+  })
+
   it('does not open the frame or background menu in empty frame space', async () => {
     await page.mouse.click(500, 440, { button: 'right' })
     await page.waitForFunction(() => document.querySelector('[role="menuitem"]')?.textContent?.startsWith('Copy'))
-    expect(await items()).toEqual(['Copy', 'Paste'])
+    expect(await items()).toEqual(['Copy', 'Cut', 'Paste'])
     expect(await page.evaluate(() => window.contextMenuHarness.selection())).toBeNull()
   })
 
@@ -320,7 +449,7 @@ describe.skipIf(!findBrowserPath())('frame and element context menus', () => {
       el.dispatchEvent(new Event('input', { bubbles: true }))
     })
     await rightClick('#text')
-    await choose('Copy HTML')
+    await chooseIn('Copy/Paste as', 'Copy HTML')
     expect(await page.evaluate(() => navigator.clipboard.readText())).toContain('Edited text')
   })
 
@@ -342,8 +471,42 @@ describe.skipIf(!findBrowserPath())('frame and element context menus', () => {
       frameId: 'f',
       selector: '#text',
     })
-    await choose('Copy HTML')
+    await chooseIn('Copy/Paste as', 'Copy HTML')
     expect(await page.evaluate(() => navigator.clipboard.readText())).toContain('id="text"')
+  })
+
+  it("copies and cuts every selected canvas shape from one shape's Layers row", async () => {
+    const shape = (id: string, x: number, locked = false): Frame => ({
+      ...saved,
+      id,
+      name: `Shape ${id}`,
+      x,
+      width: 40,
+      height: 40,
+      html: `<body data-doop-canvas-element="true"><div id="${id}-box" data-doop-drawing="rect"${locked ? ' data-doop-locked="true"' : ''} style="width:40px;height:40px;background:red"></div></body>`,
+    })
+    await page.evaluate(
+      (frames) => {
+        window.contextMenuHarness.seed(frames)
+        window.contextMenuHarness.selectMany(['f', 'g', 'h'])
+      },
+      /* h is locked on its own layer (⌘⇧L): copied with the rest, never cut */
+      [shape('f', 60), shape('g', 200), shape('h', 340, true)],
+    )
+    const row = '[data-row-key="f|#f-box"]'
+    const clip = () =>
+      page.evaluate(() => JSON.parse(localStorage.getItem('doop:frame-clipboard') ?? '{"frames":[]}').frames.length)
+
+    await page.click(row, { button: 'right' })
+    await choose('Copy')
+    await expect.poll(clip).toBe(3)
+
+    await page.evaluate(() => localStorage.removeItem('doop:frame-clipboard'))
+    await page.evaluate(() => window.contextMenuHarness.selectMany(['f', 'g', 'h']))
+    await page.click(row, { button: 'right' })
+    await choose('Cut')
+    await expect.poll(clip).toBe(3)
+    await expect.poll(() => [...deletedIds].sort()).toEqual(['f', 'g'])
   })
 
   it('keeps group actions on titles but restricts a surface action to its element', async () => {
@@ -372,12 +535,12 @@ describe.skipIf(!findBrowserPath())('frame and element context menus', () => {
     })
     const updated = original.replace('<main>', '<main><div style="position:absolute;top:200px">Inserted</div>')
     await page.evaluate((html) => window.contextMenuHarness.updateHtml(html), updated)
-    await doc.waitForFunction(() => !!window.releaseContextMessage)
+    await doc.waitForFunction(() => !!window.heldFrameMessage)
     expect(await doc.$eval('main', (el) => el.textContent)).toBe('KeepTarget')
     await rightClick('main > div:nth-of-type(2)', false)
     await page.waitForFunction(() => document.querySelector('[role="menu"]')?.textContent === 'Finding element…')
     expect(await page.evaluate(() => window.contextMenuHarness.selection())).toBeNull()
-    await doc.evaluate(() => window.releaseContextMessage?.())
+    await releaseFrameMessage()
     await page.waitForFunction(
       () =>
         window.contextMenuHarness.selection()?.selector ===

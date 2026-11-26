@@ -123,6 +123,8 @@ const schema = {
   /* unset in production = user credentials stored unencrypted (boot warns) */
   SECRETS_ENCRYPTION_KEYS: secretKeys({ default: [], devDefault: DEV_SECRET_KEYS }),
   TRUSTED_ORIGINS: list({ default: [] }),
+  AUTH_IP_HEADERS: list({ default: [] }),
+  AUTH_TRUSTED_PROXIES: list({ default: [] }),
   SIGNUP_EMAIL_DOMAINS: list({ default: [] }),
   ADMIN_EMAILS: list({ default: [] }),
   REQUIRE_EMAIL_VERIFICATION: bool({ default: true }),
@@ -136,6 +138,8 @@ const schema = {
   MICROSOFT_CLIENT_ID: str({ default: undefined }),
   MICROSOFT_CLIENT_SECRET: str({ default: undefined }),
   MICROSOFT_TENANT_ID: str({ default: 'common' }),
+  GITHUB_CLIENT_ID: str({ default: undefined }),
+  GITHUB_CLIENT_SECRET: str({ default: undefined }),
   APPLE_CLIENT_ID: str({ default: undefined }),
   APPLE_CLIENT_SECRET: str({ default: undefined }),
   APPLE_APP_BUNDLE_IDENTIFIER: str({ default: undefined }),
@@ -148,6 +152,8 @@ const schema = {
   SMTP_PASS: str({ default: undefined }),
   SMTP_SECURE: bool({ default: false }),
   EMAIL_FROM: str({ default: 'doop <no-reply@localhost>' }),
+  /** where the app's Feedback button sends a person's note; unset = no button */
+  FEEDBACK_EMAIL: str({ default: undefined }),
 
   /* ------------------------------------------------------ webhooks */
   WEBHOOK_ALLOW_PRIVATE_URLS: bool({ default: false }),
@@ -164,6 +170,17 @@ const schema = {
   /* incident kill switch: a frame write stops pushing a changed main into every
      other frame synchronously (each catches up on its own next write) */
   DOOP_DEFER_COMPONENT_PROPAGATION: bool({ default: false }),
+  /* temporary kill switch: false stores every frame with its component stylesheets and
+     token block written in, as before lean storage, and token changes rewrite frames again.
+     Reads compose either way (server/frameCompose.ts). To be removed once lean storage
+     has run in production */
+  DOOP_LEAN_FRAME_STORAGE: bool({ default: true }),
+  /* temporary kill switch: false stores every frame with its component instances written
+     out in full again, as before compact storage, so a change to a component's markup
+     rewrites the loaded frames using it. Reads expand either way, whatever mix of the two
+     forms the database holds (server/frameRest.ts). To be removed once compact storage
+     has run in production */
+  DOOP_COMPACT_FRAME_STORAGE: bool({ default: true }),
   /* what one operation (a request, a tool call, one frame of the propagation queue) may
      hand the component engine's HTML parser, and how long it may spend in it
      (server/workBudget.ts); 0 lifts a limit */
@@ -181,9 +198,9 @@ const schema = {
   STALL_LOG_MS: nonNegativeInt({ default: 5000 }),
   STALL_EXIT_MS: nonNegativeInt({ default: 60_000, devDefault: 0 }),
   SLOW_OP_LOG_MS: nonNegativeInt({ default: 2000 }),
-  DOOP_AGENT_MODEL: str({ default: 'claude-opus-5' }),
-  DOOP_DISTILL_MODEL: str({ default: 'claude-haiku-4-5-20251001' }),
-  DOOP_AGENT_OPENAI_MODEL: str({ default: 'gpt-5.6-terra' }),
+  DOOP_AGENT_MODEL: str({ default: 'claude-opus-5-5' }),
+  DOOP_DISTILL_MODEL: str({ default: 'claude-haiku-5-5' }),
+  DOOP_AGENT_OPENAI_MODEL: str({ default: 'gpt-6.2-sol' }),
   DOOP_AGENT_OPENAI_EFFORT: str({ default: 'medium' }),
   DOOP_AGENT_OPENROUTER_MODEL: str({ default: DEFAULT_OPENROUTER_MODEL }),
   DOOP_AGENT_GEMINI_MODEL: str({ default: DEFAULT_GEMINI_MODEL }),
@@ -204,7 +221,7 @@ const schema = {
   /* the Codex backend's model catalog; it answers for a Codex CLI version it
      knows, so the pin moves with the CLI releases */
   CHATGPT_MODELS_URL: str({ default: 'https://chatgpt.com/backend-api/codex/models' }),
-  CHATGPT_CODEX_CLIENT_VERSION: str({ default: '0.163.0' }),
+  CHATGPT_CODEX_CLIENT_VERSION: str({ default: '0.171.0' }),
   CHATGPT_ORIGINATOR: str({ default: 'codex_cli_rs' }),
   OPENAI_RESPONSES_URL: str({ default: 'https://api.openai.com/v1/responses' }),
   OPENAI_IMAGES_URL: str({ default: 'https://api.openai.com/v1/images/generations' }),

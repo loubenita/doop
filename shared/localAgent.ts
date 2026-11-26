@@ -16,7 +16,7 @@ export const CLAUDE_MODEL_ID = /^claude-[a-z0-9][a-z0-9.-]{0,98}$/
 /** An alias, or a pinned `claude-*` id. */
 export type ClaudeModel = string
 
-export const DEFAULT_CLAUDE_MODEL: ClaudeModelAlias = 'sonnet'
+export const DEFAULT_CLAUDE_MODEL: ClaudeModelAlias = 'opus'
 
 export function isClaudeModel(value: unknown): value is ClaudeModel {
   return (
@@ -51,6 +51,9 @@ export const CLAUDE_EFFORT_OPTIONS: { id: ClaudeEffort; name: string; blurb: str
   { id: 'max', name: 'Max', blurb: 'All the thinking it can do, and the slowest turns' },
 ]
 
+/** What a user who never saved a preference runs on. */
+export const DEFAULT_CLAUDE_EFFORT: ClaudeEffort = 'medium'
+
 export function isClaudeEffort(value: unknown): value is ClaudeEffort {
   return CLAUDE_EFFORTS.some((effort) => effort === value)
 }
@@ -75,4 +78,10 @@ export interface LocalAgentJob {
 export interface LocalAgentResult {
   success: boolean
   text: string
+  /** the run stopped at its turn limit (Claude Code's `error_max_turns`),
+   *  not on an error: its work is judged like any run the cap stopped */
+  limitReached?: boolean
+  /** Doop's relay worded this failure itself (the desktop went away, a
+   *  worker was down), so it is shown as it is, not quoted as the model's */
+  fromDoop?: boolean
 }

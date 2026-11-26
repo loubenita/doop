@@ -1,23 +1,27 @@
+import { parseCardScope } from '../../shared/cardScope.ts'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { nanoid } from 'nanoid'
-import { and, desc, eq, inArray, sql } from 'drizzle-orm'
+import { and, desc, eq, getTableColumns, inArray, lt, sql } from 'drizzle-orm'
 import { db } from './index.ts'
 import * as t from './schema.ts'
 import { extractAssetIds } from '../assets.ts'
 import { AGENT_ROLES, roleByAgentName } from '../../shared/agents.ts'
 import { isCommunityCategory } from '../../shared/types.ts'
 import { storedLinkAccess } from '../../shared/canvasRole.ts'
-import type { ComponentDef, LibraryComponent } from '../../shared/components.ts'
+import { MAX_COMPONENT_HISTORY } from '../../shared/components.ts'
+import type { ComponentDef, ComponentSnapshot, LibraryComponent } from '../../shared/components.ts'
 import type { DesignToken, TokenType } from '../../shared/designTokens.ts'
 import { parseRunnerPick } from '../../shared/agentRunner.ts'
 import { byStack } from '../../shared/frameStack.ts'
 import { unloadHtml } from '../frameHtml.ts'
+import { definitionSerial, restingHtml } from '../frameRest.ts'
+import { WorkBudgetError } from '../workBudget.ts'
 import type {
   ActivityItem,
   ActorKind,
   AgentTask,
-  CardScope,
   Canvas,
   DesignDecision,
   ElementComment,
@@ -40,6 +44,61 @@ import type {
 
 function swallow(p: Promise<unknown>) {
   p.catch((err) => console.error('[db] write failed', err))
+}
+
+/* Frames at rest (server/frameRest.ts): the HTML of a frame's row, and of a version of it,
+   holds each component instance as a reference, rendered from its component when the frame
+   is read. What a frame is stored as depends on its canvas's components, which the store
+   holds: the server hands them over (server/index.ts). Without that (a script, a test of
+   this file alone) HTML is stored as given. */
+let componentsOf: ((canvasId: string) => readonly ComponentDef[] | undefined) | undefined
+
+/** Store frames at rest as references into these components: `components(canvasId)` is
+ *  what the canvas has now, undefined for a canvas whose frames are stored as given (one
+ *  on an actor, one the store does not hold). */
+export function restFramesThrough(components: (canvasId: string) => readonly ComponentDef[] | undefined) {
+  componentsOf = components
+}
+
+/* Definitions the database holds as they stand: what boot read, and every one whose write
+   has landed. A reference is only as good as the row it renders from after a restart, so
+   an instance of a definition not in here is stored written out. */
+const storedDefs = new WeakSet<ComponentDef>()
+
+const isStored = (def: ComponentDef) => storedDefs.has(def)
+
+/* What a frame's HTML was last stored as, by a hash of that HTML and the state of its canvas's
+   definitions: a write that changed no HTML (a move, a rename, a sign-off, a version of the
+   same document) does not parse the frame again. */
+const MAX_KEPT_RESTING = 300
+const keptResting = new Map<string, string>()
+
+function restingKey(
+  canvasId: string,
+  html: string,
+  defs: readonly ComponentDef[],
+  stored: (def: ComponentDef) => boolean,
+) {
+  const state = defs.map((def) => `${definitionSerial(def)}${stored(def) ? '' : '!'}`).join(',')
+  return createHash('sha1').update(`${canvasId}\u0000${state}\u0000${html}`).digest('base64')
+}
+
+/** A frame's HTML as its row keeps it. Never fails a save: out of budget, or anything the
+ *  engine trips over, the rendered HTML is stored, which is always a form a read accepts. */
+function atRest(canvasId: string, html: string, defs = componentsOf?.(canvasId), stored = isStored): string {
+  if (!defs || !html) return html
+  try {
+    const key = restingKey(canvasId, html, defs, stored)
+    const kept = keptResting.get(key)
+    if (kept !== undefined) return kept
+    const resting = restingHtml(html, defs, { stored })
+    keptResting.set(key, resting)
+    if (keptResting.size > MAX_KEPT_RESTING) keptResting.delete(keptResting.keys().next().value ?? '')
+    return resting
+  } catch (error) {
+    if (!(error instanceof WorkBudgetError)) console.error('[db] a frame could not be made compact', canvasId, error)
+    return html
+  }
 }
 
 /** every mutable canvas column, so insert and upsert can't drift apart */
@@ -72,6 +131,9 @@ export function saveCanvas(c: Canvas) {
 /** Persist a newly duplicated canvas as one unit. Unlike ordinary live edits,
  * duplication must not report success until every copied row is durable. */
 export async function saveCanvasCopy(c: Canvas): Promise<void> {
+  /* a copy's frames are stored as they are in memory, written out: making every frame of a
+     canvas compact in one turn is the whole-canvas work this server never does at once
+     (2026-11-11). Each goes compact on its own first write; a read takes either form */
   await db.transaction(async (tx) => {
     await tx.insert(t.canvases).values({ id: c.id, ...canvasColumns(c), createdAt: c.createdAt })
 
@@ -116,6 +178,13 @@ export async function saveCanvasCopy(c: Canvas): Promise<void> {
 
     if (c.components?.length) {
       await tx.insert(t.components).values(c.components.map((def) => componentRow(c.id, def)))
+      const revisions = c.components.flatMap((def) => revisionRows(c.id, def.id, def.history))
+      for (let at = 0; at < revisions.length; at += REVISION_INSERT_BATCH) {
+        await tx
+          .insert(t.componentRevisions)
+          .values(revisions.slice(at, at + REVISION_INSERT_BATCH))
+          .onConflictDoNothing()
+      }
     }
     if (c.tokens?.length) {
       await tx.insert(t.designTokens).values(c.tokens.map((token) => tokenRow(c.id, token)))
@@ -142,6 +211,10 @@ export async function saveCanvasCopy(c: Canvas): Promise<void> {
     )
     if (refs.length) await tx.insert(t.assetRefs).values(refs)
   })
+  for (const def of c.components ?? []) {
+    noteRevisionsFiled(c.id, def.id, def.history)
+    storedDefs.add(def)
+  }
 }
 
 export function saveMember(canvasId: string, userId: string, addedBy: string, addedAt: number) {
@@ -167,10 +240,10 @@ function componentRow(canvasId: string, def: ComponentDef) {
     props: def.props,
     slots: def.slots,
     rev: def.rev,
+    renderRev: def.renderRev ?? null,
     mainFrameId: def.mainFrameId,
     code: def.code ?? null,
     source: def.source ?? null,
-    history: def.history,
     status: def.status ?? ('active' as const),
     deletedAt: def.deletedAt ?? null,
     deletedBy: def.deletedBy ?? null,
@@ -266,38 +339,94 @@ export function pendingComponentWrites(canvasId?: string): Promise<unknown> {
   )
 }
 
+/*
+ * A component's earlier revisions are rows of component_revisions, written once each: a
+ * save sends the small `components` row and only the revisions not yet filed, where the
+ * row used to carry all twenty and was rewritten whole on every change (2026-11: 1 GB of
+ * table for 135 MB of content). `revisionsFiled` is the newest revision of each component
+ * known to be a row (what boot loaded, then every write that landed); the inserts are
+ * ON CONFLICT DO NOTHING besides, so a revision is never written over.
+ */
+const revisionsFiled = new Map<string, number>()
+
+/** most revision rows in one insert: nine parameters each, well under the protocol's 65,535 */
+const REVISION_INSERT_BATCH = 500
+
+const componentKey = (canvasId: string, id: string) => `${canvasId}\0${id}`
+
+function revisionRows(canvasId: string, componentId: string, history: readonly ComponentSnapshot[]) {
+  return history.map((entry) => ({
+    canvasId,
+    componentId,
+    rev: entry.rev,
+    renderRev: entry.renderRev ?? null,
+    template: entry.template,
+    rawCss: entry.rawCss,
+    head: entry.head,
+    props: entry.props,
+    savedAt: entry.savedAt,
+    savedBy: entry.savedBy,
+  }))
+}
+
+function noteRevisionsFiled(canvasId: string, id: string, history: readonly ComponentSnapshot[]) {
+  const newest = history.at(-1)
+  if (newest) revisionsFiled.set(componentKey(canvasId, id), newest.rev)
+  else revisionsFiled.delete(componentKey(canvasId, id))
+}
+
+const ofComponent = (canvasId: string, id: string) =>
+  and(eq(t.componentRevisions.canvasId, canvasId), eq(t.componentRevisions.componentId, id))
+
 export function saveComponent(canvasId: string, def: ComponentDef) {
   const row = componentRow(canvasId, def)
   const { canvasId: _canvasId, id: _id, createdAt: _createdAt, ...set } = row
-  queueComponentWrite(canvasId, def.id, () =>
-    db
-      .insert(t.components)
-      .values(row)
-      .onConflictDoUpdate({ target: [t.components.canvasId, t.components.id], set }),
-  )
-}
-
-/**
- * The components with an instance stored at an older revision than the component: the
- * frames a propagation never reached (the queue lives in memory, so a restart mid-drain
- * drops it; the kill switch of 2026-11-11 deferred it). Read in the database, where matching
- * every frame's HTML costs the server nothing.
- */
-export async function componentsBehind(): Promise<{ canvasId: string; componentId: string }[]> {
-  const result = await db.execute(sql`
-    select distinct c.canvas_id as "canvasId", c.id as "componentId"
-    from components c
-    join frames f on f.canvas_id = c.canvas_id
-      and position('data-doop-instance="' || c.id || '"' in f.html) > 0
-    cross join lateral regexp_matches(f.html, 'data-doop-instance="' || c.id || '" data-doop-rev="(\\d+)"', 'g') as m
-    where coalesce(c.status, 'active') = 'active' and c.rev > 1 and m[1]::int < c.rev`)
-  return (result as unknown as { rows: { canvasId: string; componentId: string }[] }).rows
+  const { history } = def
+  const key = componentKey(canvasId, def.id)
+  /* inside the row's queue, so revisions are filed in the order their saves were made */
+  queueComponentWrite(canvasId, def.id, async () => {
+    const filed = revisionsFiled.get(key)
+    /* at or behind a revision already filed: this is not the definition those rows were
+       kept for (one made again under its id), so they go rather than answer for it */
+    const restarted = filed !== undefined && def.rev <= filed
+    const added = restarted || filed === undefined ? history : history.filter((entry) => entry.rev > filed)
+    const upsert = (on: Pick<typeof db, 'insert'>) =>
+      on
+        .insert(t.components)
+        .values(row)
+        .onConflictDoUpdate({ target: [t.components.canvasId, t.components.id], set })
+    if (!added.length && !restarted) {
+      await upsert(db)
+      storedDefs.add(def)
+      return
+    }
+    await db.transaction(async (tx) => {
+      await upsert(tx)
+      if (restarted) await tx.delete(t.componentRevisions).where(ofComponent(canvasId, def.id))
+      if (!added.length) return
+      await tx
+        .insert(t.componentRevisions)
+        .values(revisionRows(canvasId, def.id, added))
+        .onConflictDoNothing()
+      /* memory keeps the newest MAX_COMPONENT_HISTORY: the table keeps the same ones */
+      const oldest = history[0]!.rev
+      await tx
+        .delete(t.componentRevisions)
+        .where(and(ofComponent(canvasId, def.id), lt(t.componentRevisions.rev, oldest)))
+    })
+    noteRevisionsFiled(canvasId, def.id, history)
+    storedDefs.add(def)
+  })
 }
 
 export function deleteComponent(canvasId: string, id: string) {
-  queueComponentWrite(canvasId, id, () =>
-    db.delete(t.components).where(and(eq(t.components.canvasId, canvasId), eq(t.components.id, id))),
-  )
+  queueComponentWrite(canvasId, id, async () => {
+    await db.transaction(async (tx) => {
+      await tx.delete(t.components).where(and(eq(t.components.canvasId, canvasId), eq(t.components.id, id)))
+      await tx.delete(t.componentRevisions).where(ofComponent(canvasId, id))
+    })
+    revisionsFiled.delete(componentKey(canvasId, id))
+  })
 }
 
 export function saveLibraryComponent(snapshot: LibraryComponent) {
@@ -616,9 +745,26 @@ async function writeFrame(f: Frame) {
 }
 
 async function writeFrameRow(f: Frame) {
+  /* a reference needs its definition's row: the canvas's queued component writes go first,
+     and the frame is read once they have landed, as it stands then */
+  if (componentsOf?.(f.canvasId)?.length) {
+    const wasDirty = dirtyFrames.has(f.id)
+    await pendingComponentWrites(f.canvasId)
+    /* deleted while this waited (its frame, or its whole canvas): the row must not come back */
+    if ((wasDirty && !dirtyFrames.has(f.id)) || !componentsOf(f.canvasId)) return
+  }
   const generation = dirtyFrames.get(f.id)
   const html = f.html
-  const row = {
+  const row = { ...frameRowOf(f), html: atRest(f.canvasId, html) }
+  const { id, createdAt, ...set } = row
+  await db.insert(t.frames).values(row).onConflictDoUpdate({ target: t.frames.id, set })
+  /* a save made while this one was in flight keeps the frame dirty */
+  if (dirtyFrames.get(f.id) === generation) dirtyFrames.delete(f.id)
+  await syncAssetRefs(f, html)
+}
+
+function frameRowOf(f: Frame) {
+  return {
     id: f.id,
     canvasId: f.canvasId,
     pageId: f.pageId ?? null,
@@ -627,7 +773,7 @@ async function writeFrameRow(f: Frame) {
     y: f.y,
     width: f.width,
     height: f.height,
-    html,
+    html: f.html,
     createdAt: f.createdAt,
     updatedAt: f.updatedAt,
     updatedBy: f.updatedBy,
@@ -638,11 +784,6 @@ async function writeFrameRow(f: Frame) {
     rotation: f.rotation ?? null,
     approval: f.approval ?? null,
   }
-  const { id, createdAt, ...set } = row
-  await db.insert(t.frames).values(row).onConflictDoUpdate({ target: t.frames.id, set })
-  /* a save made while this one was in flight keeps the frame dirty */
-  if (dirtyFrames.get(f.id) === generation) dirtyFrames.delete(f.id)
-  await syncAssetRefs(f.id, html)
 }
 
 /** A frame whose latest state is not yet stored: waiting on its debounce,
@@ -668,9 +809,21 @@ async function writeFramePage(frameId: string, pageId: string) {
   await db.update(t.frames).set({ pageId }).where(eq(t.frames.id, frameId))
 }
 
-/** The html of every frame on a canvas, for store.load. */
-export function loadFrameHtml(canvasId: string): Promise<{ id: string; html: string }[]> {
-  return db.select({ id: t.frames.id, html: t.frames.html }).from(t.frames).where(eq(t.frames.canvasId, canvasId))
+/** ids per query when frame html is read by id */
+const HTML_READ_BATCH = 200
+
+/** The html of these frames, for store.loadPages; a frame with no row is left out. */
+export async function loadFrameHtml(frameIds: readonly string[]): Promise<Map<string, string>> {
+  const html = new Map<string, string>()
+  for (let at = 0; at < frameIds.length; at += HTML_READ_BATCH) {
+    const ids = frameIds.slice(at, at + HTML_READ_BATCH)
+    const rows = await db
+      .select({ id: t.frames.id, html: t.frames.html })
+      .from(t.frames)
+      .where(inArray(t.frames.id, ids))
+    for (const row of rows) html.set(row.id, row.html)
+  }
+  return html
 }
 
 /** One frame's html, for a render of a frame whose canvas is not loaded. */
@@ -717,8 +870,15 @@ function queueVersionWrite(frameId: string, canvasId: string, work: () => Promis
   swallow(queued.finally(() => versionWrites.get(frameId)?.queued === queued && versionWrites.delete(frameId)))
 }
 
+/** A version is stored like a frame's row: its instances as references, made when its turn
+ *  to be written comes, once the canvas's queued component writes have landed (a reference
+ *  needs its definition's row). A preview or a restore renders them from the components as
+ *  they are then. */
 export function saveFrameVersion(version: FrameVersion) {
-  queueVersionWrite(version.frameId, version.canvasId, () => appendFrameVersion(version))
+  queueVersionWrite(version.frameId, version.canvasId, async () => {
+    if (componentsOf?.(version.canvasId)?.length) await pendingComponentWrites(version.canvasId)
+    await appendFrameVersion({ ...version, html: atRest(version.canvasId, version.html) })
+  })
 }
 
 /** Settles once every queued version write the filter picks has landed. */
@@ -827,11 +987,29 @@ export async function getFrameVersion(frameId: string, versionId: string): Promi
   }
 }
 
-/* asset_refs is a projection of frame HTML: recompute this frame's full ref
-   set on every durable write (never increment/decrement — nothing to drift).
-   Boot reconciles the whole table, so a lost write here self-heals. */
-async function syncAssetRefs(frameId: string, html: string) {
-  const ids = [...extractAssetIds(html)]
+/* A frame's stored HTML is its source: an asset only a component's stylesheet names (a
+   background image) is in what the canvas composes into the frame, not in the row. The
+   server hands over that view (server/index.ts, `composedHtml`); without one, the HTML as
+   stored is read. */
+let assetView: (canvasId: string, html: string) => string = (_canvasId, html) => html
+
+export function viewAssetsThrough(view: (canvasId: string, html: string) => string) {
+  assetView = view
+}
+
+/* asset_refs is a projection of the frame as it renders: recompute this frame's full ref
+   set on every durable write (never increment/decrement — nothing to drift). A change to
+   a component's stylesheet writes no frame, so an asset it starts to name joins a frame's
+   refs with that frame's own next write. */
+/** A frame rendered again in memory with no write of it (a component it uses changed its
+ *  markup, store.rerenderFrame): the assets it shows may have changed with the component. */
+export function refreshAssetRefs(frame: Frame) {
+  swallow(syncAssetRefs(frame, frame.html))
+}
+
+async function syncAssetRefs(frame: Pick<Frame, 'id' | 'canvasId'>, html: string) {
+  const frameId = frame.id
+  const ids = [...extractAssetIds(assetView(frame.canvasId, html))]
   await db.delete(t.assetRefs).where(eq(t.assetRefs.frameId, frameId))
   if (ids.length) {
     await db
@@ -866,8 +1044,14 @@ export function deleteCanvas(canvasId: string) {
   swallow(db.delete(t.activity).where(eq(t.activity.canvasId, canvasId)))
   swallow(db.delete(t.guidelines).where(eq(t.guidelines.canvasId, canvasId)))
   swallow(
-    pendingComponentWrites(canvasId).then(() => db.delete(t.components).where(eq(t.components.canvasId, canvasId))),
+    pendingComponentWrites(canvasId).then(async () => {
+      await db.delete(t.components).where(eq(t.components.canvasId, canvasId))
+      await db.delete(t.componentRevisions).where(eq(t.componentRevisions.canvasId, canvasId))
+      const prefix = componentKey(canvasId, '')
+      for (const key of revisionsFiled.keys()) if (key.startsWith(prefix)) revisionsFiled.delete(key)
+    }),
   )
+  swallow(db.delete(t.storybookSources).where(eq(t.storybookSources.canvasId, canvasId)))
   swallow(db.delete(t.libraryComponents).where(eq(t.libraryComponents.canvasId, canvasId)))
   swallow(db.delete(t.guidelineVersions).where(eq(t.guidelineVersions.canvasId, canvasId)))
   swallow(
@@ -904,8 +1088,8 @@ export function deleteFrame(frameId: string) {
 function scopeField(scope: string | null): Pick<AgentTask, 'scope'> {
   if (!scope) return {}
   try {
-    const parsed = JSON.parse(scope) as CardScope
-    return typeof parsed?.frameId === 'string' ? { scope: parsed } : {}
+    const parsed = parseCardScope(JSON.parse(scope))
+    return parsed ? { scope: parsed } : {}
   } catch {
     return {}
   }
@@ -963,6 +1147,7 @@ export function saveTask(canvasId: string, task: AgentTask) {
     id: task.id,
     canvasId,
     agentName: task.agentName,
+    agentKey: task.agentKey ?? null,
     owner: task.owner ?? null,
     color: task.color,
     status: task.status,
@@ -994,6 +1179,7 @@ export function saveTask(canvasId: string, task: AgentTask) {
           endedAt: row.endedAt,
           status: row.status,
           agentName: row.agentName,
+          agentKey: row.agentKey,
           color: row.color,
           claimedAt: row.claimedAt,
           failedAt: row.failedAt,
@@ -1132,6 +1318,11 @@ export function saveActivity(canvasId: string, item: ActivityItem) {
 /** Flush pending debounced frame writes and queued version writes (called
  *  on shutdown): a design must not survive a restart without its history. */
 export async function flush(getFrame: (id: string) => Frame | undefined): Promise<void> {
+  /* a component write waiting out a retry gets its last try now: a frame's row waits for
+     its canvas's component writes (it may hold references to them), and must not sit out
+     the wait behind one */
+  draining = true
+  for (const wake of [...retryWaits]) wake()
   /* every dirty frame, a failed write included, not only the debounced ones */
   const ids = [...dirtyFrames.keys()]
   for (const [, timer] of frameTimers) clearTimeout(timer)
@@ -1143,8 +1334,6 @@ export async function flush(getFrame: (id: string) => Frame | undefined): Promis
     }),
   )
   await pendingVersionWrites(() => true)
-  draining = true
-  for (const wake of [...retryWaits]) wake()
   await pendingComponentWrites()
 }
 
@@ -1167,6 +1356,9 @@ export interface Hydrated {
 
 const LOG_CAP = 100
 
+/* every column but the retired inline history, which is most of the table's bytes */
+const { legacyHistory: _legacyHistory, ...componentColumns } = getTableColumns(t.components)
+
 export async function hydrate(): Promise<Hydrated> {
   const [
     canvasRows,
@@ -1177,6 +1369,7 @@ export async function hydrate(): Promise<Hydrated> {
     activityRows,
     guidelineRows,
     componentRows,
+    revisionRowsStored,
     tokenRows,
     referenceRows,
     decisionRows,
@@ -1192,7 +1385,8 @@ export async function hydrate(): Promise<Hydrated> {
     db.select().from(t.comments).orderBy(desc(t.comments.at)),
     db.select().from(t.activity).orderBy(desc(t.activity.at)),
     db.select().from(t.guidelines).orderBy(t.guidelines.name),
-    db.select().from(t.components).orderBy(t.components.name),
+    db.select(componentColumns).from(t.components).orderBy(t.components.name),
+    db.select().from(t.componentRevisions).orderBy(t.componentRevisions.rev),
     db.select().from(t.designTokens).orderBy(t.designTokens.order, t.designTokens.name),
     db.select().from(t.memoryReferences).orderBy(desc(t.memoryReferences.pinnedAt)),
     db.select().from(t.decisions).orderBy(desc(t.decisions.at)),
@@ -1251,16 +1445,32 @@ export async function hydrate(): Promise<Hydrated> {
       pinnedAt: r.pinnedAt,
     })
   }
+  /* oldest first, as bumpRevision keeps them */
+  const histories = new Map<string, ComponentSnapshot[]>()
+  for (const { canvasId, componentId, renderRev, ...kept } of revisionRowsStored) {
+    const entry: ComponentSnapshot = renderRev == null ? kept : { ...kept, renderRev }
+    const key = componentKey(canvasId, componentId)
+    const history = histories.get(key)
+    if (history) history.push(entry)
+    else histories.set(key, [entry])
+  }
+  revisionsFiled.clear()
   for (const row of componentRows) {
     const c = byId.get(row.canvasId)
     if (!c) continue
-    const { canvasId: _canvasId, code, source, status, deletedAt, deletedBy, ...def } = row
-    ;(c.components ??= []).push({
+    const { canvasId: _canvasId, code, source, status, deletedAt, deletedBy, renderRev, ...def } = row
+    const history = (histories.get(componentKey(row.canvasId, row.id)) ?? []).slice(-MAX_COMPONENT_HISTORY)
+    noteRevisionsFiled(row.canvasId, row.id, history)
+    const read: ComponentDef = {
       ...def,
+      ...(renderRev != null && renderRev < def.rev ? { renderRev } : {}),
+      history,
       ...(code ? { code } : {}),
       ...(source ? { source } : {}),
       ...(status === 'deleted' ? { status, deletedAt: deletedAt ?? def.updatedAt, deletedBy: deletedBy ?? '' } : {}),
-    })
+    }
+    storedDefs.add(read)
+    ;(c.components ??= []).push(read)
   }
   for (const g of guidelineRows) {
     const c = byId.get(g.canvasId)
@@ -1314,6 +1524,7 @@ export async function hydrate(): Promise<Hydrated> {
     list.push({
       id: row.id,
       agentName: row.agentName,
+      ...(row.agentKey != null ? { agentKey: row.agentKey } : {}),
       ...(row.owner != null ? { owner: row.owner } : {}),
       color: row.color,
       status: row.status,

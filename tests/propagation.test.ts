@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('../server/db/persist.ts', () => ({
   saveCanvas: () => {},
+  refreshAssetRefs: () => {},
   saveFrame: () => {},
   saveActivity: () => {},
   saveFrameVersion: () => {},
@@ -32,6 +33,7 @@ import * as propagation from '../server/propagation.ts'
 import { blankComponent, prepareFrameHtml } from '../server/components.ts'
 import { updateComponent } from '../server/componentActions.ts'
 import { withCanvasFaces } from '../server/canvasFaces.ts'
+import { composedHtml } from '../server/frameCompose.ts'
 import { referencesComponent } from '../server/components.ts'
 import { COMPONENT_ATTR, type ComponentDef } from '../shared/components.ts'
 import type { Actor, Canvas } from '../shared/types.ts'
@@ -42,7 +44,8 @@ const actor = { name: 'Tester', kind: 'user', color: '#000', clientId: 'x' } as 
 const doc = (body: string, css = '') =>
   `<!doctype html><html><head><style>${css}</style></head><body>${body}</body></html>`
 
-const framed = (id: string) => store.getFrame(id)!.html
+/* as rendered: a frame stores its source, and these cases are about what it shows */
+const framed = (id: string) => composedHtml(store.getFrame(id)!.canvasId, store.getFrame(id)!.html)
 const current = (canvasId: string, id: string) => store.getComponents(canvasId).find((d) => d.id === id)!
 
 /** A Button main, a Card main built from it, and `pages` frames using one or both. */
@@ -88,6 +91,22 @@ function library(pages: number) {
   return { canvas, button, buttonMain, card, cardMain, frames }
 }
 
+/* A frame that follows a changed main is rendered again in memory (store.rerenderFrame) where
+   what it stores, its instances as references, is unchanged; it is written (store.updateFrame)
+   only where that changed too. Either way it is one visit of the queue. */
+type FrameChange = (frameId: string, ...rest: unknown[]) => ReturnType<typeof store.updateFrame>
+
+function onFrameChanges(seen: (frameId: string, changed: ReturnType<typeof store.updateFrame>) => void) {
+  for (const method of ['updateFrame', 'rerenderFrame'] as const) {
+    const real = (Object.getPrototypeOf(store) as Record<string, FrameChange>)[method]!
+    vi.spyOn(store, method).mockImplementation(((frameId: string, ...rest: unknown[]) => {
+      const changed = real.call(store, frameId, ...rest)
+      seen(frameId, changed)
+      return changed
+    }) as never)
+  }
+}
+
 const restyle = (frameId: string, cls: string) =>
   actions.updateFrame(
     frameId,
@@ -119,7 +138,9 @@ function oldPropagateComponents(canvasId: string, changed: ComponentDef[], origi
   }
 }
 
-const htmlOf = (canvas: Canvas) => Object.fromEntries(canvas.frames.map((frame) => [frame.id, frame.html]))
+/* as rendered: the queue stores each frame's source, the old sweep the composed document */
+const htmlOf = (canvas: Canvas) =>
+  Object.fromEntries(canvas.frames.map((frame) => [frame.id, composedHtml(canvas.id, frame.html)]))
 const defsOf = (canvas: Canvas) =>
   (canvas.components ?? []).map(({ updatedAt: _at, history, ...def }) => ({
     ...def,
@@ -184,7 +205,7 @@ describe('the propagation queue', () => {
     expect(defsOf(canvas)).toEqual(queued.defs)
   })
 
-  it('writes at most one frame per tick', async () => {
+  it('changes at most one frame per tick', async () => {
     const { buttonMain } = library(30)
     await propagation.whenIdle()
     let turn = 0
@@ -195,10 +216,7 @@ describe('the propagation queue', () => {
         run()
       })) as typeof setImmediate)
     const perTurn = new Map<number, number>()
-    vi.spyOn(store, 'updateFrame').mockImplementation(function (this: typeof store, ...args) {
-      perTurn.set(turn, (perTurn.get(turn) ?? 0) + 1)
-      return Object.getPrototypeOf(store).updateFrame.apply(store, args)
-    })
+    onFrameChanges(() => perTurn.set(turn, (perTurn.get(turn) ?? 0) + 1))
 
     restyle(buttonMain.id, 'fresh')
     perTurn.clear()
@@ -246,10 +264,8 @@ describe('the propagation queue', () => {
     const two = library(9)
     await propagation.whenIdle()
     const order: string[] = []
-    vi.spyOn(store, 'updateFrame').mockImplementation(function (this: typeof store, ...args) {
-      const frame = Object.getPrototypeOf(store).updateFrame.apply(store, args)
+    onFrameChanges((_frameId, frame) => {
       if (frame) order.push(frame.canvasId === one.canvas.id ? 'one' : 'two')
-      return frame
     })
     restyle(one.buttonMain.id, 'fresh')
     restyle(two.buttonMain.id, 'fresh')
@@ -263,13 +279,11 @@ describe('the propagation queue', () => {
   it('coalesces a burst of edits to one main into one visit per frame and one activity line', async () => {
     const { canvas, buttonMain, frames } = library(9)
     await propagation.whenIdle()
-    const writes = vi.spyOn(store, 'updateFrame')
+    const perFrame = new Map<string, number>()
     for (const cls of ['a', 'b', 'c', 'd', 'e']) restyle(buttonMain.id, cls)
-    writes.mockClear()
+    onFrameChanges((frameId) => perFrame.set(frameId, (perFrame.get(frameId) ?? 0) + 1))
 
     await propagation.whenIdle()
-    const perFrame = new Map<string, number>()
-    for (const [frameId] of writes.mock.calls) perFrame.set(frameId, (perFrame.get(frameId) ?? 0) + 1)
     expect(perFrame.size).toBe(7)
     expect([...perFrame.values()].every((count) => count === 1)).toBe(true)
     expect(framed(frames[1]!.id)).toContain('btn e')
@@ -278,15 +292,26 @@ describe('the propagation queue', () => {
     expect(lines[0]!.message).toBe('updated “Button” in 7 frames')
   })
 
-  it('holds the canvas while work is pending and lets go when it drains', async () => {
-    const { canvas, buttonMain } = library(3)
+  /* it used to load the whole canvas and hold it until the queue drained. A frame at rest
+     holds references to its components (server/frameRest.ts), so only frames in memory are
+     visited, and a canvas is neither read nor kept for it */
+  it('holds no canvas for a changed main: frames that leave memory mid-drain are passed over', async () => {
+    const { canvas, buttonMain, frames } = library(3)
     await propagation.whenIdle()
+    const changed: string[] = []
     restyle(buttonMain.id, 'fresh')
-    expect(store.stats().held).toBeGreaterThan(0)
-    store.evictIdle(0, Date.now() + 1)
-    expect(store.isLoaded(canvas.id)).toBe(true)
-    await propagation.whenIdle()
     expect(store.stats().held).toBe(0)
+    expect(propagation.pendingFrames(canvas.id)).toBeGreaterThan(0)
+    onFrameChanges((frameId) => changed.push(frameId))
+    const load = vi.spyOn(store, 'load')
+    store.evictIdle(0, Date.now() + 1)
+    expect(store.isLoaded(canvas.id)).toBe(false)
+
+    await propagation.whenIdle()
+    expect(changed).toEqual([])
+    expect(load).not.toHaveBeenCalled()
+    expect(store.isLoaded(canvas.id)).toBe(false)
+    expect(frames).toHaveLength(3)
   })
 
   it('still skips propagation on frame writes while the kill switch is on', async () => {
@@ -307,17 +332,6 @@ describe('what a component update reports', () => {
     const { canvas, buttonMain, frames } = library(6)
     await propagation.whenIdle()
     const before = htmlOf(canvas)
-
-    const dry = updateComponent(
-      canvas.id,
-      'Button',
-      { find: 'class="btn"', replace: 'class="btn big"', dryRun: true },
-      actor,
-    )
-    expect(dry.propagation).toBeUndefined()
-    expect(dry.impact.frames).toHaveLength(5)
-    expect(htmlOf(canvas)).toEqual(before)
-    expect(propagation.pendingFrames(canvas.id)).toBe(0)
 
     const applied = updateComponent(canvas.id, 'Button', { find: 'class="btn"', replace: 'class="btn big"' }, actor)
     expect(applied.propagation).toEqual({ status: 'queued', frames: 5 })

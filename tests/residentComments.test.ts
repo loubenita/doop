@@ -4,6 +4,7 @@ import type { Frame } from '../shared/types.ts'
 /* Replies are persisted and broadcast like any comment; these tests only
    care about what lands in the thread, so both sides are stubbed. */
 vi.mock('../server/db/persist.ts', () => ({
+  refreshAssetRefs: () => {},
   saveFrame: () => {},
   saveFrameNow: async () => {},
   saveCanvas: () => {},
@@ -94,6 +95,16 @@ describe('the resident agent replying in a thread', () => {
     const posted = replyInThread(CANVAS, c.id, `Seen "@@${DEFAULT_ROLE_ID} now" — on it.`, actor(), run())
     expect(posted.ok).toBe(true)
     expect(texts(c.id)[1]).toBe(`${AGENT}: Seen "${DEFAULT_ROLE_ID} now" — on it.`)
+    expect(actions.takeAgentCommentsFor(CANVAS, AGENT, 'alice')).toEqual([])
+  })
+
+  it("keeps a person's mention whose name starts like an agent's, and queues no agent work", async () => {
+    const c = await ask()
+    const fan = { id: 'u-fan', name: `${DEFAULT_ROLE_ID} Fan` }
+    const posted = replyInThread(CANVAS, c.id, `Done. @${fan.name}, take a look`, actor(), run(), false, [fan])
+    expect(posted.ok).toBe(true)
+    expect(texts(c.id)[1]).toBe(`${AGENT}: Done. @${fan.name}, take a look`)
+    expect(posted.ok && posted.reply.forAgent).toBeFalsy()
     expect(actions.takeAgentCommentsFor(CANVAS, AGENT, 'alice')).toEqual([])
   })
 

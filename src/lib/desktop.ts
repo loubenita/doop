@@ -1,5 +1,6 @@
 /* Doop in the desktop shell (desktop/src-tauri). The shell is one webview
-   with an overlay title bar; canvases open Figma-style in a tab strip the
+   with an overlay title bar (on Windows, a frame the page draws:
+   windowFrame.ts); canvases open Figma-style in a tab strip the
    web app draws itself (src/components/DesktopTabs.tsx). Tabs are ordinary
    in-page navigations — this module only keeps the strip's state and the
    shell-specific plumbing. In a plain browser every entry point returns
@@ -19,11 +20,13 @@ import {
   rememberPendingSignIn,
 } from './desktopAuth'
 import { isDesktopShell } from './shell'
+import { initWindowFrame } from './windowFrame'
 import { codexSetupTarget } from './codexConnection'
 import { forgetPendingConnect, isPendingConnect, parseDesktopConnectLink } from './desktopConnect'
 import { safeRelativeTarget } from './safeTarget'
 import { NO_CANVAS, isViewCommand, runViewCommand, syncViewMenu } from './viewMenu'
 import { initAppMenu } from './appMenu'
+import { pressedKey } from './keys'
 import { type Chord, matchesChord } from './actions/chords'
 
 export type CanvasTab = { id: string; name: string }
@@ -117,6 +120,11 @@ export function pruneTabs(liveIds: ReadonlySet<string>) {
   if (next.length !== tabs.length) setTabs(next)
 }
 
+/** a canvas renamed elsewhere (Home): its open tab, if any, follows; opens none */
+export function renameTab(id: string, name: string) {
+  if (useTabs.getState().tabs.some((t) => t.id === id)) ensureTab(id, name)
+}
+
 export function closeTab(id: string, currentPath: string) {
   const { tabs } = useTabs.getState()
   const at = tabs.findIndex((t) => t.id === id)
@@ -138,6 +146,22 @@ export function closeOtherTabs(id: string, currentPath: string) {
   if (!keep) return
   setTabs([keep])
   if (currentPath !== `/c/${id}`) navigate(`/c/${id}`)
+}
+
+/** Move a tab to a new position in the strip — DesktopTabs' drag-and-drop
+ *  commits through this. The index clamps to the strip's bounds, and a tab
+ *  that isn't open or would not move is a no-op, so the persisted order
+ *  and the ⌘1…⌘9 slots simply follow. */
+export function moveTab(id: string, toIndex: number) {
+  const { tabs } = useTabs.getState()
+  const from = tabs.findIndex((t) => t.id === id)
+  if (from < 0) return
+  const to = Math.max(0, Math.min(toIndex, tabs.length - 1))
+  const tab = tabs[from]
+  if (!tab || to === from) return
+  const next = tabs.filter((t) => t.id !== id)
+  next.splice(to, 0, tab)
+  setTabs(next)
 }
 
 /** ⌘1 (Ctrl+1 elsewhere) goes Home and ⌘2…⌘9 to the open tabs in strip
@@ -334,6 +358,8 @@ export function openExternal(url: string): boolean {
  *  browser instead. Runs once from main.tsx; no-op outside the shell. */
 export function initDesktopShell() {
   if (!isDesktopShell()) return
+  /* Windows: the page's caption buttons take over from the native frame */
+  initWindowFrame().catch(console.error)
   /* Cmd+W: on macOS the shell's menu owns the shortcut (main.rs) and relays
      it as an event — the page never sees the keystroke. Windows has no menu
      bar, so Ctrl+W arrives as a plain keydown. Both close the active tab. */
@@ -352,7 +378,7 @@ export function initDesktopShell() {
   listenForDesktopLinks()
   /* capture phase, so a field that stops its keys (the zoom input, a colour
      field) cannot swallow the tab and Settings shortcuts; a frame relays them from inside
-     too, text editing included (frameRuntime.ts) */
+     too, text editing included (src/frame-runtime/keyRelay.ts) */
   document.addEventListener(
     'keydown',
     (e) => {
@@ -364,7 +390,7 @@ export function initDesktopShell() {
     true,
   )
   document.addEventListener('keydown', (e) => {
-    if (e.key.toLowerCase() !== 'w' || !(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey) return
+    if (pressedKey(e) !== 'w' || !(e.metaKey || e.ctrlKey) || e.shiftKey || e.altKey) return
     e.preventDefault()
     closeActiveTab()
   })

@@ -8,6 +8,7 @@ import {
   type DefaultTreeAdapterTypes as Tree,
 } from 'parse5'
 import { parse, parseFragment } from './workBudget.ts'
+import { insertIntoHead, stripComponentHead, syncComponentHead, usedComponentIds } from '../shared/frameCompose.ts'
 import {
   BIND_ATTR,
   COMPONENT_ATTR,
@@ -15,7 +16,6 @@ import {
   DETACHED_ATTR,
   DETACHED_CSS_ATTR,
   IF_ATTR,
-  HEAD_ATTR,
   INSTANCE_ATTR,
   MAX_INSTANCE_DEPTH,
   MAX_NESTING_DEPTH,
@@ -30,6 +30,8 @@ import {
   isDeleted,
   isHollow,
   isPropName,
+  renderRevOf,
+  stateAtRev,
   parseBindings,
   parseCondition,
   parseStyle,
@@ -60,7 +62,8 @@ type Element = Tree.Element
 type ChildNode = Tree.ChildNode
 type ParentNode = Tree.ParentNode
 
-export type Revision = Pick<ComponentDef, 'id' | 'name' | 'template' | 'props' | 'rev'>
+/** `rev` with `renderRev`: the revision its instances are marked with (`renderRevOf`). */
+export type Revision = Pick<ComponentDef, 'id' | 'name' | 'template' | 'props' | 'rev' | 'renderRev'>
 
 export interface EngineContext {
   /** a component by id or name */
@@ -68,6 +71,83 @@ export interface EngineContext {
   /** a component as it was at a revision, when that revision is still kept */
   atRev(id: string, rev: number): Revision | undefined
   issues: ComponentIssue[]
+  /** Reading stored HTML back (server/frameRest.ts): what stands where a `<doop-use>`
+   *  cannot be rendered, in place of leaving it out. With it set, a reference is never
+   *  dropped: a deleted component still renders (the frame was stored before the
+   *  delete), and one that cannot render at all, or holds a component that cannot,
+   *  becomes what this returns for its source text. */
+  lost?(use: string, ref: string, why: string): string
+}
+
+/** A context over a list of definitions as it stands when asked: an id is exact, deleted
+ *  or not, since markup already on the canvas points at it; a name means the component
+ *  in use, and a deleted one answers to its name only when nothing else has it, so that
+ *  asking for it says "deleted" rather than "unknown". */
+export function contextOfDefs(defs: () => readonly ComponentDef[]): EngineContext {
+  return {
+    find(ref) {
+      const all = defs()
+      const wanted = ref.trim().toLowerCase()
+      const named = all.filter((def) => def.name.toLowerCase() === wanted)
+      return all.find((def) => def.id === ref) ?? named.find((def) => !isDeleted(def)) ?? named[0]
+    },
+    atRev(id, rev) {
+      const def = defs().find((candidate) => candidate.id === id)
+      const state = def && stateAtRev(def, rev)
+      if (!def || !state) return undefined
+      return state === def ? def : { id, name: def.name, ...state }
+    },
+    issues: [],
+  }
+}
+
+/** Thrown while rendering for a context with `lost`: a component nested in the template
+ *  being rendered is missing or renders nothing, so the reference that led here is kept
+ *  whole (as its placeholder, or as the markup it already was) rather than rendered short. */
+export class UnrenderableUse extends Error {
+  readonly ref: string
+  readonly why: string
+
+  constructor(ref: string, why: string) {
+    super(`component “${ref}” cannot be rendered: ${why}`)
+    this.ref = ref
+    this.why = why
+    this.name = 'UnrenderableUse'
+  }
+}
+
+/** A `<doop-use>` that could not be rendered when its frame was read from storage, kept
+ *  visible and whole: the element says which component is missing and carries the
+ *  reference's source text, so the next save stores the reference again and a later read
+ *  (the definition repaired) renders it. base64url: nothing in it needs escaping, however
+ *  a browser serializes the attribute on the way back. */
+export const LOST_USE_ATTR = 'data-doop-lost-use'
+
+const LOST_USE_STYLE =
+  'display:inline-block;box-sizing:border-box;padding:6px 10px;border:1px dashed #d92d20;border-radius:6px;background:#fff5f4;color:#b42318;font:12px/1.4 system-ui,sans-serif'
+
+export function lostUsePlaceholder(use: string, name: string): string {
+  const source = Buffer.from(use, 'utf8').toString('base64url')
+  const label = name.replace(/[&<>]/g, ' ')
+  return `<div ${LOST_USE_ATTR}="${source}" style="${LOST_USE_STYLE}">Missing component: ${label}</div>`
+}
+
+/* wherever the attribute stands among the others: an editor may add its own (an element id) */
+const LOST_USE = new RegExp(`<div\\b[^>]*?\\s${LOST_USE_ATTR}="([A-Za-z0-9_-]*)"[^>]*>[^<]*</div>`, 'g')
+
+/** The component a `<doop-use>`'s source text names. */
+export function useRef(use: string): string {
+  return /\bcomponent\s*=\s*["']([^"']*)["']/i.exec(use)?.[1] ?? ''
+}
+
+/** Placeholders turned back into the references they keep; `wanted` picks which (by the
+ *  component each names), all of them without it. */
+export function reviveLostUses(html: string, wanted?: (ref: string, use: string) => boolean): string {
+  if (!html.includes(LOST_USE_ATTR)) return html
+  return html.replace(LOST_USE, (placeholder, source: string) => {
+    const use = Buffer.from(source, 'base64url').toString('utf8')
+    return !wanted || wanted(useRef(use), use) ? use : placeholder
+  })
 }
 
 export interface InstanceState {
@@ -110,8 +190,70 @@ function setChildrenFromHtml(el: Element, markup: string) {
   for (const child of el.childNodes) child.parentNode = el
 }
 
+/* A template is parsed once and kept: rendering an instance clones the kept tree, and
+   reading one (its part keys, its bindings) looks at it without changing it. A page of
+   thousands of instances of a few components then costs a few parses, not thousands,
+   which is what makes expanding stored `<doop-use>` references on every page load
+   affordable (server/frameRest.ts). Bounded by count and by the markup held. */
+const MAX_KEPT_TEMPLATES = 1000
+const MAX_KEPT_TEMPLATE_CHARS = 16_000_000
+const keptTemplates = new Map<string, { root: Element | undefined; parts?: Map<string, PartInfo> }>()
+let keptTemplateChars = 0
+
+function keptTemplate(template: string) {
+  const kept = keptTemplates.get(template)
+  if (kept) {
+    /* most recently used last */
+    keptTemplates.delete(template)
+    keptTemplates.set(template, kept)
+    return kept
+  }
+  const entry: { root: Element | undefined; parts?: Map<string, PartInfo> } = {
+    root: elementKids(rootFragment(template))[0],
+  }
+  keptTemplates.set(template, entry)
+  keptTemplateChars += template.length
+  for (const oldest of keptTemplates.keys()) {
+    if (keptTemplates.size <= MAX_KEPT_TEMPLATES && keptTemplateChars <= MAX_KEPT_TEMPLATE_CHARS) break
+    if (oldest === template) break
+    keptTemplates.delete(oldest)
+    keptTemplateChars -= oldest.length
+  }
+  return entry
+}
+
+/** For a test that counts parses. */
+export function forgetKeptTemplates() {
+  keptTemplates.clear()
+  keptTemplateChars = 0
+}
+
+function cloneNode<N extends ChildNode>(node: N, parent: ParentNode): N {
+  if (!isElement(node)) return { ...node, parentNode: parent }
+  const copy = { ...node, attrs: node.attrs.map((attr) => ({ ...attr })), parentNode: parent } as Element
+  copy.childNodes = node.childNodes.map((child) => cloneNode(child, copy))
+  const content = (node as Tree.Template).content as Tree.DocumentFragment | undefined
+  if (content) {
+    const fragment = { ...content } as Tree.DocumentFragment
+    fragment.childNodes = content.childNodes.map((child) => cloneNode(child, fragment))
+    ;(copy as Tree.Template).content = fragment
+  }
+  return copy as N
+}
+
+/** A template's root element, the caller's own to change. */
 export function parseTemplateRoot(template: string): Element | undefined {
-  return elementKids(rootFragment(template))[0]
+  const root = keptTemplate(template).root
+  if (!root) return undefined
+  const holder = { nodeName: '#document-fragment', childNodes: [] } as unknown as Tree.DocumentFragment
+  const copy = cloneNode(root, holder)
+  holder.childNodes.push(copy)
+  return copy
+}
+
+/** The kept root itself: to be read, never changed. */
+function templateRootShared(template: string): Element | undefined {
+  return keptTemplate(template).root
 }
 
 /* where a table part can stand: the HTML parser drops a <td> anywhere but in a row */
@@ -249,8 +391,6 @@ interface RenderOptions {
   shallow?: boolean
   /** the instance being rendered: what a nested instance's id is derived from */
   ownerId?: string
-  /** a whole write: nothing more is coming, so an unclosed <doop-use> in slot or override content is placed too */
-  final?: boolean
 }
 
 /** A nested instance has no place of its own to keep an id: the template owns its markup, and the
@@ -348,7 +488,7 @@ function renderPart(
   setAttr(el, SLOT_SUGGEST_ATTR, null)
   if (part) applyPartOverride(el, part)
   const isSlot = attrOf(el, SLOT_ATTR) !== undefined
-  const content = (html: string) => expandUses(html, options.ctx, [], options.depth, { final: options.final })
+  const content = (html: string) => expandOverride(html, options.ctx, options.depth)
   if (part?.html !== undefined) {
     setChildrenFromHtml(el, options.shallow ? part.html : content(part.html))
     return
@@ -373,18 +513,22 @@ function renderUseElement(
   const nested = options.ctx.find(ref)
   if (!nested) {
     options.ctx.issues.push({ code: 'unknown_component', message: `no component “${ref}” on this canvas` })
+    if (options.ctx.lost) throw new UnrenderableUse(ref, 'a component its template is built from is missing')
     return undefined
   }
   const state = part?.use ?? stateFromUseAttrs(use, nested, options.ctx).overrides
   const id = attrOf(use, ELEMENT_ID_ATTR) ?? nestedInstanceId(options.ownerId, outerKey)
   const rendered = renderInstance(nested, nested, state, id, options)
+  if (!rendered && options.ctx.lost)
+    throw new UnrenderableUse(nested.name, 'a component its template is built from renders nothing')
   if (rendered && outerKey) setAttr(rendered, PART_ATTR, outerKey)
   return rendered
 }
 
 function markRoot(root: Element, def: Revision, instanceId: string, overrides: InstanceOverrides) {
   setAttr(root, INSTANCE_ATTR, def.id)
-  setAttr(root, REV_ATTR, String(def.rev))
+  /* where its markup last changed: a revision of the component's rules alone leaves it */
+  setAttr(root, REV_ATTR, String(renderRevOf(def)))
   setAttr(root, ELEMENT_ID_ATTR, instanceId)
   for (const prop of def.props) {
     if (prop.type !== 'enum') continue
@@ -522,8 +666,17 @@ export interface PartInfo {
 }
 
 export function partsOf(template: string): Map<string, PartInfo> {
+  return partsBelow(parseTemplateRoot(template))
+}
+
+/** The same, over the kept tree: for reading only (its elements are shared). */
+function partsOfShared(template: string): Map<string, PartInfo> {
+  const kept = keptTemplate(template)
+  return (kept.parts ??= partsBelow(kept.root))
+}
+
+function partsBelow(root: Element | undefined): Map<string, PartInfo> {
   const parts = new Map<string, PartInfo>()
-  const root = parseTemplateRoot(template)
   if (!root) return parts
   const stack: Element[] = [root]
   for (let el = stack.pop(); el; el = stack.pop()) {
@@ -550,15 +703,16 @@ export function partsOf(template: string): Map<string, PartInfo> {
 }
 
 /** Read an instance's whole state from its markup: the marker's props and overrides,
- *  plus slot content and nested instances found in place. Nothing is diffed here. */
+ *  plus slot content and nested instances found in place. Nothing is diffed here, except that a
+ *  nested instance matching the template's own `<doop-use>` is no override. */
 export function readInstance(el: Element, def: Revision | undefined, ctx: EngineContext): InstanceState | undefined {
   const state = readMarker(el)
   if (!state) return undefined
   if (!def) return state
-  const parts = partsOf(def.template)
+  const parts = partsOfShared(def.template)
   const merged: Record<string, PartOverride> = { ...state.overrides.parts }
   /* by the template's key: a nested root wears the outer component's on it */
-  const rootKey = attrOf(parseTemplateRoot(def.template) ?? el, PART_ATTR)
+  const rootKey = attrOf(templateRootShared(def.template) ?? el, PART_ATTR)
   if (rootKey && parts.get(rootKey)?.isSlot) {
     merged[rootKey] = { ...merged[rootKey], slot: compactChildren(el, ctx) }
     return { ...state, overrides: clean({ ...state.overrides, parts: merged }) }
@@ -570,7 +724,15 @@ export function readInstance(el: Element, def: Revision | undefined, ctx: Engine
     if (key && info?.isUse && attrOf(child, INSTANCE_ATTR)) {
       const nestedDef = ctx.atRev(attrOf(child, INSTANCE_ATTR)!, Number(attrOf(child, REV_ATTR)) || 0)
       const nested = readInstance(child, nestedDef, ctx)
-      if (nested) merged[key] = { ...merged[key], use: nested.overrides }
+      if (nested) {
+        /* the template's own <doop-use> is the main's value, not this instance's override:
+           recorded, it would pin every instance and the main's next change would stop here */
+        const { use: _template, ...rest } = merged[key] ?? {}
+        const same = isTemplateUse(info.el, nested, { ...ctx, issues: [] })
+        if (!same) merged[key] = { ...rest, use: nested.overrides }
+        else if (Object.keys(rest).length) merged[key] = rest
+        else delete merged[key]
+      }
       continue
     }
     if (attrOf(child, INSTANCE_ATTR)) continue
@@ -738,10 +900,14 @@ function diffNested(
   const reconciled = reconcileInstance(incoming, ctx)
   const use = parts.get(key)?.el
   if (!reconciled || !use) return
-  const nested = ctx.find(reconciled.componentId)
-  const defaults = nested ? stateFromUseAttrs(use, nested, ctx).overrides : {}
-  const same = stableJson(defaults) === stableJson(reconciled.overrides)
-  mergeInto(state, key, {}, { use: same ? undefined : reconciled.overrides })
+  mergeInto(state, key, {}, { use: isTemplateUse(use, reconciled, ctx) ? undefined : reconciled.overrides })
+}
+
+/** Whether a nested instance is exactly what the template's own `<doop-use>` renders. */
+function isTemplateUse(use: Element, nested: InstanceState, ctx: EngineContext): boolean {
+  const def = ctx.find(nested.componentId)
+  const defaults = def ? stateFromUseAttrs(use, def, ctx).overrides : {}
+  return stableJson(defaults) === stableJson(nested.overrides)
 }
 
 function mergeInto(
@@ -834,7 +1000,7 @@ export function reconcileInstance(el: Element, ctx: EngineContext): InstanceStat
   if (!known) return marker
   const read = readInstance(el, known, ctx) ?? marker
   if (!revision) return read
-  const parts = partsOf(revision.template)
+  const parts = partsOfShared(revision.template)
   /* the base holds the marker's overrides; slots and nested instances are read from the DOM */
   const base = renderInstance(revision, revision, marker.overrides, marker.instanceId, {
     ctx,
@@ -848,8 +1014,9 @@ export function reconcileInstance(el: Element, ctx: EngineContext): InstanceStat
   }
   const rootKey = attrOf(base, PART_ATTR)
   /* a nested root carries the outer component's key on it */
-  if (rootKey || attrOf(parseTemplateRoot(revision.template)!, PART_ATTR)) {
-    const key = attrOf(parseTemplateRoot(revision.template)!, PART_ATTR) ?? rootKey!
+  const templateKey = attrOf(templateRootShared(revision.template)!, PART_ATTR)
+  if (rootKey || templateKey) {
+    const key = templateKey ?? rootKey!
     setAttr(base, PART_ATTR, key)
     diffPart(base, el, key, parts, revision, true, state, ctx)
   }
@@ -898,7 +1065,7 @@ export function useMarkup(
 ): string {
   const rest: Record<string, PartOverride> = {}
   const slotChildren: string[] = []
-  const slotParts = def ? partsOf(def.template) : new Map<string, PartInfo>()
+  const slotParts = def ? partsOfShared(def.template) : new Map<string, PartInfo>()
   for (const [key, override] of Object.entries(state.overrides.parts ?? {})) {
     const { slot, ...others } = override
     if (slot !== undefined) {
@@ -931,7 +1098,7 @@ const TEMPLATE_ONLY_ATTRS: Record<string, string> = {
 export function stateFromUseAttrs(use: Element, def: Revision, ctx: EngineContext): InstanceState {
   const props: Record<string, string> = {}
   let parts: Record<string, PartOverride> = {}
-  const root = parseTemplateRoot(def.template)
+  const root = templateRootShared(def.template)
   const rootKey = root ? attrOf(root, PART_ATTR) : undefined
   const addRoot = (patch: PartOverride) => {
     if (!rootKey) return
@@ -992,13 +1159,13 @@ export function stateFromUseAttrs(use: Element, def: Revision, ctx: EngineContex
   return {
     instanceId: isElementId(rawId) ? rawId : newElementId(),
     componentId: def.id,
-    rev: def.rev,
+    rev: renderRevOf(def),
     overrides: clean({ props, parts }),
   }
 }
 
 function assignSlots(use: Element, def: Revision, parts: Record<string, PartOverride>) {
-  const slotParts = [...partsOf(def.template)].filter(([, info]) => info.isSlot)
+  const slotParts = [...partsOfShared(def.template)].filter(([, info]) => info.isSlot)
   if (!slotParts.length) return
   const byName = new Map(slotParts.map(([key, info]) => [attrOf(info.el, SLOT_ATTR) ?? '', key]))
   const fallback = slotParts[0]![0]
@@ -1029,9 +1196,9 @@ function templateInner(el: Element): string {
   return content ? serialize(content) : serialize(el)
 }
 
+/* a copy without the attribute: the element may be a kept template's (a nested use's child) */
 function serializeOuterWithoutSlot(el: Element): string {
-  setAttr(el, 'slot', null)
-  return serializeOuter(el)
+  return serializeOuter({ ...el, attrs: el.attrs.filter((attr) => attr.name !== 'slot') } as Element)
 }
 
 /* ------------------------------------------------------------------ */
@@ -1039,7 +1206,8 @@ function serializeOuterWithoutSlot(el: Element): string {
 /* one out of a <table>, and the rest of the document stays byte-exact. */
 /* ------------------------------------------------------------------ */
 
-const OPAQUE = /<(script|style|textarea|title)\b[\s\S]*?<\/\1\s*>|<!--[\s\S]*?-->/gi
+/* the name ends where the tag's does: `<style-chip>` is a custom element, not a stylesheet */
+const OPAQUE = /<(script|style|textarea|title)(?=[\s/>])[\s\S]*?<\/\1\s*>|<!--[\s\S]*?-->/gi
 
 function opaqueRanges(html: string): [number, number][] {
   return [...html.matchAll(OPAQUE)].map((match) => [match.index, match.index + match[0].length])
@@ -1057,6 +1225,26 @@ function tagEnd(html: string, from: number): number {
   return -1
 }
 
+/** The end of a tag found in running HTML, as the tokenizer has it: a quote opens a quoted
+ *  run only where an attribute's value starts (after `=`). An apostrophe in text a stray `<b`
+ *  made into a "tag" (`a<b) it's`) opens none, so the tag ends at the next `>`. */
+function documentTagEnd(html: string, from: number): number {
+  let quote = ''
+  let value = false
+  for (let i = from; i < html.length; i++) {
+    const char = html[i]!
+    if (quote) {
+      if (char === quote) quote = ''
+      continue
+    }
+    if (char === '>') return i
+    if (value && (char === '"' || char === "'")) quote = char
+    if (char === '=') value = true
+    else if (!/\s/.test(char)) value = false
+  }
+  return -1
+}
+
 interface UseSpan {
   start: number
   end: number
@@ -1067,18 +1255,69 @@ interface UseSpan {
   unclosed?: boolean
 }
 
+/** The next `tag` (`<doop-use` or `</doop-use`) from `from` that is one: followed by the end of
+ *  its name (not `<doop-user-chip>`), and outside a script, style, textarea, title or comment. */
+function nextTag(html: string, tag: string, from: number, opaque: [number, number][]): number {
+  let at = indexOfAscii(html, tag, from)
+  while (at !== -1) {
+    const following = html[at + tag.length]
+    const inOpaque = opaque.some(([a, b]) => at >= a && at < b)
+    if (following && /[\s/>]/.test(following) && !inOpaque) return at
+    at = indexOfAscii(html, tag, at + 1)
+  }
+  return -1
+}
+
+/**
+ * Is a position inside a tag, that is, in an attribute's value? An instance's marker keeps
+ * rewritten children as markup in a JSON attribute (`data-doop-overrides`, an `html`
+ * override), and that markup may hold a `<doop-use>` of its own: text of the attribute, not
+ * an element of the document. Expanded where it stands it would break the attribute apart.
+ * Answers for positions asked in rising order, walking the document's tags once.
+ */
+function tagWalker(html: string, opaque: [number, number][]): (at: number) => boolean {
+  /* everything before this is outside any tag */
+  let from = 0
+  /* the opaque ranges come in document order: the first one not yet passed */
+  let ahead = 0
+  return (at) => {
+    while (from < at) {
+      const open = html.indexOf('<', from)
+      if (open === -1 || open >= at) return false
+      while (ahead < opaque.length && opaque[ahead]![1] <= open) ahead++
+      const skipped = opaque[ahead]
+      if (skipped && open >= skipped[0]) {
+        from = skipped[1]
+        continue
+      }
+      const next = html[open + 1]
+      /* as the HTML tokenizer has it: a `<` that starts no tag is text */
+      if (!next || !/[a-zA-Z/!?]/.test(next)) {
+        from = open + 1
+        continue
+      }
+      const end = documentTagEnd(html, open)
+      /* a tag still being written (mid-stream): whatever follows is inside it */
+      if (end === -1 || at < end) return true
+      from = end + 1
+    }
+    return false
+  }
+}
+
 /** The next complete `<doop-use>` from `from`. `lenient` (a whole write, nothing more to come)
  *  takes an open tag whose end never came as empty, so the ones after it still expand. */
-function nextUse(html: string, from: number, opaque: [number, number][], lenient = false): UseSpan | undefined {
+function nextUse(
+  html: string,
+  from: number,
+  opaque: [number, number][],
+  insideTag: (at: number) => boolean,
+  lenient = false,
+): UseSpan | undefined {
   const open = `<${USE_TAG}`
   const close = `</${USE_TAG}`
-  let start = indexOfAscii(html, open, from)
-  while (start !== -1) {
-    const at = start
-    const following = html[at + open.length]
-    if (following && /[\s/>]/.test(following) && !opaque.some(([a, b]) => at >= a && at < b)) break
-    start = indexOfAscii(html, open, at + 1)
-  }
+  let start = nextTag(html, open, from, opaque)
+  while (start !== -1 && insideTag(start)) start = nextTag(html, open, start + 1, opaque)
   if (start === -1) return undefined
   const openEnd = tagEnd(html, start)
   if (openEnd === -1) return undefined
@@ -1088,8 +1327,8 @@ function nextUse(html: string, from: number, opaque: [number, number][], lenient
   let depth = 1
   let cursor = openEnd + 1
   while (depth > 0) {
-    const nextOpen = indexOfAscii(html, open, cursor)
-    const nextClose = indexOfAscii(html, close, cursor)
+    const nextOpen = nextTag(html, open, cursor, opaque)
+    const nextClose = nextTag(html, close, cursor, opaque)
     if (nextClose === -1)
       return lenient
         ? { start, end: openEnd + 1, openEnd, closeStart: openEnd + 1, selfClosing: true, unclosed: true }
@@ -1110,9 +1349,113 @@ function nextUse(html: string, from: number, opaque: [number, number][], lenient
   return undefined
 }
 
+/* the attribute itself, never the end of another's name (data-component) */
+const COMPONENT_ATTR_VALUE = /\scomponent\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>/]+))/i
+
+/** The component an open tag names, as written. */
+function componentRefIn(openTag: string): string {
+  const match = COMPONENT_ATTR_VALUE.exec(openTag)
+  return match?.[1] ?? match?.[2] ?? match?.[3] ?? ''
+}
+
+/** What a whole write does with a `<doop-use>` it leaves open: places it with no slot content. */
+function unclosedIssue(ref: string): ComponentIssue {
+  return {
+    code: 'unclosed_use',
+    component: ref,
+    message: `<${USE_TAG} component="${ref}"> was never closed with </${USE_TAG}>, so it was placed with no slot content. Close every <${USE_TAG}>, or write it self-closing.`,
+  }
+}
+
+/** The `<doop-use>` a whole write cannot read to its end (a quote never closed): the reader stops
+ *  there, so it and everything after it stay as written. */
+function stuckUse(html: string, from: number, opaque: [number, number][]): string | undefined {
+  const at = nextTag(html, `<${USE_TAG}`, from, opaque)
+  if (at === -1) return undefined
+  const end = html.indexOf('>', at)
+  return componentRefIn(html.slice(at, end === -1 ? undefined : end + 1))
+}
+
+/** The component of each `<doop-use>` a whole write of this markup would leave open, in document
+ *  order: what `expandUses` reports as `unclosed_use`, for markup that is parsed rather than
+ *  expanded (a component's template). A tag nested in an open one counts towards its parent. */
+export function unclosedUses(html: string): string[] {
+  if (indexOfAscii(html, `<${USE_TAG}`) === -1) return []
+  const opaque = opaqueRanges(html)
+  const refs: string[] = []
+  let cursor = 0
+  const insideTag = tagWalker(html, opaque)
+  for (
+    let span = nextUse(html, 0, opaque, insideTag, true);
+    span;
+    span = nextUse(html, cursor, opaque, insideTag, true)
+  ) {
+    if (span.unclosed) refs.push(componentRefIn(html.slice(span.start, span.openEnd)))
+    cursor = span.end
+  }
+  const stuck = stuckUse(html, cursor, opaque)
+  return stuck === undefined ? refs : [...refs, stuck]
+}
+
 /** Every complete `<doop-use>` in the HTML, written out in full. One still missing
  *  its end (mid-stream) stays as it is until a later pass; on a whole write (`final`)
  *  nothing more is coming, so it is taken as empty and reported. */
+/** Every outermost `<doop-use>` as a placeholder that keeps its source text, nothing parsed
+ *  and nothing rendered: what a frame is read as when rendering it failed. */
+export function placeholdUses(html: string): string {
+  if (indexOfAscii(html, `<${USE_TAG}`) === -1) return html
+  const opaque = opaqueRanges(html)
+  const insideTag = tagWalker(html, opaque)
+  let out = ''
+  let cursor = 0
+  for (let span = nextUse(html, 0, opaque, insideTag); span; span = nextUse(html, cursor, opaque, insideTag)) {
+    const use = html.slice(span.start, span.end)
+    out += html.slice(cursor, span.start) + lostUsePlaceholder(use, useRef(use))
+    cursor = span.end
+  }
+  return out + html.slice(cursor)
+}
+
+/** The tags whose opens and closes an edit must keep paired (`tagBalance`). */
+export const BALANCED_TAGS = [USE_TAG, 'template'] as const
+export type BalancedTag = (typeof BALANCED_TAGS)[number]
+
+const BALANCED_TAG = /<(\/?)(doop-use|template)(?=[\s/>]|$)/gi
+
+/** How a piece of HTML leaves one of the `BALANCED_TAGS`: `net`, how many more it opens than
+ *  it closes; `low`, the most it has closed beyond what it opened at any point (0 or less). */
+export interface TagCount {
+  net: number
+  low: number
+}
+
+/**
+ * How a piece of HTML opens and closes each `BALANCED_TAGS` tag, read the way `expandUses`
+ * reads a document: tags inside a script, style, textarea, title or comment, and text inside
+ * another tag's attribute (an instance's override JSON), are not tags. A self-closing
+ * `<doop-use/>` is complete; a `<template/>` opens one, as the HTML parser has it.
+ */
+export function tagBalance(html: string): Record<BalancedTag, TagCount> {
+  const balance: Record<BalancedTag, TagCount> = { [USE_TAG]: { net: 0, low: 0 }, template: { net: 0, low: 0 } }
+  const opaque = opaqueRanges(html)
+  const insideTag = tagWalker(html, opaque)
+  for (const match of html.matchAll(BALANCED_TAG)) {
+    const at = match.index
+    if (opaque.some(([a, b]) => at >= a && at < b) || insideTag(at)) continue
+    const tag = match[2]!.toLowerCase() as BalancedTag
+    const count = balance[tag]
+    if (match[1]) {
+      count.net--
+      count.low = Math.min(count.low, count.net)
+      continue
+    }
+    const end = tagEnd(html, at)
+    if (tag === USE_TAG && end !== -1 && html[end - 1] === '/') continue
+    count.net++
+  }
+  return balance
+}
+
 export function expandUses(
   html: string,
   ctx: EngineContext,
@@ -1120,49 +1463,56 @@ export function expandUses(
   depth = 0,
   { final = false }: { final?: boolean } = {},
 ): string {
+  /* a reference kept as a placeholder is tried again whenever stored HTML is read */
+  if (ctx.lost) html = reviveLostUses(html)
   if (indexOfAscii(html, `<${USE_TAG}`) === -1) return html
   const opaque = opaqueRanges(html)
+  const insideTag = tagWalker(html, opaque)
+  const next = (from: number) => nextUse(html, from, opaque, insideTag, final)
   let out = ''
   let cursor = 0
-  for (let span = nextUse(html, 0, opaque, final); span; span = nextUse(html, cursor, opaque, final)) {
+  for (let span = next(0); span; span = next(cursor)) {
     out += html.slice(cursor, span.start)
-    if (span.unclosed) {
-      const ref = /\bcomponent\s*=\s*["']([^"']*)["']/i.exec(html.slice(span.start, span.openEnd))?.[1] ?? ''
-      ctx.issues.push({
-        code: 'unclosed_use',
-        message: `<${USE_TAG} component="${ref}"> was never closed with </${USE_TAG}>, so it was placed with no slot content. Close every <${USE_TAG}>, or write it self-closing.`,
-      })
-    }
-    out += expandOne(html, span, ctx, stack, depth, final)
+    if (span.unclosed) ctx.issues.push(unclosedIssue(componentRefIn(html.slice(span.start, span.openEnd))))
+    out += expandOne(html, span, ctx, stack, depth)
     cursor = span.end
   }
+  /* a tag that cannot be read to its end leaves it and the rest as written: no less left open */
+  const stuck = final ? stuckUse(html, cursor, opaque) : undefined
+  if (stuck !== undefined) ctx.issues.push(unclosedIssue(stuck))
   return out + html.slice(cursor)
 }
 
-function expandOne(
-  html: string,
-  span: UseSpan,
-  ctx: EngineContext,
-  stack: string[],
-  depth: number,
-  final: boolean,
-): string {
+/** Slot or override content, which is whole by the time it renders (a closed use's slot, an
+ *  overrides string), mid-stream too: a <doop-use> it leaves open is placed empty, never left for
+ *  the parser to close, and its issue says no later chunk can close it (`inOverride`). */
+function expandOverride(html: string, ctx: EngineContext, depth: number | undefined): string {
+  const from = ctx.issues.length
+  const out = expandUses(html, ctx, [], depth, { final: true })
+  for (const issue of ctx.issues.slice(from)) if (issue.code === 'unclosed_use') issue.inOverride = true
+  return out
+}
+
+function expandOne(html: string, span: UseSpan, ctx: EngineContext, stack: string[], depth: number): string {
   const openTag = html.slice(span.start, span.openEnd + 1).replace(/\/>$/, '>')
   const inner = span.selfClosing ? '' : html.slice(span.openEnd + 1, span.closeStart)
   const use = elementKids(parseFragment(`${openTag}${inner}</${USE_TAG}>`))[0]
+  /* stored HTML being read back: the reference stays, as a placeholder that keeps its text */
+  const lost = (ref: string, why: string) => ctx.lost?.(html.slice(span.start, span.end), ref, why) ?? ''
   if (!use) {
     ctx.issues.push({ code: 'unknown_component', message: `a <${USE_TAG}> could not be read, so it was left out` })
-    return ''
+    return lost('', 'the reference could not be read')
   }
   const ref = attrOf(use, 'component') ?? ''
   const def = ctx.find(ref)
   if (!def) {
     ctx.issues.push({ code: 'unknown_component', message: `no component “${ref}” on this canvas` })
-    return ''
+    return lost(ref, 'no such component on this canvas')
   }
   /* a deleted component takes no new use. One a template already holds (it wears its part
-     key) is not new: a component built from a deleted one keeps rendering as it did */
-  if (isDeleted(def) && attrOf(use, PART_ATTR) === undefined) {
+     key) is not new: a component built from a deleted one keeps rendering as it did. Nor is
+     one read back from storage: its frame was stored before the delete */
+  if (isDeleted(def) && attrOf(use, PART_ATTR) === undefined && !ctx.lost) {
     ctx.issues.push({
       code: 'deleted_component',
       message: `“${def.name}” was deleted from this canvas, so it was not placed. Restore it (restore_component) to use it again, or use another component.`,
@@ -1170,8 +1520,14 @@ function expandOne(
     return ''
   }
   const state = stateFromUseAttrs(use, def, ctx)
-  const root = renderInstance(def, def, state.overrides, state.instanceId, { ctx, stack, depth, final })
-  if (!root) return ''
+  let root: Element | undefined
+  try {
+    root = renderInstance(def, def, state.overrides, state.instanceId, { ctx, stack, depth })
+  } catch (error) {
+    if (!(error instanceof UnrenderableUse) || !ctx.lost) throw error
+    return lost(ref, error.why)
+  }
+  if (!root) return lost(ref, 'the component renders nothing')
   /* a template read back by update_component keeps the nested instance's key, and its overrides
      with it. One that names none gets no key from the component it renders: that is the
      component's own root key, the same for every use of it, so a second keyless use in a main
@@ -1263,6 +1619,48 @@ export function splice(html: string, edits: { start: number; end: number; text: 
   return out
 }
 
+/**
+ * Every outermost instance reconciled (what was edited becomes its overrides) and rendered at
+ * its component's current revision; markup that needs nothing stays byte for byte. An instance
+ * of a component the canvas does not have becomes plain markup, unless `keepUnknown` (stored
+ * HTML being read back, where nothing is to be decided about it).
+ */
+export function prepareInstances(html: string, ctx: EngineContext, { keepUnknown = false } = {}): string {
+  const edits: { start: number; end: number; text: string }[] = []
+  for (const found of findMarked(html, INSTANCE_ATTR)) {
+    const id = attrOf(found.el, INSTANCE_ATTR) ?? ''
+    const def = ctx.find(id)
+    if (!def) {
+      if (keepUnknown) continue
+      /* its component was deleted, or this came from another canvas: plain markup */
+      for (const name of [INSTANCE_ATTR, REV_ATTR, PROPS_ATTR, OVERRIDES_ATTR]) setAttr(found.el, name, null)
+      edits.push({ start: found.start, end: found.end, text: serializeOuter(found.el) })
+      continue
+    }
+    /* its component was deleted: the instance keeps the markup it has, untouched. So does one
+       holding an instance of a hollow component: rendered again, that instance would be lost */
+    if (isDeleted(def) || holdsHollow(found.el, ctx)) continue
+    const before = serializeOuter(found.el)
+    const state = reconcileInstance(found.el, ctx)
+    if (!state) continue
+    let rendered: Element | undefined
+    try {
+      /* only a whole write gets here: nothing more is coming for the content it holds */
+      rendered = renderInstance(def, def, state.overrides, state.instanceId, { ctx, stack: [] })
+    } catch (error) {
+      /* a component it is built from cannot render (contexts with `lost` only): as written */
+      if (!(error instanceof UnrenderableUse)) throw error
+      continue
+    }
+    if (!rendered) continue
+    /* the key it has is its place in what holds it (a main), not the component's own root key */
+    setAttr(rendered, PART_ATTR, attrOf(found.el, PART_ATTR) ?? null)
+    const after = serializeOuter(rendered)
+    if (after !== before) edits.push({ start: found.start, end: found.end, text: after })
+  }
+  return edits.length ? splice(html, edits) : html
+}
+
 /** Short form of a whole document: instances as `<doop-use>`, their CSS copies gone.
  *  What agents read: a screen of 40 buttons costs 40 lines rather than 40 subtrees. */
 export function compactDocument(html: string, ctx: EngineContext): string {
@@ -1313,61 +1711,7 @@ function hollowIds(html: string, ctx: EngineContext): Set<string> {
   return new Set([...usedComponentIds(html)].filter((id) => isHollow(ctx.find(id))))
 }
 
-/** Everything a component put in the head: its stylesheet, and the links and scripts it brought.
- *  The stylesheets of the components in `keep` stay. */
-export function stripComponentHead(html: string, keep: ReadonlySet<string> = new Set()): string {
-  return html
-    .replace(
-      new RegExp(`<style[^>]*\\b${CSS_ATTR}="([^"]*)"[^>]*>[\\s\\S]*?</style>\\n?`, 'gi'),
-      (block, id: string) => (keep.has(id) ? block : ''),
-    )
-    .replace(new RegExp(`<script[^>]*\\s${HEAD_ATTR}(?:="[^"]*")?[\\s>][^>]*>[\\s\\S]*?</script>\\n?`, 'gi'), '')
-    .replace(new RegExp(`<link[^>]*\\s${HEAD_ATTR}(?:="[^"]*")?[\\s>/][^>]*>\\n?`, 'gi'), '')
-}
-
-/** A head tag with the mark that says a component brought it, so `frameHeadTags` and the next
- *  `syncComponentHead` can tell it from the frame's own. */
-function markedHeadTag(tag: string): string {
-  return tag.replace(/^<(link|script)\b/i, `<$1 ${HEAD_ATTR}`)
-}
-
-/** Every component an instance in this document uses, nested ones included. */
-export function usedComponentIds(html: string): Set<string> {
-  const ids = new Set<string>()
-  /* the leading space: an element's attribute, not a selector in a stylesheet */
-  for (const match of html.matchAll(new RegExp(`\\s${INSTANCE_ATTR}="([^"]+)"`, 'g'))) ids.add(match[1]!)
-  return ids
-}
-
-/** Put exactly the component stylesheets this document needs into its head. */
-export function syncComponentHead(html: string, defs: ComponentDef[]): string {
-  /* a hollow component has no stylesheet to put back: its instances keep the one they have */
-  const stripped = stripComponentHead(html, new Set(defs.filter(isHollow).map((def) => def.id)))
-  const blocks: string[] = []
-  for (const def of defs) {
-    /* a tag the frame has of its own, or one another component already brought, is not repeated */
-    for (const tag of def.head) {
-      const marked = markedHeadTag(tag)
-      if (!stripped.includes(tag) && !blocks.includes(marked)) blocks.push(marked)
-    }
-    if (def.css.trim()) blocks.push(`<style ${CSS_ATTR}="${def.id}">\n${def.css}\n</style>`)
-  }
-  if (!blocks.length) return stripped === html ? html : stripped
-  const next = insertIntoHead(stripped, blocks.join('\n'))
-  return next
-}
-
-function insertIntoHead(html: string, block: string): string {
-  const close = /<\/head\s*>/i.exec(html)
-  if (close) return `${html.slice(0, close.index)}${block}\n${html.slice(close.index)}`
-  const open = /<head\b[^>]*>/i.exec(html)
-  if (open) return `${html.slice(0, open.index + open[0].length)}\n${block}${html.slice(open.index + open[0].length)}`
-  const body = /<body\b[^>]*>/i.exec(html)
-  if (body) return `${html.slice(0, body.index)}<head>\n${block}\n</head>${html.slice(body.index)}`
-  const doctype = /^\s*<!doctype[^>]*>/i.exec(html)
-  const at = doctype ? doctype[0].length : 0
-  return `${html.slice(0, at)}${block}\n${html.slice(at)}`
-}
+export { stripComponentHead, syncComponentHead, usedComponentIds }
 
 /* ------------------------------------------------------------------ */
 /* Turning a main element into a template                              */
@@ -1631,7 +1975,7 @@ export function inferBindings(root: Element, limit = 12): string[] {
 }
 
 /* ------------------------------------------------------------------ */
-/* Shape matching: lookalikes and repeated structures                  */
+/* Shape matching: repeated structures                                 */
 /* ------------------------------------------------------------------ */
 
 const MAX_SHAPE_ELEMENTS = 200

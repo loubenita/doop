@@ -5,12 +5,24 @@
 # - PRs touching this file → archive only, unsigned, so the pipeline stays valid.
 #
 # Signing uses Xcode cloud-managed ("automatic") signing driven by an App Store
-# Connect API key, so no certificates or profiles are stored in the repo. Secrets:
+# Connect API key, so no certificates or profiles are stored in the repo. The
+# secrets live in the `ios-release` environment, which only `ios-v*` tags and
+# `main` may use, so a workflow pushed on another branch cannot read them. Secrets:
 #   APP_STORE_CONNECT_KEY_ID      the key id shown in App Store Connect → Users and Access → Integrations
 #   APP_STORE_CONNECT_ISSUER_ID   the issuer id on the same page
 #   APP_STORE_CONNECT_PRIVATE_KEY the .p8 contents (the key needs the App Manager role)
 #   APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD
 #                                 a base64 .p12 of an Apple Distribution certificate, and its password
+#                                 (set on the environment: the repo-level pair is desktop's Developer ID)
+#   IOS_PROFILE_APP / IOS_PROFILE_ACTIVITY
+#                                 base64 App Store profiles "Doop App Store CI" and
+#                                 "Doop Activity App Store CI" for that certificate
+# The archive is signed for development (automatic signing, as the targets are set up):
+# Xcode creates the development certificate and profiles through the API key. The signing
+# keychain is made the default so the private key Xcode generates lands where it searches.
+# The export re-signs manually with the distribution certificate and the two profiles
+# (ios/ExportOptions.plist): automatic export would need cloud signing, which an App
+# Manager key may not use.
 # The build number is the workflow run number, so every upload is unique.
 name: iOS Release
 
@@ -26,7 +38,9 @@ permissions:
 
 jobs:
   archive:
-    runs-on: macos-15
+    runs-on: blacksmith-12vcpu-macos-15
+    # PR runs archive unsigned and need no secrets, so they stay outside the environment.
+    environment: ${{ github.event_name != 'pull_request' && 'ios-release' || '' }}
     env:
       ARCHIVE: ios/DerivedData/Doop.xcarchive
     steps:
@@ -58,6 +72,19 @@ jobs:
           security import "$RUNNER_TEMP/dist.p12" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
           security set-key-partition-list -S apple-tool:,apple: -k "" "$KEYCHAIN"
           security list-keychain -d user -s "$KEYCHAIN"
+          security default-keychain -d user -s "$KEYCHAIN"
+      - name: Install the App Store provisioning profiles
+        if: github.event_name != 'pull_request'
+        env:
+          IOS_PROFILE_APP: ${{ secrets.IOS_PROFILE_APP }}
+          IOS_PROFILE_ACTIVITY: ${{ secrets.IOS_PROFILE_ACTIVITY }}
+        run: |
+          set -euo pipefail
+          for dir in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            mkdir -p "$dir"
+            echo "$IOS_PROFILE_APP" | base64 --decode > "$dir/doop-appstore.mobileprovision"
+            echo "$IOS_PROFILE_ACTIVITY" | base64 --decode > "$dir/doop-activity-appstore.mobileprovision"
+          done
       - name: Write the App Store Connect API key
         if: github.event_name != 'pull_request'
         env:

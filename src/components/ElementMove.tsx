@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { composeFrame, showFrameHtml } from '../lib/frameCompose'
 import { frameDesignPoint, frameWorldPoint, rotateVector, turnedDropRect } from '../../shared/frameRotation'
 import { createPortal } from 'react-dom'
 import type { Frame } from '../../shared/types'
@@ -72,6 +73,9 @@ export interface ElementMoveHit {
 export function useElementMove(frame: Frame, layoutZoom: number) {
   const t = useT()
   const [preview, setPreview] = useState<Preview | null>(null)
+  /* a document of its own: the canvas's token values and component styles go in */
+  const previewHtml = preview?.html
+  const previewDocument = useMemo(() => (previewHtml ? composeFrame(previewHtml) : ''), [previewHtml])
   /* the gesture under way: its element's outline, grips and size badge stay
      hidden until it lands, so only the element itself shows */
   const [movingOwner, setMovingOwner] = useState<object | null>(null)
@@ -182,6 +186,8 @@ export function useElementMove(frame: Frame, layoutZoom: number) {
     let layerReady: Promise<ElementInfo | null> | null = null
     let layerPoint: { x: number; y: number; pointerX: number; pointerY: number } | null = null
     let layerWork: Promise<void> = Promise.resolve()
+    /* the point the last finished preview put the layer at */
+    let appliedPoint: { x: number; y: number; pointerX: number; pointerY: number } | null = null
     let inFlight = false
     let picked = false
     /* an ⌥⇧ drag's copy, once it is in the live document: the gesture moves
@@ -266,7 +272,7 @@ export function useElementMove(frame: Frame, layoutZoom: number) {
       const planned = planCopy()
       if (!planned) return null
       noteFrameDocument(frame.id, null)
-      if (!(await requestFrame(frame.id, 'doop:html', { html: planned.html }))) return null
+      if (!(await showFrameHtml(frame.id, planned.html))) return null
       noteFrameDocument(frame.id, planned.html)
       return planned.selector
     }
@@ -283,7 +289,7 @@ export function useElementMove(frame: Frame, layoutZoom: number) {
       const html = useStore.getState().canvas?.frames.find((f) => f.id === frame.id)?.html
       if (html === undefined) return
       noteFrameDocument(frame.id, null)
-      if (await requestFrame(frame.id, 'doop:html', { html })) noteFrameDocument(frame.id, html)
+      if (await showFrameHtml(frame.id, html)) noteFrameDocument(frame.id, html)
     }
     /* where the pressed layer may go: a layout drop (a new place in the
        flow) is for one layer alone, so several picked layers always move
@@ -309,6 +315,7 @@ export function useElementMove(frame: Frame, layoutZoom: number) {
         if (!info) return cancel()
         const selector = movingSelector()
         updateLayer(await editElementGeometry(frame.id, selector, { kind: 'move', x: point.x, y: point.y }))
+        appliedPoint = point
         if (closed) return
         const result = await moveTarget(selector, point.pointerX, point.pointerY)
         if (closed) return
@@ -349,12 +356,16 @@ export function useElementMove(frame: Frame, layoutZoom: number) {
           // Drain a preview before restoring styles or saving. A slow hit-test
           // must never repaint after Escape, or commit the previous pointer slot.
           await layerWork
+          /* put the layer where it was let go before asking where it lands:
+             on a busy main thread the last preview can trail the pointer,
+             and a drop reads the layer's live box */
+          if (commit && final && final !== appliedPoint && sourceUnchanged())
+            updateLayer(await editElementGeometry(frame.id, selector, { kind: 'move', x: final.x, y: final.y }))
           const result =
             commit && final && sourceUnchanged()
               ? await moveTarget(selector, final.pointerX, final.pointerY)
               : undefined
           if (commit && final && sourceUnchanged() && result?.free) {
-            updateLayer(await editElementGeometry(frame.id, selector, { kind: 'move', x: final.x, y: final.y }))
             const saves = sourceUnchanged()
             const done = await styleGesture(frame.id, selector, saves ? 'commit' : 'cancel')
             /* the runtime's save carries the copy along; the copy is the pick */
@@ -448,9 +459,15 @@ export function useElementMove(frame: Frame, layoutZoom: number) {
            travel turned back by the frame's rotation; the pointer likewise */
         const travel = rotateVector({ x: rect.x - bounds.x, y: rect.y - bounds.y }, -(frame.rotation ?? 0))
         const pointer = frameDesignPoint(point, frame)
+        /* a dragged layer lands on whole design px, as a design tool places
+           one: the pointer at a fractional zoom is never a place anyone
+           means. An axis the drag did not move (Shift holds it) keeps its
+           value, and align and distribute, which move layers through the
+           same edit, keep exact placement */
+        const onGrid = (from: number, by: number) => (by === 0 ? from : Math.round(from + by))
         layerPoint = {
-          x: layer.rect.x + travel.x,
-          y: layer.rect.y + travel.y,
+          x: onGrid(layer.rect.x, travel.x),
+          y: onGrid(layer.rect.y, travel.y),
           pointerX: pointer.x - contentOffset.x,
           pointerY: pointer.y - contentOffset.y,
         }
@@ -723,7 +740,7 @@ export function useElementMove(frame: Frame, layoutZoom: number) {
                 <iframe
                   title={t('stage.movingDrawing')}
                   sandbox=""
-                  srcDoc={preview.html}
+                  srcDoc={previewDocument}
                   onLoad={() => hideDrawing(preview.owner, preview.selector)}
                   className="block border-0 bg-transparent"
                   style={{

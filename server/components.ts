@@ -1,3 +1,4 @@
+import { rendersWhole } from './frameRest.ts'
 import { customAlphabet } from 'nanoid'
 import { serializeOuter } from 'parse5'
 import {
@@ -6,36 +7,40 @@ import {
   HEAD_ATTR,
   INSTANCE_ATTR,
   MAX_COMPONENT_HISTORY,
-  OVERRIDES_ATTR,
-  PART_ATTR,
-  PROPS_ATTR,
-  REV_ATTR,
   USE_TAG,
   isDeleted,
+  isHollow,
   type ComponentDef,
   type ComponentIssue,
   type ComponentProp,
 } from '../shared/components.ts'
-import { extractComponentCss, frameHeadTags, frameStylesheets } from './componentCss.ts'
+import { componentClosure } from '../shared/frameCompose.ts'
+import { componentSourceCss, extractComponentCss, frameHeadTags, frameStylesheets } from './componentCss.ts'
 import {
   attrOf,
+  contextOfDefs,
   derivePropsAndSlots,
   expandUses,
   findMarked,
-  holdsHollow,
+  prepareInstances,
   renderInstance,
-  reconcileInstance,
+  reviveLostUses,
   setAttr,
   splice,
   stampParts,
   syncComponentHead,
   templateFromMain,
+  unclosedUses,
   usedComponentIds,
   type EngineContext,
+  type Revision,
 } from './componentEngine.ts'
 import { adoptFromLibrary, findInLibraries, LibraryAdoptError } from './componentLibrary.ts'
+import { withHostedIcons } from './iconProxy.ts'
+import { env } from './env.ts'
 import { store } from './store.ts'
 import { noteCanvas } from './workBudget.ts'
+import { WriteRefusedError } from './writeRefusal.ts'
 import type { Canvas } from '../shared/types.ts'
 
 /**
@@ -59,30 +64,20 @@ export interface LibraryAdoption {
   added: ComponentDef[]
 }
 
+/** A template in the URL form every frame write saves (withHostedIcons): an instance whose
+ *  Iconify icon a write pointed at Doop still reads as its template, not as an override that
+ *  would stop it following the component, and a main frame reads as unchanged. */
+function hostedForm<T extends Revision>(def: T | undefined): T | undefined {
+  if (!def?.template.includes('api.iconify.design')) return def
+  return { ...def, template: withHostedIcons(def.template) }
+}
+
 export function contextFor(canvasId: string, adoption?: LibraryAdoption): EngineContext {
-  const defs = () => store.getComponents(canvasId)
-  const issues: ComponentIssue[] = []
-  /* an id is exact, deleted or not: markup already on the canvas points at it. A name means
-     the component in use; a deleted one answers to its name only when nothing else has it,
-     so that asking for it says "deleted" rather than "unknown" */
-  const local = (ref: string) => {
-    const wanted = ref.trim().toLowerCase()
-    const named = defs().filter((def) => def.name.toLowerCase() === wanted)
-    return defs().find((def) => def.id === ref) ?? named.find((def) => !isDeleted(def)) ?? named[0]
-  }
+  const local = contextOfDefs(() => store.getComponents(canvasId))
+  const issues = local.issues
   const find = (ref: string) =>
-    local(ref) ?? (adoption && ref ? fromLibrary(canvasId, ref, adoption, issues) : undefined)
-  return {
-    find,
-    atRev(id, rev) {
-      const def = defs().find((candidate) => candidate.id === id)
-      if (!def) return undefined
-      if (def.rev === rev) return def
-      const snapshot = def.history.find((entry) => entry.rev === rev)
-      return snapshot ? { id, name: def.name, rev, template: snapshot.template, props: snapshot.props } : undefined
-    },
-    issues,
-  }
+    hostedForm(local.find(ref) ?? (adoption && ref ? fromLibrary(canvasId, ref, adoption, issues) : undefined))
+  return { ...local, find, atRev: (id: string, rev: number) => hostedForm(local.atRev(id, rev)) }
 }
 
 /** Nothing on the canvas has this name: its workspace library may. A local
@@ -133,21 +128,7 @@ function touchesComponents(html: string): boolean {
 }
 
 function closureOf(ids: Iterable<string>, canvasId: string): ComponentDef[] {
-  const defs = store.getComponents(canvasId)
-  const seen = new Map<string, ComponentDef>()
-  const stack = [...ids]
-  for (let id = stack.pop(); id; id = stack.pop()) {
-    if (seen.has(id)) continue
-    const def = defs.find((candidate) => candidate.id === id)
-    if (!def) continue
-    seen.set(id, def)
-    for (const match of def.template.matchAll(/component="([^"]+)"/g)) {
-      const nested = defs.find((candidate) => candidate.id === match[1] || candidate.name === match[1])
-      if (nested) stack.push(nested.id)
-    }
-  }
-  /* dependencies first, so a nested component's rules come before the ones built on them */
-  return [...seen.values()].reverse()
+  return componentClosure(ids, store.getComponents(canvasId))
 }
 
 /** Would a template using these components put `id` inside itself? */
@@ -170,6 +151,7 @@ export function bumpRevision(def: ComponentDef, by: string): ComponentDef {
     ...def.history,
     {
       rev: def.rev,
+      ...(def.renderRev !== undefined ? { renderRev: def.renderRev } : {}),
       template: def.template,
       rawCss: def.rawCss,
       head: def.head,
@@ -218,6 +200,8 @@ function prepareMains(
   let sheetCache: string | undefined
   let headCache: string[] | undefined
   const sheet = () => (sheetCache ??= frameStylesheets(html))
+  let sourceCache: Map<string, string> | undefined
+  const sources = () => (sourceCache ??= componentSourceCss(html))
   const headTags = () => [...(headCache ??= frameHeadTags(html))]
   for (const found of findMarked(html, COMPONENT_ATTR)) {
     const id = attrOf(found.el, COMPONENT_ATTR) ?? ''
@@ -251,7 +235,8 @@ function prepareMains(
     claimed.add(id)
     const stamped = stampParts(found.el)
     if (stamped) edits.push({ start: found.start, end: found.end, text: serializeOuter(found.el) })
-    const template = templateFromMain(found.el, ctx)
+    /* in the URL form the frame is saved in (withHostedIcons), whatever form the main arrived in */
+    const template = withHostedIcons(templateFromMain(found.el, ctx))
     if (wouldCycle(canvas.id, id, template)) {
       ctx.issues.push({
         code: 'nesting_cycle',
@@ -260,12 +245,15 @@ function prepareMains(
       continue
     }
     const variants = def.props.filter((prop) => prop.type === 'enum').map((prop) => `data-${prop.name}`)
-    const { css, rawCss } = extractComponentCss(sheet(), found.el, id, variants)
+    const extracted = extractComponentCss(sheet(), found.el, id, variants, sources().get(id))
+    const css = withHostedIcons(extracted.css)
+    const rawCss = withHostedIcons(extracted.rawCss)
     const head = headTags()
     const { props, slots } = derivePropsAndSlots(template, def.props)
     const same =
-      def.template === template &&
-      def.css === css &&
+      /* a definition saved before frames were rewritten still holds Iconify hotlinks: the same icons */
+      withHostedIcons(def.template) === template &&
+      withHostedIcons(def.css) === css &&
       JSON.stringify(def.head) === JSON.stringify(head) &&
       JSON.stringify(def.props) === JSON.stringify(props) &&
       JSON.stringify(def.slots) === JSON.stringify(slots)
@@ -308,34 +296,6 @@ export function rederiveFromMains(
   return { html: mains.html, saved: [...mains.changed, ...mains.moved] }
 }
 
-function prepareInstances(html: string, ctx: EngineContext) {
-  const edits: { start: number; end: number; text: string }[] = []
-  for (const found of findMarked(html, INSTANCE_ATTR)) {
-    const id = attrOf(found.el, INSTANCE_ATTR) ?? ''
-    const def = ctx.find(id)
-    if (!def) {
-      /* its component was deleted, or this came from another canvas: plain markup */
-      for (const name of [INSTANCE_ATTR, REV_ATTR, PROPS_ATTR, OVERRIDES_ATTR]) setAttr(found.el, name, null)
-      edits.push({ start: found.start, end: found.end, text: serializeOuter(found.el) })
-      continue
-    }
-    /* its component was deleted: the instance keeps the markup it has, untouched. So does one
-       holding an instance of a hollow component: rendered again, that instance would be lost */
-    if (isDeleted(def) || holdsHollow(found.el, ctx)) continue
-    const before = serializeOuter(found.el)
-    const state = reconcileInstance(found.el, ctx)
-    if (!state) continue
-    /* only a whole write gets here: nothing more is coming for the content it holds */
-    const rendered = renderInstance(def, def, state.overrides, state.instanceId, { ctx, stack: [], final: true })
-    if (!rendered) continue
-    /* the key it has is its place in what holds it (a main), not the component's own root key */
-    setAttr(rendered, PART_ATTR, attrOf(found.el, PART_ATTR) ?? null)
-    const after = serializeOuter(rendered)
-    if (after !== before) edits.push({ start: found.start, end: found.end, text: after })
-  }
-  return edits.length ? splice(html, edits) : html
-}
-
 export interface PreparedHtml {
   html: string
   issues: ComponentIssue[]
@@ -347,13 +307,25 @@ export interface PreparedHtml {
   adopted: ComponentDef[]
 }
 
+/** `refuseUnclosed`: an agent's whole write, refused (`WriteRefusedError`) rather than saved when it
+ *  leaves a `<doop-use>` open; anyone else's places it empty with an `unclosed_use` note. */
 export function prepareFrameHtml(
   canvas: Canvas,
   frameId: string,
   incoming: string,
   by: string,
   priorHtml = '',
+  { refuseUnclosed = false }: { refuseUnclosed?: boolean } = {},
 ): PreparedHtml {
+  /* a reference kept as a placeholder (its component could not render when the frame was
+     read, server/frameRest.ts) is a reference again once that component can */
+  incoming = reviveLostUses(incoming, (ref, use) => {
+    const defs = store.getComponents(canvas.id)
+    const def = defs.find((candidate) => candidate.id === ref || candidate.name === ref)
+    /* whole, or not yet: with a nested component still missing, the write would render the
+       rest and record the missing part as hidden for good */
+    return !!def && !isDeleted(def) && !isHollow(def) && rendersWhole(use, defs)
+  })
   if (!touchesComponents(incoming)) {
     const lost = frameId && priorHtml.includes(`${COMPONENT_ATTR}="`)
     const moved = lost ? prepareMains(canvas, frameId, incoming, by, contextFor(canvas.id)).moved : []
@@ -364,6 +336,7 @@ export function prepareFrameHtml(
   noteCanvas(canvas.id)
   try {
     const expanded = expandUses(incoming, ctx, [], 0, { final: true })
+    if (refuseUnclosed) refuseUnclosedUses(ctx.issues)
     const mains = prepareMains(canvas, frameId, expanded, by, ctx)
     const instances = prepareInstances(mains.html, ctx)
     const html = syncComponentHead(instances, closureOf(usedComponentIds(instances), canvas.id))
@@ -416,9 +389,11 @@ export function dedupeIssues(issues: ComponentIssue[]): ComponentIssue[] {
   })
 }
 
-/** One chunk of a live stream: components render as they arrive, each stylesheet
- *  once and in place, since the head may already have gone by. The last chunk's
- *  full pass moves them where they belong. */
+/** One chunk of a live stream: components render as they arrive. Their stylesheets are
+ *  not the frame's to hold (lean storage): whoever is shown the frame mid-stream composes
+ *  them in (the browser, the renderer, `legacyFrame` for a client that cannot). With
+ *  `DOOP_LEAN_FRAME_STORAGE=false` each goes in once and in place, since the head may
+ *  already have gone by, and the last chunk's full pass moves them where they belong. */
 export function prepareChunk(
   canvas: Canvas,
   chunk: string,
@@ -429,9 +404,11 @@ export function prepareChunk(
   const adoption: LibraryAdoption = { by, added: [] }
   const ctx = contextFor(canvas.id, adoption)
   const expanded = expandUses(chunk, ctx)
-  const styles = closureOf(usedComponentIds(expanded), canvas.id)
-    .filter((def) => def.css.trim() && !soFar.includes(`${CSS_ATTR}="${def.id}"`))
-    .map((def) => `<style ${CSS_ATTR}="${def.id}">\n${def.css}\n</style>`)
+  const styles = env.DOOP_LEAN_FRAME_STORAGE
+    ? []
+    : closureOf(usedComponentIds(expanded), canvas.id)
+        .filter((def) => def.css.trim() && !soFar.includes(`${CSS_ATTR}="${def.id}"`))
+        .map((def) => `<style ${CSS_ATTR}="${def.id}">\n${def.css}\n</style>`)
   /* a use expanded here is gone by the last chunk's pass: what it had to say is said now */
   return { html: `${styles.join('\n')}${expanded}`, issues: ctx.issues, adopted: adoption.added }
 }
@@ -466,4 +443,39 @@ export function blankComponent(input: {
     updatedAt: now,
     updatedBy: input.by,
   }
+}
+
+/** What a `<doop-use>` left open does once saved, by where it is written: `subject` is "it" or
+ *  "each". */
+const UNCLOSED_CONSEQUENCE = {
+  /* the engine reads it as self-closing (a frame, and an instance override's markup) */
+  frame: (subject: string) =>
+    `Saved, ${subject} would be placed with no slot content, and the markup meant for its slots would land after it.`,
+  /* a template is parsed first, which closes it at its parent's end */
+  template: (subject: string) =>
+    `Saved, ${subject} would be closed where its parent ends, taking whatever follows it into its slots.`,
+}
+
+/** What to tell an agent whose whole write leaves these `<doop-use>` open (their components, as
+ *  written): a breakage that would otherwise only show in a screenshot (#528). */
+export function unclosedUseRefusal(refs: readonly string[], target: keyof typeof UNCLOSED_CONSEQUENCE): string {
+  const tags = refs.map((ref) => (ref ? `<${USE_TAG} component="${ref}">` : `a <${USE_TAG}>`))
+  return [
+    `Refused, nothing was written: ${tags.join(', ')} ${refs.length === 1 ? 'is' : 'are'} opened and never closed with </${USE_TAG}> (or one nested inside it is: the tags are counted in pairs).`,
+    UNCLOSED_CONSEQUENCE[target](refs.length === 1 ? 'it' : 'each'),
+    `Close each with </${USE_TAG}> where its content ends, or write it self-closing (<${USE_TAG} component="…" />) when it has none, then send the HTML again.`,
+  ].join('\n')
+}
+
+/** Refuse the write whose expansion reported a `<doop-use>` left open (`unclosed_use`). */
+export function refuseUnclosedUses(issues: readonly ComponentIssue[]): void {
+  const refs = issues.filter((issue) => issue.code === 'unclosed_use').map((issue) => issue.component ?? '')
+  if (refs.length) throw new WriteRefusedError(unclosedUseRefusal(refs, 'frame'))
+}
+
+/** Refuse a component template that leaves a `<doop-use>` open. It is parsed before it is kept,
+ *  which closes the tag at its parent's end, and every instance would inherit that guess. */
+export function refuseUnclosedTemplate(template: string): void {
+  const refs = unclosedUses(template)
+  if (refs.length) throw new WriteRefusedError(unclosedUseRefusal(refs, 'template'))
 }

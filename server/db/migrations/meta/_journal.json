@@ -414,6 +414,48 @@
       "when": 1794783638191,
       "tag": "0059_workspace_seats_bought",
       "breakpoints": true
+    },
+    {
+      "idx": 60,
+      "version": "7",
+      "when": 1794975071415,
+      "tag": "0060_skills",
+      "breakpoints": true
+    },
+    {
+      "idx": 61,
+      "version": "7",
+      "when": 1795256823668,
+      "tag": "0061_agent_key",
+      "breakpoints": true
+    },
+    {
+      "idx": 62,
+      "version": "7",
+      "when": 1795256824668,
+      "tag": "0062_component_revisions",
+      "breakpoints": true
+    },
+    {
+      "idx": 63,
+      "version": "7",
+      "when": 1795256825668,
+      "tag": "0063_component_render_rev",
+      "breakpoints": true
+    },
+    {
+      "idx": 64,
+      "version": "7",
+      "when": 1795256826668,
+      "tag": "0064_workspace_link_sharing",
+      "breakpoints": true
+    },
+    {
+      "idx": 65,
+      "version": "7",
+      "when": 1795256886668,
+      "tag": "0065_storybook_sources",
+      "breakpoints": true
     }
   ]
 }

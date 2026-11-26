@@ -198,7 +198,8 @@ export const FRAME_STYLES = `- Style an element on the element itself: style="�
  *  guide and the resident agents' system prompt. */
 export const LEAN_FRAMES = `- Frames carry markup, never files. A frame is sent whole to every viewer and agent on each
   edit, so anything pasted into it is paid for on every round-trip. A base64 data: URI of any
-  kind is refused and nothing is written. Put each heavy thing where it belongs:
+  kind is refused and nothing is written, and so is a long block of base64 text in a script or
+  anywhere else (a packed bundle, a compressed data file). Put each heavy thing where it belongs:
   - Fonts: a family the canvas library or the hosted fonts already have is used by name alone.
     Any other font file goes into the library with upload_font, then is named in CSS: never an
     @font-face with the file inlined.
@@ -213,7 +214,9 @@ export const LEAN_FRAMES = `- Frames carry markup, never files. A frame is sent 
     <script src> or <link>, never pasted in. Better still, write only the CSS the design uses.
   - Data: a chart or table needs a few representative rows, not the dataset. Keep inline JSON to a
     few KB.
-  - Icon sets: hotlink each icon you use from search_icons, not a sprite sheet of the whole set.`
+  - Icon sets: hotlink each icon you use from search_icons, not a sprite sheet of the whole set.
+  - An application: a frame is one screen. Never pack an app's bundles and pages into a frame to
+    make it clickable; put each screen in its own frame and wire them as a prototype.`
 
 export const COMPONENTS = `A component is one design used in many places: change its main and every instance follows.
 get_canvas and list_components show a canvas's components with their props.
@@ -243,9 +246,9 @@ needs a reusable piece the system lacks, add it, then use it.
 - Write a reusable piece as a component the first time, not after the third copy. Adding to a
   canvas whose pages already repeat a block: make the block a component from one existing copy
   (create_component with its frame_id and element) and use it in
-  what you add, rather than writing it out again. replace_matching=true turns every other copy
-  into an instance too; that rewrites the existing pages, so use it when the human asked for that
-  clean-up, and otherwise offer it when you finish.
+  what you add, rather than writing it out again. Turning the other copies into instances means
+  replacing each with <doop-use> in edit_frame_html; that rewrites the existing pages, so do it
+  when the human asked for that clean-up, and otherwise offer it when you finish.
 - Components nest, and every rule here applies inside a main too. A main's markup can hold
   <doop-use>, and a change to the inner component reaches every main that uses it and every
   instance of those. A NavItem written out by hand nine times inside a Sidebar is the same mistake
@@ -280,9 +283,10 @@ needs a reusable piece the system lacks, add it, then use it.
   are captured as overrides on that element alone and survive every later change to the main. Do
   not detach to make a small change.
 - To change them all, call update_component with find + replace, and read the impact it reports.
-  Approved frames keep their sign-off: following a component is not an edit. Use dry_run first on anything
-  widely used. Never edit each instance by hand.
-- get_component_preview shows you every variant at once. Look at it after changing a component.
+  Approved frames keep their sign-off: following a component is not an edit. Never edit each
+  instance by hand.
+- After changing a component, use get_component_preview to check the appearance you edited. Omit props
+  for the default, or pass e.g. {"tone": ["solid", "ghost"]} to compare two tones at the default size.
 - Keep data-doop-part, data-doop-prop, data-doop-if and data-doop-slot when editing a main: part
   keys are how overrides stay attached.
 - update_component returns before the instances have followed: they are rewritten in the
@@ -302,8 +306,8 @@ needs a reusable piece the system lacks, add it, then use it.
   canvases still to pull) and sync_component on each; without a component it pulls all that wait.
   Publish when the human asks, in any words ("make it available to the team"), not on your own
   initiative; it never changes another canvas until that canvas pulls. Only when the human asks
-  for the change on every canvas: update_library_everywhere on the library canvas (dry_run first;
-  it changes other people's canvases; approved frames keep their sign-off).`
+  for the change on every canvas: update_library_everywhere on the library canvas (ask the human
+  first: it changes other people's canvases; approved frames keep their sign-off).`
 
 export const DOOP_GUIDE = `# Doop Agent Guide
 
@@ -372,6 +376,11 @@ and fix real issues before moving on:
   or a block repeated in this frame, inside a component it uses, or copied from another frame,
   that is not a <doop-use>? A hex, font or size that a token already names? Make the component
   or use the token.
+
+For Fit and overlaps, inspect_frame measures what the eye estimates: its \`problems\` list
+content past the frame's edge, text cut off by its box and text or controls on top of each
+other, with each element's selector and box. Pass selectors to read exact boxes and computed
+styles of the elements you are fixing. Judge its findings against the screenshot.
 
 Prefer targeted fixes over rewrites. Never delete and restart a mostly-good frame — the
 humans watching lose work they may have been reacting to.
@@ -450,8 +459,8 @@ ${FRAME_STYLES}
   frame's pageId. Put one screen in a frame and a body of work on a page: a second product
   surface, a platform (web vs. mobile), a round of explorations. create_canvas_page adds one
   and returns its id for create_frame's pageId; get_canvas with page_id reads one page;
-  set_canvas_pages renames, reorders or deletes pages. A link to a page is
-  /c/<canvas_id>?page=<page_id>.
+  set_canvas_pages renames, reorders or deletes pages, and update_canvas renames the canvas
+  itself. A link to a page is /c/<canvas_id>?page=<page_id>.
 - Element links: /c/<canvas_id>?frame=<frame_id>&element=<element_id> points at the one
   element carrying data-doop-id="<element_id>" in that frame's HTML. Find that attribute with
   get_frame before applying the feedback; if no element carries it any more, ask for an
@@ -500,9 +509,10 @@ A canvas's palette, type scale, spacing, radii and fonts are typed design tokens
 properties every frame uses, each with a value per theme (light, dark, …) where it differs.
 
 - get_canvas lists them (and says when a canvas has none yet). Write var(--name) in CSS,
-  never the literal value, so one token change restyles every frame using it. Doop writes
-  the values a frame names into its own <style data-doop-tokens> block: keep that block and
-  never edit it, and never declare the palette on a frame's own :root.
+  never the literal value, so one token change restyles every frame using it. Doop supplies
+  the values a frame names wherever the frame is rendered (a <style data-doop-tokens> block
+  you may see in a screenshot's source or an expanded read): never write that block
+  yourself, and never declare the palette on a frame's own :root.
 - No tokens yet: create_tokens before the first frame, from the brief (palette by role,
   font families, type scale, spacing, radii). Decisions and their reasons go to
   save_decision; values never do.
@@ -576,7 +586,8 @@ gives PNG, JPG or PDF, export_layer one element (get_guide export).
 - Call get_canvas before adding or editing anything. Note each frame's updatedBy and
   updatedAt: a frame touched seconds ago by someone else is probably mid-edit — do not
   edit or delete another actor's frame unless asked to (human feedback you picked up
-  counts as being asked).
+  counts as being asked). A comment, a token rename or a component update is not an edit:
+  updatedBy stays and updatedAt moves by a millisecond.
 - Put new work in new frames beside existing ones; omit x/y to auto-place.
 - Keep the SAME agent_name for your whole session. It is your identity in the room.
 - You act with the canvas role of the account you connected through: a view link reads, a
@@ -787,8 +798,9 @@ reply inherits the root's element anchor, so an @mention reaches the resident ag
 the same context the conversation is about. Close the thread with resolve_comment once the
 request is carried out; resolving an @mention thread also records the exchange in the
 canvas Memory. Writing is metered only when a reply @mentions a resident role, exactly
-like a comment left in the browser. Reading does not claim work or resolve it; task
-feedback is separate (get_feedback).
+like a comment left in the browser. To tag a person, write @ and their name as a comment's
+\`from\` spells it ("@Ana Souza"): they are emailed at once. Reading does not claim work or
+resolve it; task feedback is separate (get_feedback).
 `,
   export: `# Exporting frames (images, PDF)
 
@@ -817,6 +829,13 @@ file and the components it imports, then set_frame_html a complete self-containe
 document that faithfully renders it — real CSS derived from its actual classes and
 design tokens, realistic placeholder data, no scripts. Design at the frame's width and
 resize the frame to the content. Keep the marker meta so the frame stays traceable.
+
+A person without a Doop Agent plan who imports a repo queues the import for you: tool
+results then carry a REPO IMPORT notice. take_repo_cards hands you the cards (a design
+system, then screens) with the repository tree; read_repo_files reads source through
+Doop's GitHub connection, so you need no checkout; finish_repo_card lands each screen
+as a placed, marked frame, or pins the design system as the canvas guideline. Review
+every landed screen with get_frame_screenshot and fix it in place.
 
 ## Synced from a live app
 

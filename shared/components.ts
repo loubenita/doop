@@ -4,7 +4,8 @@
  * written out in full in the frame that uses it, marked `data-doop-instance`, so
  * everything that reads frame HTML (the iframe, exports, screenshots, comments,
  * the Layers panel) needs no idea components exist. Agents read and write the
- * short form, `<doop-use component="Button" label="Buy"></doop-use>`.
+ * short form, `<doop-use component="Button" label="Buy"></doop-use>`, and it is
+ * also how a frame's row keeps an instance at rest (server/frameRest.ts).
  * Spec: .context/specs/components.md.
  */
 
@@ -74,6 +75,9 @@ export interface ComponentCode {
 
 export interface ComponentSnapshot {
   rev: number
+  /** the revision this state last changed what an instance is rendered from (see
+   *  `ComponentDef.renderRev`); absent means `rev` */
+  renderRev?: number
   template: string
   rawCss: string
   head: string[]
@@ -97,6 +101,12 @@ export interface ComponentDef {
   props: ComponentProp[]
   slots: ComponentSlot[]
   rev: number
+  /** the newest revision at which what an instance is rendered from (the template and the
+   *  props) last changed. A revision of the rules alone (stylesheet, head tags) raises
+   *  `rev` and leaves this: every revision from `renderRev` to `rev` renders the same
+   *  markup, an instance is marked with `renderRev`, and it is behind only when its mark
+   *  is older. Absent means `rev`. Set by the store on every save (`store.saveComponent`). */
+  renderRev?: number
   /** the frame whose element is the main; null once that element is gone */
   mainFrameId: string | null
   code?: ComponentCode
@@ -115,6 +125,52 @@ export interface ComponentDef {
   createdAt: number
   updatedAt: number
   updatedBy: string
+}
+
+/** A definition as browsers and the native apps get it (room `init`, `component` messages,
+ *  REST): without its earlier revisions, which only the server merges against. The editor
+ *  reads them on request: `GET /api/canvases/:id/components/:componentId/revisions`. */
+export type WireComponentDef = Omit<ComponentDef, 'history'>
+
+export function wireComponent(def: ComponentDef): WireComponentDef {
+  const { history: _history, ...wire } = def
+  return wire
+}
+
+/** A canvas as a browser gets it: its components without their earlier revisions. */
+export function withWireComponents<C extends { components?: ComponentDef[] }>(
+  canvas: C,
+): Omit<C, 'components'> & { components?: WireComponentDef[] } {
+  const { components, ...rest } = canvas
+  return components ? { ...rest, components: components.map(wireComponent) } : rest
+}
+
+/** The revision an instance of this state is marked with: where its markup last changed. */
+export function renderRevOf(state: { rev: number; renderRev?: number }): number {
+  return state.renderRev ?? state.rev
+}
+
+/** Do two states of a component render the same instance markup? */
+export function rendersSame(
+  a: Pick<ComponentDef, 'template' | 'props'>,
+  b: Pick<ComponentDef, 'template' | 'props'>,
+): boolean {
+  return a.template === b.template && (a.props === b.props || JSON.stringify(a.props) === JSON.stringify(b.props))
+}
+
+/** What a component rendered from at the revision an instance is marked with: the
+ *  definition itself when that revision renders as it does now, else the kept state
+ *  whose span of revisions (`renderRev`..`rev`) holds the mark. Rules-only revisions use
+ *  up kept history without moving a mark out of reach: a span is found by any of its
+ *  revisions. Undefined when no kept state covers it. */
+export function stateAtRev<D extends Pick<ComponentDef, 'rev' | 'renderRev' | 'template' | 'props' | 'history'>>(
+  def: D,
+  rev: number,
+): D | (Pick<ComponentSnapshot, 'template' | 'props'> & { rev: number }) | undefined {
+  if (rev > def.rev) return undefined
+  if (rev >= renderRevOf(def)) return rev === renderRevOf(def) ? def : { rev, template: def.template, props: def.props }
+  const kept = def.history.find((entry) => renderRevOf(entry) <= rev && rev <= entry.rev)
+  return kept ? { rev, template: kept.template, props: kept.props } : undefined
 }
 
 export function isDeleted(def: Pick<ComponentDef, 'status'> | undefined): boolean {
@@ -197,6 +253,8 @@ export type ComponentIssueCode =
   | 'library_ambiguous'
   | 'ignored_attribute'
   | 'css_not_kept'
+  | 'css_unmatched'
+  | 'css_not_read'
   | 'empty_template'
   | 'unclosed_use'
 
@@ -204,6 +262,10 @@ export type ComponentIssueCode =
 export interface ComponentIssue {
   code: ComponentIssueCode
   message: string
+  /** `unclosed_use`: the component the open tag names, as written */
+  component?: string
+  /** `unclosed_use` in slot or override content, which is whole: no later stream chunk closes it */
+  inOverride?: boolean
 }
 
 /** One instance's identity as the editor needs it, read from the frame's markup. */

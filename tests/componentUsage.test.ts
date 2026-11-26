@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('../server/db/persist.ts', () => ({
   saveCanvas: () => {},
+  refreshAssetRefs: () => {},
   saveFrame: () => {},
   saveActivity: () => {},
   saveFrameVersion: () => {},
@@ -32,7 +33,7 @@ import { store } from '../server/store.ts'
 import * as actions from '../server/actions.ts'
 import * as propagation from '../server/propagation.ts'
 import { blankComponent } from '../server/components.ts'
-import { catalog, componentDetail, updateComponent, usageOf } from '../server/componentActions.ts'
+import { catalog, componentDetail, usageOf } from '../server/componentActions.ts'
 import { usageScans } from '../server/componentUsage.ts'
 import { COMPONENT_ATTR, INSTANCE_ATTR } from '../shared/components.ts'
 import type { Actor, Canvas } from '../shared/types.ts'
@@ -152,36 +153,25 @@ describe('component usage', () => {
     expect(usageScans().framesScanned - before.framesScanned).toBe(0)
     await client.close()
   })
-})
 
-describe('a dry run of update_component', () => {
-  it('parses no frame when no instance could lose an override', () => {
-    const { canvas, button } = fixture()
+  it('parses no frame that only uses a component when update_component changes it', async () => {
+    const { canvas, button, frames } = fixture()
+    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair()
+    await buildMcpServer('Owner', OWNER).connect(serverSide)
+    const client = new Client({ name: 'usage-test', version: '0' })
+    await client.connect(clientSide)
+    const using = frames.filter((frame) => framed(frame.id).includes(`data-doop-instance="${button.def.id}"`))
+    expect(using.length).toBeGreaterThan(0)
+    /* each frame as it was when the call began: what parsing it would have handed the engine */
+    const before = using.map((frame) => framed(frame.id))
     parsed.documents.length = 0
-    const dry = updateComponent(
-      canvas.id,
-      'Button',
-      { find: 'class="btn"', replace: 'class="btn big"', dryRun: true },
-      actor,
-    )
-    expect(dry.impact.instances).toBe(oldUsageOf(canvas, button.def.id).instances)
-    expect(dry.impact.overrides_orphaned).toEqual([])
-    expect(parsed.documents).toEqual([])
-  })
-
-  it('parses only the frames whose instances carry overrides, and finds the ones a rewrite orphans', () => {
-    const { canvas, frames } = fixture()
-    const overridden = frames[0]!
-    actions.updateFrame(
-      overridden.id,
-      { html: framed(overridden.id).replace('<span', '<span style="color: red"') },
-      actor,
-    )
-    expect(framed(overridden.id)).toContain('data-doop-overrides')
-    parsed.documents.length = 0
-    const dry = updateComponent(canvas.id, 'Button', { html: '<button class="btn">Buy</button>', dryRun: true }, actor)
-    expect(dry.impact.overrides_orphaned).toHaveLength(1)
-    expect(dry.impact.overrides_orphaned[0]!.frame_id).toBe(overridden.id)
-    expect(parsed.documents).toEqual([framed(overridden.id)])
+    const response = (await client.callTool({
+      name: 'update_component',
+      arguments: { canvas_id: canvas.id, agent_name: 'Tester', component: 'Button', css: '.btn { color: red }' },
+    })) as { isError?: boolean }
+    expect(response.isError).toBeFalsy()
+    /* the instances follow later, in the propagation queue: the call itself reads none of their frames */
+    for (const html of before) expect(parsed.documents).not.toContain(html)
+    await client.close()
   })
 })

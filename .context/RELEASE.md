@@ -38,9 +38,9 @@ Driven by `.github/workflows/desktop-release.yml`; every desktop job shares the 
 in `.github/actions/setup-desktop`:
 
 - Push a tag matching `desktop-v*` -> `dmg-macos` builds a universal (Apple Silicon + Intel) DMG
-  with `bunx tauri build --target universal-apple-darwin --bundles app,dmg`, `nsis-windows` builds
+  of the Chromium shell with `desktop/scripts/macos-universal.sh` (below), `nsis-windows` builds
   `doop_<version>_x64-setup.exe` with `bunx tauri build --bundles nsis`, `linux` builds the
-  x64 AppImage, .deb and .rpm on `ubuntu-22.04` (the oldest runner, for a low glibc floor) with
+  x64 AppImage, .deb and .rpm on Ubuntu 22.04 (`blacksmith-4vcpu-ubuntu-2204`, the oldest image, for a low glibc floor) with
   `bunx tauri build --bundles deb,rpm,appimage`, and a final `release` job (`needs` all three)
   attaches them to one GitHub Release - so a tag is never published with an installer missing.
 - The AppImage is repacked after the build by `desktop/scripts/appimage-drop-wayland.sh` (pinned
@@ -106,7 +106,8 @@ in `.github/actions/setup-desktop`:
 - Desktop app version is tracked separately from the root `package.json` and bumped by
   release-please (see above); after the release PR merges, tag as `desktop-vX.Y.Z`.
 - The macOS app is the Chromium (CEF) build in `desktop/src-tauri-chromium`; Windows and Linux
-  stay on the WebKit build. It ships as `doop` / `design.doop.desktop` with the executable
+  stay on the system-webview build in `desktop/src-tauri` (Tauri 2: WebView2, itself Chromium, on
+  Windows; WebKitGTK on Linux), which these notes call the WebKit build after its old macOS engine. It ships as `doop` / `design.doop.desktop` with the executable
   `doop-desktop`, exactly as the WebKit app did, so the updater swaps the bundle in place and
   relaunches it by its old path. The Tauri 3 CLI bundles CEF for one architecture at a time
   (its universal target ships one architecture's framework), so `dmg-macos` runs
@@ -146,6 +147,49 @@ tools, resources, OAuth and reconnecting against a fresh Doop server. Before rel
 also install it in Claude Desktop on macOS and Windows. Installation, build and release
 notes live in [`claude-extension/README.md`](../claude-extension/README.md). No directory
 submission or publication is performed by the build.
+
+## VS Code extension
+
+`vscode-extension/` is the Doop extension for VS Code and its forks (see its README), published as `doop.doop` by
+`.github/workflows/vscode-extension.yml`. Bump `version` in `vscode-extension/package.json`, merge, then push the
+tag `vscode-v<version>`: the workflow checks the tag matches, builds the VSIX, publishes it to the Visual Studio
+Marketplace (`VSCE_PAT` secret: an Azure DevOps token with Marketplace → Manage, all accessible organizations) and
+Open VSX, which Cursor, Windsurf and VSCodium read (`OVSX_PAT` secret), and attaches it to a GitHub Release. A store
+whose secret is missing is skipped with a warning. PRs touching the extension and manual runs build it and upload
+the VSIX as an artifact. The publisher (`doop` on marketplace.visualstudio.com/manage) and the Open VSX namespace
+(`ovsx create-namespace doop`) are made by hand, once. The extension id is also `EDITOR_EXTENSION_ID` in
+`shared/editorConnect.ts`, which the server checks sign-in links against. The server routes it needs (`/editor/*`)
+ship with the web app, so deploy the server before tagging.
+
+## doop CLI (npm)
+
+The doop CLI is the npm package `@doop-design/cli` (`bin`: `doop`), published by
+`.github/workflows/publish-cli.yml`. `bun run pack:cli` (`scripts/pack-doop-cli.mjs`) writes the package to
+`cli/dist`: the bundle Doop serves at `/cli/doop.mjs` (one build, `scripts/doop-cli-bundle.mjs`), its manifest
+`cli/package.json`, `cli/README.md` and the `LICENSE` where the repository has one.
+
+The CLI has its own version, in `cli/package.json`, as the desktop app and the editor extension have theirs: it
+is released when the CLI changes, not when the app's version does. `doop --version` prints it, from the npm
+package and from the file a server serves alike.
+
+To release: bump `version` in `cli/package.json`, merge, deploy the server if the CLI needs something new from
+it, then push the tag `cli-v<version>`. The workflow checks the tag matches, packs, runs the packed CLI and
+publishes. A manual run packs and uploads the package as an artifact without publishing. npm refuses a version
+that is already published.
+
+Publishing uses npm trusted publishing: the package's settings on npmjs.com name this repository and
+`publish-cli.yml` as its trusted publisher, and no npm token is stored as a secret. npm's conditions
+(docs.npmjs.com/trusted-publishers): a GitHub-hosted runner, which is why this job does not run on the self-hosted
+ones; npm 11.5.1 or newer, which the workflow installs; and a `repository.url` in the manifest that is the
+repository of the publishing workflow (`repository.url` in `cli/package.json`: moving the workflow to another
+repository means changing it too). Published from a private repository, the package carries no provenance.
+
+Done by hand, once: the `doop-design` organisation on npmjs.com; the first publish, since a trusted publisher is
+set on a package that exists (`bun run pack:cli`, then `npm publish ./cli/dist --access public` signed in as an
+owner of the organisation); and then, under the package's Settings → Trusted publishing, GitHub Actions with the
+organisation `doop-design`, this repository and the workflow file `publish-cli.yml`, allowing `npm publish` (a
+new configuration allows only `npm stage publish`, which waits for a maintainer's approval). A new configuration
+expires unless its first publish succeeds within two days, so set it up just before the first tagged release.
 
 ## Codex desktop setup
 

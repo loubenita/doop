@@ -1,5 +1,7 @@
 import type { Page } from 'puppeteer-core'
-import type { Canvas, CanvasPageInfo, Frame } from '../shared/types'
+import type { WireComponentDef } from '../shared/components'
+import type { DesignToken } from '../shared/designTokens'
+import type { AgentTask, Canvas, CanvasPageInfo, Frame } from '../shared/types'
 import { fixtureUrl } from './browser'
 
 declare global {
@@ -8,6 +10,14 @@ declare global {
       seed: (frames: Frame[], canvas?: Partial<Canvas>) => void
       /** the page list as the room would send it after someone's edit */
       setPages: (pages: CanvasPageInfo[]) => void
+      /** the canvas's tokens as the room's `tokens` message would set them */
+      setTokens: (tokens: DesignToken[], themes: string[]) => void
+      /** a component as the room's `component` message would set it */
+      setComponent: (component: WireComponentDef) => void
+      /** the agents' tasks as the room's init would carry them */
+      setTasks: (tasks: AgentTask[]) => void
+      /** the frame's HTML as the store holds it */
+      frameHtml: (id: string) => string
     }
   }
 }
@@ -70,5 +80,6 @@ export async function showCanvasPage(
   await page.goto(fixtureUrl(`canvasPage.html${search}`))
   await page.waitForFunction(() => !!window.canvasPageHarness && !!document.querySelector('.stage'))
   await page.evaluate((frames, canvas) => window.canvasPageHarness.seed(frames, canvas), frames, canvas)
-  await page.waitForSelector('[data-frame-title]')
+  /* an empty canvas has no frame title to wait for: its Layers rail is what shows */
+  await page.waitForSelector(frames.length ? '[data-frame-title]' : '[data-slot="pages-panel"]')
 }

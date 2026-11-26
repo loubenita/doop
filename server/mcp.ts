@@ -1,12 +1,13 @@
 import { env } from './env.ts'
 import { resolveAgentBrand } from '../shared/agentBrand.ts'
+import { agentKeyOf, isAgentsTask } from '../shared/agentIdentity.ts'
 import { MAX_DECISION_CHARS } from '../shared/designDecisions.ts'
 import packageJson from '../package.json' with { type: 'json' }
 import { createHash } from 'node:crypto'
 import { eq } from 'drizzle-orm'
 import { db } from './db/index.ts'
 import * as authSchema from './db/auth-schema.ts'
-import { canvasPages, framePageId, MAX_PAGE_NAME } from '../shared/pages.ts'
+import { canvasPages, framePageId, MAX_CANVAS_NAME, MAX_PAGE_NAME } from '../shared/pages.ts'
 import { normalizePageBackground } from '../shared/pageBackground.ts'
 import { prototypeReport, prototypeUrl, setPrototypeStart } from './prototypeTools.ts'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
@@ -15,13 +16,23 @@ import type { Request, Response } from 'express'
 import { fromNodeHeaders } from 'better-auth/node'
 import { z } from 'zod'
 import { store } from './store.ts'
-import { addPage, savePages, updateFrameMeta } from './pageTools.ts'
+import { composedHtml, stampRender } from './frameCompose.ts'
+import { addPage, savePages } from './pageTools.ts'
+import {
+  FIT_AXES,
+  FIT_ON,
+  FIT_NEEDS_HTML,
+  type FittedFrame,
+  fitNotes,
+  fitWrittenFrame,
+  updateFrameMetaWithFit,
+} from './frameFit.ts'
+import { isImportWriteFailure, runCanvasWrite } from './canvasWrites.ts'
 import { FontInputError, canUseScope, fontsForCanvas } from './fonts.ts'
 import { addGoogleFont } from './googleFonts.ts'
 import { customAgentsForCanvas } from './customAgents.ts'
 import { describeLibrary, libraryBrief, MAX_FONT_BYTES } from '../shared/fonts.ts'
 import { addCanvasFont, uploadedFontResult } from './canvasFontUpload.ts'
-import { inlineDataRefusal } from './inlineData.ts'
 import {
   MAX_TOKEN_DESCRIPTION,
   TOKEN_TYPES,
@@ -34,6 +45,7 @@ import {
 } from '../shared/designTokens.ts'
 import { webFontFamilies, webFontsBrief } from '../shared/webFonts.ts'
 import * as actions from './actions.ts'
+import { deliverRepoCard, readRepoFilesFor, repoCardBrief, repoCardTask } from './githubRecon.ts'
 import { canvasMoveRefusal, canvasRole } from './access.ts'
 import { roleAllows, type CanvasRole } from '../shared/canvasRole.ts'
 import { isAgentKeySecret, verifyAgentKey } from './agentKeys.ts'
@@ -41,7 +53,7 @@ import * as workspaces from './workspaces.ts'
 import { auth, getUserName, isBanned } from './auth.ts'
 import { capture, captureThrottled } from './analytics.ts'
 import { captureFeature, captureTokenResults } from './featureEvents.ts'
-import { renderFrame } from './screenshot.ts'
+import { inspectFrame, renderFrame } from './screenshot.ts'
 import { imagesForFrames } from './assets.ts'
 import type { FrameImage } from '../shared/imageDescriptions.ts'
 import { renderedHeight } from './renderLimits.ts'
@@ -55,13 +67,16 @@ import {
   takePdfExportSlot,
 } from './pdfExport.ts'
 import { primeImage } from './previews.ts'
-import { MAX_LAYER_SELECTOR_CHARS, layerExport } from './layerExport.ts'
+import { MAX_LAYER_SELECTOR_CHARS } from '../shared/elementId.ts'
+import { layerExport } from './layerExport.ts'
+import { renderStamp } from './styleVersion.ts'
 import {
   DEFAULT_EXPORT_SCALE,
   MAX_EXPORT_SCALE,
   MIN_EXPORT_SCALE,
   exportPixelSize,
   fitExportScale,
+  fullFrameRenderScale,
   parseExportScale,
 } from '../shared/exportScale.ts'
 import { COMPOSE_CHECK, GUIDE_TOPIC_SUMMARIES, GUIDE_TOPICS, guideFor } from './guide.ts'
@@ -86,8 +101,9 @@ import { normalizeImportUrl } from './importer.ts'
 import { extensions, type McpToolHelpers } from './extensions.ts'
 import { websiteAccessErrorMessage } from './websiteAccess.ts'
 import { mentionedRole } from '../shared/agents.ts'
+import { resolveCommentMentions, threadAuthorIds } from './canvasPeople.ts'
 import * as allowance from './allowance.ts'
-import { previewOf, previewToolMeta, registerFramePreview, type CanvasPreview } from './chatgptApp.ts'
+import { embedsPreview, previewOf, previewToolMeta, registerFramePreview, type CanvasPreview } from './chatgptApp.ts'
 import * as persist from './db/persist.ts'
 import type { FrameApproval } from '../shared/types.ts'
 import { recordAgentFeedback } from './agentFeedback.ts'
@@ -101,6 +117,8 @@ import {
 import {
   catalog,
   compactFrameHtml,
+  frameEditProblem,
+  unbalancedProblem,
   deletedComponentsInUse,
   findComponent,
   instancesIn,
@@ -115,8 +133,8 @@ import {
   streamChunkNotes,
 } from './componentTools.ts'
 import { componentSystemPlan } from './reuseNotes.ts'
-import { previewFrame } from './componentPreview.ts'
-import { activeComponents, INSTANCE_ATTR } from '../shared/components.ts'
+import { previewCombinations, previewDescription, previewFrame, previewProps } from './componentPreview.ts'
+import { activeComponents, componentSignature, INSTANCE_ATTR } from '../shared/components.ts'
 import { usageByComponent } from './componentUsage.ts'
 
 /* What every agent gets in the handshake. Claude Code cuts server instructions at 4,096
@@ -141,6 +159,7 @@ You MUST call get_guide({ topic: "doop-instructions" }) before using other Doop 
 - When Doop gets in your way, call report_issue, then carry on.`
 
 /** What this server's integrations add to the main guide. */
+
 function extensionGuideLines(): string[] {
   return extensions.flatMap((extension) => extension.mcpGuideLines ?? [])
 }
@@ -191,28 +210,20 @@ function withEscapeNote<T extends { content: { type: 'text' | 'image'; [k: strin
   return result
 }
 
-/** What a frame write could not do with components, and components it redrew by hand. */
+/** What a frame write could not do with components. */
 function withComponentNotes<T extends ToolContent>(result: T, frame: Frame, options?: { review?: boolean }): T {
   return withNotesFirst(result, componentWriteNotes(frame, options))
+}
+
+/** What fit_to_content did, right after the result's data: it says what the frame's size now is. */
+function withFitNote<T extends ToolContent>(result: T, fit: FittedFrame | undefined): T {
+  return withNotesFirst(result, fitNotes(fit))
 }
 
 /** Notes right after the result's data, ahead of the generic nudges: they name the call to make. */
 function withNotesFirst<T extends ToolContent>(result: T, notes: string[]): T {
   result.content.splice(1, 0, ...notes.map((note) => ({ type: 'text' as const, text: note })))
   return result
-}
-
-/** Find and replace in a frame, in the form get_frame shows it first: an agent copies from that. */
-function editFrameSource(frame: Frame, find: string, replace: string): { html: string } | { error: string } {
-  const compact = compactFrameHtml(frame)
-  const sources = compact === frame.html ? [frame.html] : [compact, frame.html]
-  for (const source of sources) {
-    const count = source.split(find).length - 1
-    if (count === 1) return { html: source.replace(find, () => replace) }
-    if (count > 1)
-      return { error: `old_str occurs ${count} times — include more surrounding context so it matches exactly once.` }
-  }
-  return { error: 'old_str not found in the frame HTML. Call get_frame to see the current content.' }
 }
 
 /** A PDF returned inline as base64; beyond this, export fewer frames. */
@@ -236,7 +247,7 @@ function withGuidelinesNudge<T extends { content: { type: 'text' | 'image'; [k: 
 ): T {
   if (!actor) return result
   const docs = store.getGuidelines(canvasId)
-  if (docs.length === 0 || actions.hasSeenGuidelines(canvasId, actor.name)) return result
+  if (docs.length === 0 || actions.hasSeenGuidelines(canvasId, agentKeyOf(actor))) return result
   result.content.push({
     type: 'text' as const,
     text: `This canvas has style guides you have not read: ${docs.map((d) => d.name).join(', ')}. Call get_guidelines({ canvas_id, name }) for each relevant one NOW and make your design follow them.`,
@@ -244,17 +255,44 @@ function withGuidelinesNudge<T extends { content: { type: 'text' | 'image'; [k: 
   return result
 }
 
+/** Whose work a task is, as the agent reading about it should hear it: its
+ *  own, another agent's, or another agent going by its own name (two
+ *  people's agents may both be "Claude"). */
+function whoseWork(task: { agentName: string; agentKey?: string }, actor: Actor): string {
+  if (isAgentsTask(task, actor)) return 'your'
+  if (task.agentName === actor.name) return `another ${task.agentName}’s`
+  return `${task.agentName}’s`
+}
+
+/** Claimed feedback as an agent is handed it, by get_feedback and by the agent API
+ *  (server/agentApi.ts): who asked, what for, and whose work it is about. */
+export function describeFeedback(
+  canvasId: string,
+  claimed: ReturnType<typeof actions.takeFeedbackFor>,
+  actor: Actor,
+): { from: string; text: string; about?: string; at: string }[] {
+  const tasks = actions.getTasks(canvasId)
+  return claimed.map((item) => {
+    const task = tasks.find((candidate) => candidate.id === item.taskId)
+    return {
+      from: item.from,
+      text: item.text,
+      ...(task ? { about: `${whoseWork(task, actor)} work: “${task.status}”` } : {}),
+      at: new Date(item.at).toISOString(),
+    }
+  })
+}
+
 /** Append any undelivered human feedback for this agent to a tool result.
  *  MCP is pull-based, so this is the channel through which humans steer agents. */
 function appendFeedback<T extends ToolContent>(result: T, canvasId: string, actor?: Actor): T {
   if (!actor) return result
-  const pending = actions.takeFeedbackFor(canvasId, actor.name)
+  const pending = actions.takeFeedbackFor(canvasId, actor)
   if (pending.length === 0) return result
   const tasks = actions.getTasks(canvasId)
   const lines = pending.map((f) => {
     const task = tasks.find((t) => t.id === f.taskId)
-    const mine = task && task.agentName === actor.name
-    const about = task ? ` (about ${mine ? 'your' : `${task.agentName}’s`} work: “${task.status}”)` : ''
+    const about = task ? ` (about ${whoseWork(task, actor)} work: “${task.status}”)` : ''
     return `- ${f.from}${about}: ${f.text}`
   })
   result.content.push({
@@ -269,7 +307,7 @@ function appendFeedback<T extends ToolContent>(result: T, canvasId: string, acto
  *  stays with get_feedback and the tools that change the canvas. */
 function appendFeedbackNotice<T extends ToolContent>(result: T, canvasId: string, actor?: Actor): T {
   if (!actor) return result
-  const open = actions.openFeedbackFor(canvasId, actor.name).length
+  const open = actions.openFeedbackFor(canvasId, actor).length
   if (open === 0) return result
   result.content.push({
     type: 'text' as const,
@@ -279,9 +317,12 @@ function appendFeedbackNotice<T extends ToolContent>(result: T, canvasId: string
 }
 
 /** Attaches the data behind the ChatGPT preview card (server/chatgptApp.ts):
- *  the frames a tool touched, as `structuredContent`. Clients without a
- *  component host ignore it; the model keeps reading `content` as before. */
-function withPreview<T extends { content: unknown[] }>(
+ *  the frames a tool touched, as `structuredContent`. Only for a client that
+ *  embeds the card: the card's data is not the tool's answer, and a client
+ *  that reads `structuredContent` in place of `content` (Claude Code,
+ *  opencode, Codex) would see nothing else, no pages, positions, notes or
+ *  HUMAN FEEDBACK (#526). */
+function attachPreview<T extends { content: unknown[] }>(
   result: T,
   canvasId: string,
   frames: Frame[],
@@ -375,8 +416,15 @@ function frameSummary(
  *  name remembered from initialize, else the OAuth application's): feedback
  *  records it and agent presence reads its brand from it. */
 export function buildMcpServer(owner?: string, ownerId?: string, clientName?: string): McpServer {
-  const actorFrom = (agent_name?: string) =>
-    actions.resolveActor({ name: agent_name, kind: 'agent', owner, brand: resolveAgentBrand(clientName, agent_name) })
+  const actorFrom = (agent_name?: string) => {
+    const actor = actions.resolveActor({
+      name: agent_name,
+      kind: 'agent',
+      owner,
+      brand: resolveAgentBrand(clientName, agent_name),
+    })
+    return { ...actor, agentKey: mcpAgentKey(ownerId, actor.name) }
+  }
   /* Canvas access for agents mirrors the web UI: the OAuth user's id runs
      through the same canvasRole gate as browser sessions, so an agent
      connected by someone holding a view or comment link reads but cannot
@@ -408,7 +456,20 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
   const withFeedback = <T extends ToolContent>(result: T, canvasId: string, actor?: Actor): T =>
     roleAllows(roleOn(canvasId), 'edit') ? appendFeedback(result, canvasId, actor) : result
   const withFeedbackNotice = <T extends ToolContent>(result: T, canvasId: string, actor?: Actor): T =>
-    roleAllows(roleOn(canvasId), 'edit') ? appendFeedbackNotice(result, canvasId, actor) : result
+    roleAllows(roleOn(canvasId), 'edit')
+      ? appendRepoCardsNotice(appendFeedbackNotice(result, canvasId, actor), canvasId)
+      : result
+  /* repo import cards this account queued for its own agent (no Doop Agent plan) */
+  const appendRepoCardsNotice = <T extends ToolContent>(result: T, canvasId: string): T => {
+    const mine = actions.waitingOutsideCards(canvasId, ownerId)
+    if (!mine.length) return result
+    const repos = [...new Set(mine.map((c) => c.payload?.repo))].join(', ')
+    result.content.push({
+      type: 'text' as const,
+      text: `REPO IMPORT — ${mine.length} card${mine.length === 1 ? '' : 's'} from ${repos} queued for you on this canvas (your person imported a GitHub repo and asked you to build it). Call take_repo_cards({ canvas_id, agent_name }) to take and build them.`,
+    })
+    return result
+  }
   const withStatusNudge = <T extends ToolContent>(result: T, canvasId: string, actor?: Actor): T =>
     roleAllows(roleOn(canvasId), 'edit') ? appendStatusNudge(result, canvasId, actor) : result
   const noComment = (id: string) => err(`no comment with id ${id} on this canvas`)
@@ -460,6 +521,12 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
   const server = new McpServer({ name: 'doop-canvas', version: packageJson.version }, { instructions: INSTRUCTIONS })
   loadToolTargets(server)
   registerFramePreview(server)
+  /* only for a client that shows the card inside the conversation (embedsPreview) */
+  const embedsCard = embedsPreview(clientName)
+  const previewMeta = (invoking: string, invoked: string) =>
+    embedsCard ? previewToolMeta(invoking, invoked) : undefined
+  const withPreview = <T extends { content: unknown[] }>(result: T, canvasId: string, frames: Frame[]) =>
+    embedsCard ? attachPreview(result, canvasId, frames) : result
 
   server.registerTool(
     'get_guide',
@@ -580,7 +647,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
         'Create a new design canvas. Returns the canvas id, which is part of the shareable URL (/c/<id>). Pass workspace_id (from list_canvases) to create it inside a shared workspace so every member can open it.',
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
       inputSchema: {
-        name: z.string().describe('Canvas name'),
+        name: z.string().trim().min(1).max(MAX_CANVAS_NAME).describe('Canvas name'),
         workspace_id: z.string().optional().describe('Create inside this shared workspace'),
         agent_name: agentName.optional(),
       },
@@ -733,10 +800,32 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
   )
 
   server.registerTool(
+    'update_canvas',
+    {
+      title: 'Rename a canvas',
+      description:
+        'Rename a canvas: the name on its tab, in the dashboard and in get_canvas. Everyone viewing it sees the new name at once. Pages are renamed with set_canvas_pages, frames with update_frame.',
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      inputSchema: {
+        canvas_id: z.string(),
+        name: z.string().trim().min(1).max(MAX_CANVAS_NAME).describe('The new canvas name'),
+        agent_name: agentName,
+      },
+    },
+    async ({ canvas_id, name, agent_name }) => {
+      if (!canvasFor(canvas_id, 'edit')) return noCanvas(canvas_id)
+      const actor = actorFrom(agent_name)
+      const canvas = actions.renameCanvas(canvas_id, name, actor)
+      if (!canvas) return noCanvas(canvas_id)
+      return withFeedback(text({ ok: true, id: canvas.id, name: canvas.name }), canvas_id, actor)
+    },
+  )
+
+  server.registerTool(
     'get_canvas',
     {
       title: 'Get a canvas and its frames',
-      _meta: previewToolMeta('Reading the canvas…', 'Canvas loaded'),
+      _meta: previewMeta('Reading the canvas…', 'Canvas loaded'),
       description:
         "Get a canvas: its name, its pages (id, name, prototype start frame) and its frames with pageId, position, size, approvalStatus and human approval attribution (not the HTML — use get_frame for that). Pass page_id to see one page's frames only; filter approval_status to ready_for_dev to find screens approved for implementation. Use this to see the current layout before adding or editing frames. Pass your agent_name so the result can tell you when human feedback is waiting (claim it with get_feedback).",
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -873,7 +962,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
     },
     async ({ canvas_id, agent_name }) => {
       if (!canvasFor(canvas_id, 'view')) return noCanvas(canvas_id)
-      if (agent_name) actions.markGuidelinesSeen(canvas_id, actorFrom(agent_name).name)
+      if (agent_name) actions.markGuidelinesSeen(canvas_id, agentKeyOf(actorFrom(agent_name)))
       const docs = store.getGuidelines(canvas_id)
       if (docs.length === 0)
         return text({
@@ -921,7 +1010,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
             : `no style guides on this canvas yet`,
         )
       }
-      if (agent_name) actions.markGuidelinesSeen(canvas_id, actorFrom(agent_name).name)
+      if (agent_name) actions.markGuidelinesSeen(canvas_id, agentKeyOf(actorFrom(agent_name)))
       return withFeedbackNotice(text(doc.markdown), canvas_id, agent_name ? actorFrom(agent_name) : undefined)
     },
   )
@@ -953,7 +1042,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
       const actor = actorFrom(agent_name)
       try {
         const doc = actions.setGuideline(canvas_id, name, markdown, actor, undefined, title)
-        actions.markGuidelinesSeen(canvas_id, actor.name)
+        actions.markGuidelinesSeen(canvas_id, agentKeyOf(actor))
         return withFeedback(
           text(
             doc
@@ -1050,10 +1139,10 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
     async ({ canvas_id, tokens, agent_name }) => {
       if (!canvasFor(canvas_id, 'edit')) return noCanvas(canvas_id)
       const actor = actorFrom(agent_name)
-      const results = actions.createTokens(canvas_id, tokens, actor)
-      if (!results) return noCanvas(canvas_id)
-      captureTokenResults(ownerId, canvas_id, 'mcp', results)
-      return withFeedback(text({ results }), canvas_id, actor)
+      const written = await runCanvasWrite(canvas_id, { type: 'create-tokens', tokens, actor })
+      if (!written) return noCanvas(canvas_id)
+      captureTokenResults(ownerId, canvas_id, 'mcp', written.results)
+      return withFeedback(text({ results: written.results }), canvas_id, actor)
     },
   )
 
@@ -1089,14 +1178,17 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
     async ({ canvas_id, tokens, agent_name }) => {
       if (!canvasFor(canvas_id, 'edit')) return noCanvas(canvas_id)
       const actor = actorFrom(agent_name)
-      const results = actions.setTokens(
-        canvas_id,
-        tokens.map(({ new_name, ...rest }) => ({ ...rest, ...(new_name !== undefined ? { newName: new_name } : {}) })),
+      const written = await runCanvasWrite(canvas_id, {
+        type: 'set-tokens',
+        edits: tokens.map(({ new_name, ...rest }) => ({
+          ...rest,
+          ...(new_name !== undefined ? { newName: new_name } : {}),
+        })),
         actor,
-      )
-      if (!results) return noCanvas(canvas_id)
-      captureTokenResults(ownerId, canvas_id, 'mcp', results)
-      return withFeedback(text({ results }), canvas_id, actor)
+      })
+      if (!written) return noCanvas(canvas_id)
+      captureTokenResults(ownerId, canvas_id, 'mcp', written.results)
+      return withFeedback(text({ results: written.results }), canvas_id, actor)
     },
   )
 
@@ -1124,12 +1216,14 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
       if (!canvasFor(canvas_id, 'edit')) return noCanvas(canvas_id)
       const actor = actorFrom(agent_name)
       try {
-        const set = actions.setTokenThemes(canvas_id, themes, actor, renames ?? [])
+        const set = await runCanvasWrite(canvas_id, { type: 'set-token-themes', themes, renames, actor })
         if (!set) return noCanvas(canvas_id)
-        captureFeature(ownerId, 'token_themes_set', 'mcp', { canvas_id, theme_count: set.length })
-        return withFeedback(text({ ok: true, themes: set }), canvas_id, actor)
+        captureFeature(ownerId, 'token_themes_set', 'mcp', { canvas_id, theme_count: set.themes.length })
+        return withFeedback(text({ ok: true, themes: set.themes }), canvas_id, actor)
       } catch (e) {
-        return err(e instanceof Error ? e.message : 'invalid themes')
+        /* only a refusal of the list; anything else fails the tool call, its writes undone */
+        if (e instanceof actions.TokenThemesError) return err(e.message)
+        throw e
       }
     },
   )
@@ -1277,7 +1371,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
     {
       title: 'Reply to a comment',
       description:
-        'Reply inside an element-comment thread on a canvas. The reply inherits the root comment’s element anchor, so an @mention in it gives the resident agent the same anchor the conversation is about. Writing does not resolve the thread — read the request with get_comments, make the change, then close it with resolve_comment. If the text @mentions a resident role (e.g. "@Doop"), it counts as a new resident task against the account’s meter, exactly like a comment left in the browser.',
+        'Reply inside an element-comment thread on a canvas. The reply inherits the root comment’s element anchor, so an @mention in it gives the resident agent the same anchor the conversation is about. Writing does not resolve the thread — read the request with get_comments, make the change, then close it with resolve_comment. If the text @mentions a resident role (e.g. "@Doop"), it counts as a new resident task against the account’s meter, exactly like a comment left in the browser. To tag a person, write @ and their name exactly as a comment\'s `from` spells it (e.g. "@Ana Souza"): someone the canvas is shared with, or already in the thread, is emailed at once.',
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
       inputSchema: {
         canvas_id: z.string(),
@@ -1290,10 +1384,13 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
       if (!canvasFor(canvas_id, 'comment')) return noCanvas(canvas_id)
       const found = actions.findComment(comment_id)
       if (!found || found.canvasId !== canvas_id) return noComment(comment_id)
-      if (!body.trim() || !actions.openThread(comment_id)) return err('thread resolved or empty text')
+      const canvas = store.getCanvas(canvas_id)
+      if (!body.trim() || !canvas || !actions.openThread(comment_id)) return err('thread resolved or empty text')
+      /* people it tags are emailed; a person's name is never an agent's */
+      const mentions = await resolveCommentMentions(canvas, body.trim(), { authorIds: threadAuthorIds(found) })
       /* an @mention commands the resident agent to change frames — the REST
          reply route holds comment-only visitors to the same rule */
-      const mentioned = mentionedRole(body, actions.canvasRoster(canvas_id))
+      const mentioned = mentionedRole(mentions.roleText, actions.canvasRoster(canvas_id))
       if (mentioned && !canvasFor(canvas_id, 'edit'))
         return err('asking an agent to change the canvas needs edit access')
       const actor = actorFrom(agent_name)
@@ -1312,7 +1409,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
       /* attributed to the agent, billed to the connecting user: the resident
          picks whose model account pays from the requester id, and without one
          it falls back to the canvas owner's — wrong on a shared canvas */
-      const reply = actions.replyToComment(comment_id, body, actor.name, ownerId, 'agent')
+      const reply = actions.replyToComment(comment_id, body, actor.name, ownerId, 'agent', mentions)
       if (!reply) {
         /* the thread closed while the meter was being written: give the task back */
         if (gate && ownerId) {
@@ -1373,21 +1470,153 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
     },
     async ({ canvas_id, agent_name }) => {
       if (!canvasFor(canvas_id, 'edit')) return noCanvas(canvas_id)
-      const fbs = actions.takeFeedbackFor(canvas_id, actorFrom(agent_name).name)
+      const actor = actorFrom(agent_name)
+      const fbs = actions.takeFeedbackFor(canvas_id, actor)
       if (fbs.length === 0) return text({ feedback: [], note: 'No open feedback requests right now.' })
-      const tasks = actions.getTasks(canvas_id)
       return text({
-        feedback: fbs.map((f) => {
-          const task = tasks.find((t) => t.id === f.taskId)
-          return {
-            from: f.from,
-            text: f.text,
-            about: task ? `${task.agentName}: “${task.status}”` : undefined,
-            at: new Date(f.at).toISOString(),
-          }
-        }),
+        feedback: describeFeedback(canvas_id, fbs, actor),
         note: "These requests are now assigned to you. Address each one (a human request overrides the don't-touch-others'-frames etiquette), review with get_frame_screenshot, and update your set_status.",
       })
+    },
+  )
+
+  /* GitHub import cards queued for this account's own agent: the person has
+     no Doop Agent plan, so the server reads the repo and the agent designs */
+  server.registerTool(
+    'take_repo_cards',
+    {
+      title: 'Take queued GitHub import cards',
+      description:
+        'Take the GitHub repo import cards queued for your account on a canvas (a person imported a repo in Doop, and with no Doop Agent plan connected the work waits for you). Returns the cards you now hold: a design-system card (distill the repo’s real palette, type, radii and component idioms into markdown) and screen cards (rebuild one page or component from its source as a self-contained HTML document), each with the repository tree to investigate. Read files with read_repo_files, then deliver each with finish_repo_card. Do design-system cards first: their guide grounds the screens. Calling it again returns the cards you still hold, plus more from the queue.',
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      inputSchema: {
+        canvas_id: z.string(),
+        agent_name: agentName,
+        limit: z.number().int().min(1).max(12).optional().describe('How many cards to hold at once (default 4).'),
+      },
+    },
+    async ({ canvas_id, agent_name, limit }) => {
+      if (!canvasFor(canvas_id, 'edit')) return noCanvas(canvas_id)
+      const actor = actorFrom(agent_name)
+      arrive(canvas_id, agent_name)
+      const cards = actions.takeOutsideRepoCards(canvas_id, actor, ownerId, limit ?? 4)
+      if (!cards.length) return text({ cards: [], note: 'No repo import cards are waiting on this canvas.' })
+      const briefs = []
+      for (const card of cards) {
+        try {
+          const brief = await repoCardBrief(canvas_id, card)
+          if (!brief) {
+            actions.failCard(canvas_id, card.id, 'This card lost its repository details. Import again.')
+            continue
+          }
+          const screen = card.payload?.screen
+          briefs.push({
+            card_id: card.id,
+            kind: card.kind,
+            repo: card.payload?.repo,
+            ...(screen
+              ? {
+                  screen: {
+                    title: screen.title,
+                    route: screen.route,
+                    source_path: screen.sourcePath,
+                    kind: screen.kind,
+                  },
+                }
+              : {}),
+            task: repoCardTask(card, brief),
+            tree: brief.tree,
+          })
+        } catch (e) {
+          actions.failCard(
+            canvas_id,
+            card.id,
+            `Could not read the repository: ${e instanceof Error ? e.message : String(e)}. Retry when you are ready.`,
+          )
+        }
+      }
+      actions.narrateAgent(canvas_id, actor, `Importing ${briefs[0]?.repo ?? 'a repository'} from GitHub`)
+      return text({
+        cards: briefs,
+        note: 'These cards are yours now and show on the board under your name. For each: read_repo_files → design → finish_repo_card. After a screen lands, check it with get_frame_screenshot and fix it with set_frame_html or edit_frame_html (keep the doop-github-screen meta). If one cannot be done, finish_repo_card with failed_reason.',
+      })
+    },
+  )
+
+  server.registerTool(
+    'read_repo_files',
+    {
+      title: 'Read files from an imported GitHub repo',
+      description:
+        'Read files from the repository behind a repo import card you hold (take_repo_cards). Paths come from the card’s tree. Up to 15 files and about 100 KB a call; ask again for more.',
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+      inputSchema: {
+        canvas_id: z.string(),
+        card_id: z.string(),
+        paths: z.array(z.string()).min(1).max(15),
+        agent_name: agentName,
+      },
+    },
+    async ({ canvas_id, card_id, paths, agent_name }) => {
+      if (!canvasFor(canvas_id, 'edit')) return noCanvas(canvas_id)
+      const card = actions.outsideCardOf(canvas_id, card_id, actorFrom(agent_name), ownerId)
+      if (!card) return err(`you hold no open repo import card ${card_id} on this canvas — call take_repo_cards first`)
+      try {
+        return text({ files: await readRepoFilesFor(canvas_id, card, paths) })
+      } catch (e) {
+        return err(e instanceof Error ? e.message : String(e))
+      }
+    },
+  )
+
+  server.registerTool(
+    'finish_repo_card',
+    {
+      title: 'Deliver a GitHub import card',
+      description:
+        'Deliver a repo import card you hold. A screen card takes `html` (the complete document, ending with <!-- doop-height: N -->; omit it for committed-HTML screens) and lands it as a frame beside the import’s other screens. A design-system card takes `markdown` and pins it as the canvas guideline. Pass `failed_reason` instead when the card cannot be done; the person sees it on the board and can retry.',
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      inputSchema: {
+        canvas_id: z.string(),
+        card_id: z.string(),
+        html: z.string().max(1_000_000).optional(),
+        markdown: z.string().max(60_000).optional(),
+        failed_reason: z.string().max(300).optional(),
+        agent_name: agentName,
+      },
+    },
+    async ({ canvas_id, card_id, html, markdown, failed_reason, agent_name }) => {
+      if (!canvasFor(canvas_id, 'edit')) return noCanvas(canvas_id)
+      const actor = actorFrom(agent_name)
+      const card = actions.outsideCardOf(canvas_id, card_id, actor, ownerId)
+      if (!card) return err(`you hold no open repo import card ${card_id} on this canvas — call take_repo_cards first`)
+      if (failed_reason) {
+        actions.failCard(canvas_id, card.id, failed_reason)
+        return withFeedback(text({ ok: true, card_id, failed: true }), canvas_id, actor)
+      }
+      try {
+        const landed = await deliverRepoCard(
+          canvas_id,
+          card,
+          { ...(html !== undefined ? { html } : {}), ...(markdown !== undefined ? { markdown } : {}) },
+          actor,
+          'mcp',
+        )
+        const left = actions.takeOutsideRepoCards(canvas_id, actor, ownerId, 0).length
+        if ('guideline' in landed)
+          return withFeedback(text({ ok: true, card_id, guideline: landed.guideline, left }), canvas_id, actor)
+        const { frame } = landed
+        return withFeedback(
+          textWithNudge(
+            { ok: true, card_id, frame_id: frame.id, width: frame.width, height: frame.height, left },
+            REVIEW_NUDGE,
+          ),
+          canvas_id,
+          actor,
+        )
+      } catch (e) {
+        return err(e instanceof Error ? e.message : String(e))
+      }
     },
   )
 
@@ -1619,27 +1848,43 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
         y: z.number().optional(),
         width: z.number().optional().describe('Default 640'),
         height: z.number().optional().describe('Default 480'),
+        fit_to_content: z
+          .enum(FIT_AXES)
+          .optional()
+          .describe(
+            `${FIT_ON.create} Needs the whole design in html: after streaming with append_frame_html, call update_frame with fit_to_content instead.`,
+          ),
         agent_name: agentName,
       },
     },
-    async ({ canvas_id, pageId, name, html, x, y, width, height, agent_name }) => {
+    async ({ canvas_id, pageId, name, html, x, y, width, height, fit_to_content, agent_name }) => {
       if (!canvasFor(canvas_id, 'edit')) return noCanvas(canvas_id)
-      const inline = inlineDataRefusal(html)
-      if (inline) return err(inline)
-      const frame = actions.createFrame(canvas_id, { name, pageId, html, x, y, width, height }, actorFrom(agent_name))
-      if (!frame) return noCanvas(canvas_id)
+      if (fit_to_content && !html.trim()) return err(FIT_NEEDS_HTML)
+      const created = await runCanvasWrite(canvas_id, {
+        type: 'create-frame',
+        input: { name, pageId, html, x, y, width, height },
+        actor: actorFrom(agent_name),
+        inline: 'mcp',
+      })
+      if (created && 'inline' in created) return err(created.inline)
+      if (!created) return noCanvas(canvas_id)
+      const fit = fit_to_content ? await fitWrittenFrame(created, fit_to_content, actorFrom(agent_name)) : undefined
+      const frame = fit?.frame ?? created
       const canvas = store.getCanvas(canvas_id)
-      const result = withComponentNotes(
-        withEscapeNote(
-          frame.html.length > 0
-            ? textWithNudge({ ok: true, frame: frameSummary(frame) }, REVIEW_NUDGE)
-            : canvas
-              ? textWithNudge({ ok: true, frame: frameSummary(frame) }, componentSystemPlan(canvas))
-              : text({ ok: true, frame: frameSummary(frame) }),
-          html,
+      const result = withFitNote(
+        withComponentNotes(
+          withEscapeNote(
+            frame.html.length > 0
+              ? textWithNudge({ ok: true, frame: frameSummary(frame) }, REVIEW_NUDGE)
+              : canvas
+                ? textWithNudge({ ok: true, frame: frameSummary(frame) }, componentSystemPlan(canvas))
+                : text({ ok: true, frame: frameSummary(frame) }),
+            html,
+          ),
+          frame,
+          { review: frame.html.length > 0 },
         ),
-        frame,
-        { review: frame.html.length > 0 },
+        fit,
       )
       return withGuidelinesNudge(
         withStatusNudge(withFeedback(result, canvas_id, actorFrom(agent_name)), canvas_id, actorFrom(agent_name)),
@@ -1674,7 +1919,9 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
       return withFeedbackNotice(
         text({
           ...frameSummary(f, images),
-          html: expand_components ? f.html : compactFrameHtml(f),
+          /* the full form is the document as rendered: the canvas's component stylesheets
+             and token values composed in (server/frameCompose.ts) */
+          html: expand_components ? composedHtml(f.canvasId, f.html) : compactFrameHtml(f),
           ...(instances.length ? { instances } : {}),
         }),
         f.canvasId,
@@ -1687,28 +1934,47 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
     'set_frame_html',
     {
       title: 'Replace a frame’s HTML',
-      _meta: previewToolMeta('Redesigning the frame…', 'Frame redesigned'),
+      _meta: previewMeta('Redesigning the frame…', 'Frame redesigned'),
       description:
         'Replace the HTML design of a frame in one shot. The change renders live for everyone viewing the canvas. For new or heavily reworked designs, prefer append_frame_html so viewers can watch the design stream in. Keep data-doop-* attributes on elements you carry over: comments and links point at data-doop-id, prototype wiring and locks ride on the others. ' +
         COMPOSE_CHECK,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
-      inputSchema: { frame_id: z.string(), html: z.string(), agent_name: agentName },
+      inputSchema: {
+        frame_id: z.string(),
+        html: z.string(),
+        fit_to_content: z.enum(FIT_AXES).optional().describe(FIT_ON.set),
+        agent_name: agentName,
+      },
     },
-    async ({ frame_id, html, agent_name }) => {
+    async ({ frame_id, html, fit_to_content, agent_name }) => {
       const current = frameFor(frame_id, 'edit')
       if (!current) return noFrame(frame_id)
-      const inline = inlineDataRefusal(html, current.html)
-      if (inline) return err(inline)
-      const frame = actions.updateFrame(frame_id, { html }, actorFrom(agent_name), { replace: true })
-      if (!frame) return noFrame(frame_id)
+      /* refused there if it adds inline data: every form the agent may have read the frame in
+         counts as what it already held, so a rewrite of the full form carries over what the
+         canvas supplies to it (server/canvasWrites.ts) */
+      const written = await runCanvasWrite(current.canvasId, {
+        type: 'write-frame',
+        frameId: frame_id,
+        patch: { html },
+        actor: actorFrom(agent_name),
+        replace: true,
+        inline: 'mcp',
+      })
+      if (written && 'inline' in written) return err(written.inline)
+      if (!written) return noFrame(frame_id)
+      const fit = fit_to_content ? await fitWrittenFrame(written, fit_to_content, actorFrom(agent_name)) : undefined
+      const frame = fit?.frame ?? written
       return withPreview(
         withGuidelinesNudge(
           withStatusNudge(
             withFeedback(
-              withComponentNotes(
-                withEscapeNote(textWithNudge({ ok: true, frame: frameSummary(frame) }, REVIEW_NUDGE), html),
-                frame,
-                { review: true },
+              withFitNote(
+                withComponentNotes(
+                  withEscapeNote(textWithNudge({ ok: true, frame: frameSummary(frame) }, REVIEW_NUDGE), html),
+                  frame,
+                  { review: true },
+                ),
+                fit,
               ),
               frame.canvasId,
               actorFrom(agent_name),
@@ -1759,11 +2025,12 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
       if (format === 'pdf') return exportPdf(f, frame_ids ?? [])
       const ext = format === 'jpg' ? 'jpg' : 'png'
       const q = ext === 'jpg' ? `&quality=${quality ?? 90}` : ''
-      const density = fitExportScale(f, parseExportScale(scale ?? DEFAULT_EXPORT_SCALE) ?? DEFAULT_EXPORT_SCALE)
-      const pixels = exportPixelSize(f, density)
+      const requested = fitExportScale(f, parseExportScale(scale ?? DEFAULT_EXPORT_SCALE) ?? DEFAULT_EXPORT_SCALE)
+      const density = fullFrameRenderScale(f, requested)
+      const pixels = exportPixelSize({ width: Math.round(f.width), height: Math.round(f.height) }, density)
       return text({
-        image_url: `${env.BETTER_AUTH_URL}/i/${frame_id}.${ext}?scale=${density}${q}`,
-        download_url: `${env.BETTER_AUTH_URL}/i/${frame_id}.${ext}?scale=${density}${q}&download`,
+        image_url: `${env.BETTER_AUTH_URL}/i/${frame_id}.${ext}?scale=${requested}${q}`,
+        download_url: `${env.BETTER_AUTH_URL}/i/${frame_id}.${ext}?scale=${requested}${q}&download`,
         scale: density,
         width: pixels.width,
         height: pixels.height,
@@ -2002,8 +2269,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
     'generate_image',
     {
       title: 'Generate an image with AI',
-      description:
-        "Generate an image from a text prompt and store it as a permanent asset on this origin — returns the URL to embed plus a preview you can look at. Use it for visuals stock search cannot supply: brand-specific illustration, a product render, a mascot, abstract hero art in the frame's exact palette. Prefer search_images for ordinary photography. It runs on the connecting human's connected ChatGPT subscription or OpenAI key (else the server's key) and costs them quota or money, so write ONE considered prompt: subject, style, composition, palette hexes, lighting, what to leave out. Generation takes 20–60 seconds. ONLY generate when the design genuinely needs it or the human asked.",
+      description: `Generate an image from a text prompt and store it as a permanent asset on this origin — returns the URL to embed plus a preview you can look at. ${imageGen.IMAGE_PROVIDER_NOTE} Use it for visuals stock search cannot supply: brand-specific illustration, a product render, a mascot, abstract hero art in the frame's exact palette. Prefer search_images for ordinary photography. It costs the connecting human quota or money, so write ONE considered prompt: subject, style, composition, palette hexes, lighting, what to leave out. Generation takes 20–60 seconds. ONLY generate when the design genuinely needs it or the human asked.`,
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
       inputSchema: {
         prompt: z.string().describe('What to draw: subject, style, composition, palette, lighting, mood'),
@@ -2327,7 +2593,7 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
     'import_webpage',
     {
       title: 'Import an editable webpage',
-      _meta: previewToolMeta('Importing the webpage…', 'Webpage imported'),
+      _meta: previewMeta('Importing the webpage…', 'Webpage imported'),
       description:
         'Import ONE public webpage into a canvas as an editable HTML snapshot. The rendered DOM is captured, scripts/iframes are removed, stylesheets are inlined, and the resulting source frame appears on the canvas for comparison or editing. Use this when a referenced or redesign-target page should be visible to everyone; leave the imported source frame unchanged and make the new design in a separate frame. For inspection without changing the canvas, use view_website.',
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
@@ -2391,6 +2657,8 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
           frame,
         ])
       } catch (e) {
+        /* a refused write fails the tool call, which undoes it */
+        if (isImportWriteFailure(e)) throw e
         return err(
           websiteAccessErrorMessage(e, 'connected-agent') ?? (e instanceof Error ? e.message : 'webpage import failed'),
         )
@@ -2470,23 +2738,27 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
     'get_component_preview',
     {
       title: 'See a component',
-      description:
-        'Render a component in every combination of its enum props (up to 12) and return one image — how you SEE variants, which exist only as CSS. Look at it after creating or changing a component.',
+      description: previewDescription,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-      inputSchema: { canvas_id: z.string(), component: z.string(), agent_name: agentName.optional() },
+      inputSchema: {
+        canvas_id: z.string(),
+        component: z.string(),
+        props: previewProps,
+        agent_name: agentName.optional(),
+      },
     },
-    async ({ canvas_id, component, agent_name }) => {
+    async ({ canvas_id, component, props, agent_name }) => {
       if (!canvasFor(canvas_id, 'view')) return noCanvas(canvas_id)
       arrive(canvas_id, agent_name)
       const def = findComponent(canvas_id, component)
       if (!def) return err(`no component “${component}” on this canvas`)
-      const sheet = previewFrame(canvas_id, def)
       try {
+        const sheet = previewFrame(canvas_id, def, previewCombinations(def, props))
         const png = await renderFrame(sheet, 1)
         return {
           content: [
             { type: 'image' as const, data: png.toString('base64'), mimeType: 'image/png' },
-            { type: 'text' as const, text: `“${def.name}” at revision ${def.rev}, ${sheet.variants} variant(s).` },
+            { type: 'text' as const, text: `${componentSignature(def)} at revision ${def.rev}` },
           ],
         }
       } catch (e) {
@@ -2496,10 +2768,44 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
   )
 
   server.registerTool(
+    'inspect_frame',
+    {
+      title: 'Inspect a rendered frame',
+      description:
+        "Render a frame and read it as data rather than pixels: the design in use (colours, backgrounds, fonts, sizes, radii, shadows, CSS variables), an outline of its key elements with text, box (design px) and computed style, and `problems`: content past the frame's edge, text cut off by its box, and text or controls overlapping. Problems are candidates to check against the screenshot: a deliberate overlap (stacked avatars, a label on a photo) or a clipped preview is fine as it is. Pass selectors to report on those elements instead of the automatic outline (a data-doop-id, a class, any CSS selector). Use it with get_frame_screenshot to pin down what looks wrong, and before editing a large frame.",
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      inputSchema: {
+        frame_id: z.string(),
+        selectors: z
+          .array(z.string())
+          .max(20)
+          .optional()
+          .describe('CSS selectors to report on (up to 20 matches each) instead of the automatic outline'),
+        agent_name: agentName.optional(),
+      },
+    },
+    async ({ frame_id, selectors, agent_name }) => {
+      const f = frameFor(frame_id, 'view')
+      if (!f) return noFrame(frame_id)
+      arrive(f.canvasId, agent_name)
+      try {
+        const inspection = await inspectFrame({ ...f }, { selectors })
+        return withFeedbackNotice(
+          text({ ...inspection, approvalStatus: f.approval?.status ?? 'draft' }),
+          f.canvasId,
+          agent_name ? actorFrom(agent_name) : undefined,
+        )
+      } catch (e) {
+        return err(e instanceof Error ? e.message : 'inspection failed')
+      }
+    },
+  )
+
+  server.registerTool(
     'get_frame_screenshot',
     {
       title: 'Screenshot a frame',
-      _meta: previewToolMeta('Rendering the frame…', 'Frame rendered'),
+      _meta: previewMeta('Rendering the frame…', 'Frame rendered'),
       description:
         'Render a frame and return a PNG screenshot of it — this is how you SEE your design. Always review your work with this after creating or updating a frame, then fix what looks wrong (spacing, overflow, contrast, alignment) and check again. Iterate until it actually looks good, not just until the HTML seems right.',
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -2520,10 +2826,11 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
          this older image with its newer updatedAt, or the cache would serve
          it as current for the next five minutes */
       const f = { ...live }
+      const stamp = stampRender(renderStamp(f), f)
       try {
         const png = await renderFrame(f, scale ?? 1)
         /* the ChatGPT card loads this exact image next — serve it from cache */
-        primeImage(f, scale ?? 1, png)
+        primeImage(f, scale ?? 1, png, stamp)
         return withPreview(
           withFeedbackNotice(
             {
@@ -2568,20 +2875,20 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
     async ({ frame_id, html_chunk, start, done, agent_name }) => {
       const current = frameFor(frame_id, 'edit')
       if (!current) return noFrame(frame_id)
-      /* the agent's own text: the end of its last chunk joined to this one, so a URI split
-         across chunks is caught (a split can only fall inside the short data:…;base64, prefix:
-         past it, the earlier chunk already held the prefix and was refused). Never the stored
-         HTML, where a component's image expanded mid-stream would read as an upload. Compared
-         with the design the stream replaced: a rework may carry over what the frame had. */
-      const inline = start
-        ? inlineDataRefusal(html_chunk, current.html)
-        : inlineDataRefusal(
-            (actions.streamTail(frame_id) ?? '') + html_chunk,
-            actions.streamBase(frame_id) ?? current.html,
-          )
-      if (inline) return err(inline)
-      const frame = actions.appendFrameHtml(frame_id, html_chunk, actorFrom(agent_name), { start, done })
-      if (!frame) return noFrame(frame_id)
+      /* refused there if the chunk adds inline data, read joined to the end of the stream so
+         far, with the wording for a chunk that only completes a block (server/canvasWrites.ts) */
+      const appended = await runCanvasWrite(current.canvasId, {
+        type: 'append-frame-html',
+        frameId: frame_id,
+        chunk: html_chunk,
+        actor: actorFrom(agent_name),
+        ...(start !== undefined ? { start } : {}),
+        ...(done !== undefined ? { done } : {}),
+        inline: 'mcp',
+      })
+      if (!appended.ok && 'inline' in appended) return err(appended.inline)
+      if (!appended.ok) return noFrame(frame_id)
+      const frame = appended.frame
       const result = withNotesFirst(
         done
           ? textWithNudge(
@@ -2608,9 +2915,9 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
     'edit_frame_html',
     {
       title: 'Edit a frame’s HTML in place',
-      _meta: previewToolMeta('Editing the frame…', 'Frame edited'),
+      _meta: previewMeta('Editing the frame…', 'Frame edited'),
       description:
-        'Make a targeted edit to a frame: exact find-and-replace in its HTML, as get_frame returned it (a <doop-use> can be edited like any tag). Use this for small tweaks (copy, a color, spacing, one element) instead of resending the whole document — the change morphs into the rendered frame in place. old_str must appear EXACTLY ONCE in the current HTML (call get_frame first if unsure); include enough surrounding context to make it unique. Keep data-doop-* attributes on the element you edit: comments and links point at its data-doop-id.',
+        'Make a targeted edit to a frame: exact find-and-replace in its HTML, as get_frame returned it (a <doop-use> can be edited like any tag). Use this for small tweaks (copy, a color, spacing, one element) instead of resending the whole document — the change morphs into the rendered frame in place. old_str must appear EXACTLY ONCE in the current HTML (call get_frame first if unsure); include enough surrounding context to make it unique. Keep data-doop-* attributes on the element you edit: comments and links point at its data-doop-id. new_str must open and close as many <doop-use> and <template> tags as old_str does: an edit that leaves one unclosed is refused, so include the closing tags in the same edit or replace the whole instance in one call.',
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
       inputSchema: {
         frame_id: z.string(),
@@ -2622,12 +2929,22 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
     async ({ frame_id, old_str, new_str, agent_name }) => {
       const f = frameFor(frame_id, 'edit')
       if (!f) return noFrame(frame_id)
-      const edited = editFrameSource(f, old_str, new_str)
-      if ('error' in edited) return err(edited.error)
-      /* the edited document, so a URI completed across the replacement's edges is caught too */
-      const inline = inlineDataRefusal(edited.html, `${f.html}\n${compactFrameHtml(f)}`)
-      if (inline) return err(inline)
-      const frame = actions.updateFrame(frame_id, { html: edited.html }, actorFrom(agent_name))!
+      /* matched in whichever form the text was copied from, and checked for inline data the
+         frame did not hold, where the frame's writes are run (server/canvasWrites.ts) */
+      const edited = await runCanvasWrite(f.canvasId, {
+        type: 'edit-frame-html',
+        frameId: frame_id,
+        find: old_str,
+        replace: new_str,
+        actor: actorFrom(agent_name),
+        inline: 'mcp',
+      })
+      if (!edited.ok) {
+        if ('missing' in edited) return noFrame(frame_id)
+        if ('unbalanced' in edited) return err(unbalancedProblem(edited.unbalanced, 'old_str', 'new_str'))
+        return err('inline' in edited ? edited.inline : frameEditProblem(edited.problem, 'old_str', 'get_frame'))
+      }
+      const frame = edited.frame
       return withPreview(
         withStatusNudge(
           withFeedback(
@@ -2648,9 +2965,9 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
     'update_frame',
     {
       title: 'Rename, move or resize a frame',
-      _meta: previewToolMeta('Updating the frame…', 'Frame updated'),
+      _meta: previewMeta('Updating the frame…', 'Frame updated'),
       description:
-        "Update frame metadata in one call: rename it (name), move it on its page (x, y), resize it (width, height), turn it (rotation: degrees clockwise about its centre; 0 straightens it), or move it to another page (pageId from get_canvas; it keeps its x/y unless you pass new ones and lands in front of that page's frames). Set locked to true to lock the frame on the canvas (humans cannot select, move, resize or delete it from the stage until it is unlocked) or false to unlock it.",
+        "Update frame metadata in one call: rename it (name), move it on its page (x, y), resize it (width, height, or fit_to_content to size it to its content), turn it (rotation: degrees clockwise about its centre; 0 straightens it), or move it to another page (pageId from get_canvas; it keeps its x/y unless you pass new ones and lands in front of that page's frames). Set locked to true to lock the frame on the canvas (humans cannot select, move, resize or delete it from the stage until it is unlocked) or false to unlock it.",
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       inputSchema: {
         frame_id: z.string(),
@@ -2660,23 +2977,21 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
         y: z.number().optional(),
         width: z.number().optional(),
         height: z.number().optional(),
+        fit_to_content: z.enum(FIT_AXES).optional().describe(FIT_ON.update),
         locked: z.boolean().optional(),
         rotation: z.number().optional(),
         agent_name: agentName,
       },
     },
-    async ({ frame_id, agent_name, ...patch }) => {
+    async ({ frame_id, agent_name, fit_to_content, ...patch }) => {
       const found = frameFor(frame_id, 'edit')
       const canvas = found && store.getCanvas(found.canvasId)
       if (!canvas) return noFrame(frame_id)
-      const updated = updateFrameMeta(canvas, frame_id, patch, actorFrom(agent_name))
+      const updated = await updateFrameMetaWithFit(canvas, frame_id, patch, fit_to_content, actorFrom(agent_name))
       if (!updated.ok) return err(updated.error)
-      const frame = updated.value
-      return withPreview(
-        withFeedback(text({ ok: true, frame: frameSummary(frame) }), frame.canvasId, actorFrom(agent_name)),
-        frame.canvasId,
-        [frame],
-      )
+      const { frame } = updated.value
+      const result = withFitNote(text({ ok: true, frame: frameSummary(frame) }), updated.value)
+      return withPreview(withFeedback(result, frame.canvasId, actorFrom(agent_name)), frame.canvasId, [frame])
     },
   )
 
@@ -2699,7 +3014,13 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
       if (!found) return noFrame(frame_id)
       const actor = actorFrom(agent_name)
       arrive(found.canvasId, agent_name)
-      const result = actions.agentSetFrameApproval(frame_id, status, { id: ownerId, name: owner }, actor)
+      const result = await runCanvasWrite(found.canvasId, {
+        type: 'agent-approval',
+        frameId: frame_id,
+        status,
+        user: { id: ownerId, name: owner },
+        actor,
+      })
       if (!result.ok) return err(result.error)
       return withFeedback(text({ ok: true, frame: frameSummary(result.frame) }), result.frame.canvasId, actor)
     },
@@ -2744,8 +3065,14 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ frame_id, version_id, agent_name }) => {
-      if (!frameFor(frame_id, 'edit')) return noFrame(frame_id)
-      const restored = await actions.restoreFrameVersion(frame_id, version_id, actorFrom(agent_name))
+      const current = frameFor(frame_id, 'edit')
+      if (!current) return noFrame(frame_id)
+      const restored = await runCanvasWrite(current.canvasId, {
+        type: 'restore-version',
+        frameId: frame_id,
+        versionId: version_id,
+        actor: actorFrom(agent_name),
+      })
       if (restored === null) return err(`no version ${version_id} on frame ${frame_id} — call list_frame_versions`)
       if (!restored) return noFrame(frame_id)
       captureFeature(ownerId, 'frame_version_restored', 'mcp', { canvas_id: restored.frame.canvasId })
@@ -2766,8 +3093,13 @@ export function buildMcpServer(owner?: string, ownerId?: string, clientName?: st
       inputSchema: { frame_id: z.string(), agent_name: agentName },
     },
     async ({ frame_id, agent_name }) => {
-      if (!frameFor(frame_id, 'edit')) return noFrame(frame_id)
-      const frame = actions.deleteFrame(frame_id, actorFrom(agent_name))
+      const current = frameFor(frame_id, 'edit')
+      if (!current) return noFrame(frame_id)
+      const frame = await runCanvasWrite(current.canvasId, {
+        type: 'delete-frame',
+        frameId: frame_id,
+        actor: actorFrom(agent_name),
+      })
       if (!frame) return noFrame(frame_id)
       return text({ ok: true, deleted: frame.name })
     },
@@ -2798,6 +3130,21 @@ const clientNamesByCredential = new Map<string, string>()
 const oauthClientNames = new Map<string, string | undefined>()
 
 const credentialKey = (bearer: string) => createHash('sha256').update(bearer).digest('hex')
+
+/** An outside agent's identity (shared/agentIdentity.ts): its account and
+ *  the name it goes by, hashed so it can be shown and stored. Two people's
+ *  agents sharing a name are two agents.
+ *
+ *  Not the MCP session: clients start sessions far more often than an agent
+ *  starts work (Codex and other OpenAI clients one per tool call, Claude Code
+ *  in bursts), so a session-scoped key would split one agent into many. One
+ *  person's two agents of one name are therefore one agent. */
+export function mcpAgentKey(ownerId: string | undefined, name: string): string {
+  const digest = createHash('sha256')
+    .update(JSON.stringify([ownerId ?? '', name]))
+    .digest('base64url')
+  return `mcp:${digest.slice(0, 22)}`
+}
 
 function rememberClientName(bearer: string, name: unknown) {
   if (typeof name !== 'string' || !name.trim()) return
